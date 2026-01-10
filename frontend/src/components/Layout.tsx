@@ -1,5 +1,6 @@
 import { Outlet, Link, useLocation } from 'react-router-dom'
 import { useState } from 'react'
+import { useQueryClient, useQuery } from '@tanstack/react-query'
 import {
   LayoutDashboard,
   Bot,
@@ -9,6 +10,24 @@ import {
   Menu,
   X,
 } from 'lucide-react'
+
+interface Stats {
+  total_pnl: number
+  running_bots: number
+  total_bots: number
+  active_trades: number
+}
+
+async function fetchStats(): Promise<Stats> {
+  const res = await fetch('/api/stats')
+  if (!res.ok) throw new Error('Failed to fetch stats')
+  return res.json()
+}
+
+async function killAllBots(): Promise<void> {
+  const res = await fetch('/api/kill-all', { method: 'POST' })
+  if (!res.ok) throw new Error('Failed to kill all bots')
+}
 
 const navigation = [
   { name: 'Dashboard', href: '/', icon: LayoutDashboard },
@@ -20,12 +39,32 @@ const navigation = [
 export default function Layout() {
   const location = useLocation()
   const [sidebarOpen, setSidebarOpen] = useState(false)
-  const [globalPnL] = useState(0) // TODO: Fetch from API
+  const [isKilling, setIsKilling] = useState(false)
+  const queryClient = useQueryClient()
+
+  const { data: stats } = useQuery({
+    queryKey: ['stats'],
+    queryFn: fetchStats,
+    refetchInterval: 5000, // Refetch every 5 seconds
+  })
+
+  const globalPnL = stats?.total_pnl ?? 0
 
   const handleGlobalKillSwitch = async () => {
     if (confirm('Are you sure you want to activate the global kill switch? This will stop all running bots.')) {
-      // TODO: Call API
-      console.log('Global kill switch activated')
+      setIsKilling(true)
+      try {
+        await killAllBots()
+        // Invalidate queries to refresh data
+        queryClient.invalidateQueries({ queryKey: ['stats'] })
+        queryClient.invalidateQueries({ queryKey: ['bots'] })
+        console.log('Global kill switch activated')
+      } catch (error) {
+        console.error('Failed to kill all bots:', error)
+        alert('Failed to activate global kill switch')
+      } finally {
+        setIsKilling(false)
+      }
     }
   }
 
@@ -61,11 +100,12 @@ export default function Layout() {
             {/* Global Kill Switch */}
             <button
               onClick={handleGlobalKillSwitch}
-              className="flex items-center gap-2 px-4 py-2 bg-red-600 hover:bg-red-700 text-white rounded-lg font-medium transition-colors focus-ring"
+              disabled={isKilling}
+              className="flex items-center gap-2 px-4 py-2 bg-red-600 hover:bg-red-700 disabled:opacity-50 disabled:cursor-not-allowed text-white rounded-lg font-medium transition-colors focus-ring"
               aria-label="Global kill switch"
             >
-              <Power size={18} />
-              <span className="hidden sm:inline">Kill All</span>
+              <Power size={18} className={isKilling ? 'animate-spin' : ''} />
+              <span className="hidden sm:inline">{isKilling ? 'Killing...' : 'Kill All'}</span>
             </button>
           </div>
         </div>

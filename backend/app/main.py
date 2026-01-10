@@ -1,11 +1,14 @@
-"""TradingBot FastAPI Application."""
+"""TradingBot FastAPI Application.
+
+Includes alerts router for alert management.
+"""
 
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from .models import init_db
-from .routers import bots, health, stats, reports, config as config_router
+from .routers import bots, health, stats, reports, config as config_router, alerts
 
 
 @asynccontextmanager
@@ -43,6 +46,7 @@ app.include_router(bots.router, prefix="/api/bots", tags=["Bots"])
 app.include_router(stats.router, prefix="/api", tags=["Stats"])
 app.include_router(reports.router, prefix="/api/reports", tags=["Reports"])
 app.include_router(config_router.router, prefix="/api/config", tags=["Config"])
+app.include_router(alerts.router, prefix="/api/alerts", tags=["Alerts"])
 
 
 @app.get("/")
