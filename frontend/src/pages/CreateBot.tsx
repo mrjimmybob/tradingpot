@@ -1,0 +1,527 @@
+import { useState } from 'react'
+import { useNavigate } from 'react-router-dom'
+import { useMutation, useQuery } from '@tanstack/react-query'
+import { Bot, ArrowLeft, ArrowRight, Check } from 'lucide-react'
+
+interface Strategy {
+  name: string
+  display_name: string
+  description: string
+  params: Record<string, {
+    type: string
+    default: number | string | boolean
+    min?: number
+    max?: number
+    description: string
+  }>
+}
+
+interface TradingPair {
+  symbol: string
+  base: string
+  quote: string
+}
+
+interface BotFormData {
+  name: string
+  trading_pair: string
+  strategy: string
+  strategy_params: Record<string, number | string | boolean>
+  budget: number
+  running_time_hours: number | null
+  stop_loss_percent: number
+  drawdown_limit_percent: number
+  daily_loss_limit: number | null
+  weekly_loss_limit: number | null
+  is_dry_run: boolean
+  compound_enabled: boolean
+}
+
+async function fetchStrategies(): Promise<Strategy[]> {
+  const res = await fetch('/api/config/strategies')
+  if (!res.ok) throw new Error('Failed to fetch strategies')
+  return res.json()
+}
+
+async function fetchPairs(): Promise<TradingPair[]> {
+  const res = await fetch('/api/config/pairs')
+  if (!res.ok) throw new Error('Failed to fetch trading pairs')
+  return res.json()
+}
+
+async function createBot(data: BotFormData) {
+  const res = await fetch('/api/bots', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(data),
+  })
+  if (!res.ok) throw new Error('Failed to create bot')
+  return res.json()
+}
+
+const STEPS = ['Basic Info', 'Strategy', 'Risk Management', 'Review']
+
+export default function CreateBot() {
+  const navigate = useNavigate()
+  const [currentStep, setCurrentStep] = useState(0)
+  const [formData, setFormData] = useState<BotFormData>({
+    name: '',
+    trading_pair: '',
+    strategy: '',
+    strategy_params: {},
+    budget: 100,
+    running_time_hours: null,
+    stop_loss_percent: 5,
+    drawdown_limit_percent: 10,
+    daily_loss_limit: null,
+    weekly_loss_limit: null,
+    is_dry_run: true,
+    compound_enabled: false,
+  })
+
+  const { data: strategies = [] } = useQuery({
+    queryKey: ['strategies'],
+    queryFn: fetchStrategies,
+  })
+
+  const { data: pairs = [] } = useQuery({
+    queryKey: ['trading-pairs'],
+    queryFn: fetchPairs,
+  })
+
+  const createMutation = useMutation({
+    mutationFn: createBot,
+    onSuccess: (data) => {
+      navigate(`/bots/${data.id}`)
+    },
+  })
+
+  const updateFormData = (updates: Partial<BotFormData>) => {
+    setFormData((prev) => ({ ...prev, ...updates }))
+  }
+
+  const selectedStrategy = strategies.find((s) => s.name === formData.strategy)
+
+  const canProceed = () => {
+    switch (currentStep) {
+      case 0:
+        return formData.name && formData.trading_pair
+      case 1:
+        return formData.strategy
+      case 2:
+        return formData.budget > 0 && formData.stop_loss_percent > 0
+      default:
+        return true
+    }
+  }
+
+  const handleNext = () => {
+    if (currentStep < STEPS.length - 1) {
+      setCurrentStep(currentStep + 1)
+    } else {
+      createMutation.mutate(formData)
+    }
+  }
+
+  const handleBack = () => {
+    if (currentStep > 0) {
+      setCurrentStep(currentStep - 1)
+    } else {
+      navigate('/bots')
+    }
+  }
+
+  return (
+    <div className="max-w-3xl mx-auto">
+      <div className="flex items-center gap-4 mb-8">
+        <Bot size={32} className="text-accent" />
+        <h2 className="text-2xl font-bold">Create New Bot</h2>
+      </div>
+
+      {/* Progress Steps */}
+      <div className="flex items-center justify-between mb-8">
+        {STEPS.map((step, index) => (
+          <div key={step} className="flex items-center">
+            <div
+              className={`w-8 h-8 rounded-full flex items-center justify-center text-sm font-medium ${
+                index < currentStep
+                  ? 'bg-profit text-white'
+                  : index === currentStep
+                  ? 'bg-accent text-white'
+                  : 'bg-gray-700 text-gray-400'
+              }`}
+            >
+              {index < currentStep ? <Check size={16} /> : index + 1}
+            </div>
+            <span
+              className={`ml-2 text-sm ${
+                index <= currentStep ? 'text-white' : 'text-gray-400'
+              }`}
+            >
+              {step}
+            </span>
+            {index < STEPS.length - 1 && (
+              <div
+                className={`w-12 h-0.5 mx-4 ${
+                  index < currentStep ? 'bg-profit' : 'bg-gray-700'
+                }`}
+              />
+            )}
+          </div>
+        ))}
+      </div>
+
+      {/* Step Content */}
+      <div className="bg-gray-800 rounded-lg p-6 mb-6">
+        {currentStep === 0 && (
+          <div className="space-y-6">
+            <h3 className="text-lg font-semibold mb-4">Basic Information</h3>
+
+            <div>
+              <label className="block text-sm font-medium text-gray-300 mb-2">
+                Bot Name
+              </label>
+              <input
+                type="text"
+                value={formData.name}
+                onChange={(e) => updateFormData({ name: e.target.value })}
+                className="w-full px-4 py-2 bg-gray-700 border border-gray-600 rounded-lg text-white focus:outline-none focus:ring-2 focus:ring-accent"
+                placeholder="My Trading Bot"
+              />
+            </div>
+
+            <div>
+              <label className="block text-sm font-medium text-gray-300 mb-2">
+                Trading Pair
+              </label>
+              <select
+                value={formData.trading_pair}
+                onChange={(e) => updateFormData({ trading_pair: e.target.value })}
+                className="w-full px-4 py-2 bg-gray-700 border border-gray-600 rounded-lg text-white focus:outline-none focus:ring-2 focus:ring-accent"
+              >
+                <option value="">Select a trading pair</option>
+                {pairs.map((pair) => (
+                  <option key={pair.symbol} value={pair.symbol}>
+                    {pair.symbol}
+                  </option>
+                ))}
+              </select>
+            </div>
+
+            <div className="flex items-center gap-3">
+              <input
+                type="checkbox"
+                id="dry_run"
+                checked={formData.is_dry_run}
+                onChange={(e) => updateFormData({ is_dry_run: e.target.checked })}
+                className="w-4 h-4 text-accent bg-gray-700 border-gray-600 rounded focus:ring-accent"
+              />
+              <label htmlFor="dry_run" className="text-sm text-gray-300">
+                Dry Run Mode (simulated trades, no real orders)
+              </label>
+            </div>
+          </div>
+        )}
+
+        {currentStep === 1 && (
+          <div className="space-y-6">
+            <h3 className="text-lg font-semibold mb-4">Select Strategy</h3>
+
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+              {strategies.map((strategy) => (
+                <button
+                  key={strategy.name}
+                  onClick={() =>
+                    updateFormData({
+                      strategy: strategy.name,
+                      strategy_params: Object.fromEntries(
+                        Object.entries(strategy.params).map(([key, param]) => [
+                          key,
+                          param.default,
+                        ])
+                      ),
+                    })
+                  }
+                  className={`text-left p-4 rounded-lg border-2 transition-colors ${
+                    formData.strategy === strategy.name
+                      ? 'border-accent bg-accent/10'
+                      : 'border-gray-600 bg-gray-700 hover:border-gray-500'
+                  }`}
+                >
+                  <h4 className="font-medium text-white">{strategy.display_name}</h4>
+                  <p className="text-sm text-gray-400 mt-1">{strategy.description}</p>
+                </button>
+              ))}
+            </div>
+
+            {selectedStrategy && Object.keys(selectedStrategy.params).length > 0 && (
+              <div className="mt-6">
+                <h4 className="text-md font-medium mb-4">Strategy Parameters</h4>
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                  {Object.entries(selectedStrategy.params).map(([key, param]) => (
+                    <div key={key}>
+                      <label className="block text-sm font-medium text-gray-300 mb-2">
+                        {key.replace(/_/g, ' ')}
+                      </label>
+                      <input
+                        type={param.type === 'number' ? 'number' : 'text'}
+                        value={formData.strategy_params[key] ?? param.default}
+                        onChange={(e) =>
+                          updateFormData({
+                            strategy_params: {
+                              ...formData.strategy_params,
+                              [key]:
+                                param.type === 'number'
+                                  ? parseFloat(e.target.value)
+                                  : e.target.value,
+                            },
+                          })
+                        }
+                        className="w-full px-4 py-2 bg-gray-700 border border-gray-600 rounded-lg text-white focus:outline-none focus:ring-2 focus:ring-accent"
+                      />
+                      <p className="text-xs text-gray-500 mt-1">{param.description}</p>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+          </div>
+        )}
+
+        {currentStep === 2 && (
+          <div className="space-y-6">
+            <h3 className="text-lg font-semibold mb-4">Risk Management</h3>
+
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+              <div>
+                <label className="block text-sm font-medium text-gray-300 mb-2">
+                  Budget (USD)
+                </label>
+                <input
+                  type="number"
+                  value={formData.budget}
+                  onChange={(e) =>
+                    updateFormData({ budget: parseFloat(e.target.value) || 0 })
+                  }
+                  min="0"
+                  step="10"
+                  className="w-full px-4 py-2 bg-gray-700 border border-gray-600 rounded-lg text-white focus:outline-none focus:ring-2 focus:ring-accent"
+                />
+              </div>
+
+              <div>
+                <label className="block text-sm font-medium text-gray-300 mb-2">
+                  Running Time (hours, empty = forever)
+                </label>
+                <input
+                  type="number"
+                  value={formData.running_time_hours ?? ''}
+                  onChange={(e) =>
+                    updateFormData({
+                      running_time_hours: e.target.value
+                        ? parseFloat(e.target.value)
+                        : null,
+                    })
+                  }
+                  min="0"
+                  className="w-full px-4 py-2 bg-gray-700 border border-gray-600 rounded-lg text-white focus:outline-none focus:ring-2 focus:ring-accent"
+                  placeholder="Forever"
+                />
+              </div>
+
+              <div>
+                <label className="block text-sm font-medium text-gray-300 mb-2">
+                  Stop Loss (%)
+                </label>
+                <input
+                  type="number"
+                  value={formData.stop_loss_percent}
+                  onChange={(e) =>
+                    updateFormData({
+                      stop_loss_percent: parseFloat(e.target.value) || 0,
+                    })
+                  }
+                  min="0"
+                  max="100"
+                  step="0.5"
+                  className="w-full px-4 py-2 bg-gray-700 border border-gray-600 rounded-lg text-white focus:outline-none focus:ring-2 focus:ring-accent"
+                />
+              </div>
+
+              <div>
+                <label className="block text-sm font-medium text-gray-300 mb-2">
+                  Drawdown Limit (%)
+                </label>
+                <input
+                  type="number"
+                  value={formData.drawdown_limit_percent}
+                  onChange={(e) =>
+                    updateFormData({
+                      drawdown_limit_percent: parseFloat(e.target.value) || 0,
+                    })
+                  }
+                  min="0"
+                  max="100"
+                  step="1"
+                  className="w-full px-4 py-2 bg-gray-700 border border-gray-600 rounded-lg text-white focus:outline-none focus:ring-2 focus:ring-accent"
+                />
+              </div>
+
+              <div>
+                <label className="block text-sm font-medium text-gray-300 mb-2">
+                  Daily Loss Limit (USD, empty = none)
+                </label>
+                <input
+                  type="number"
+                  value={formData.daily_loss_limit ?? ''}
+                  onChange={(e) =>
+                    updateFormData({
+                      daily_loss_limit: e.target.value
+                        ? parseFloat(e.target.value)
+                        : null,
+                    })
+                  }
+                  min="0"
+                  className="w-full px-4 py-2 bg-gray-700 border border-gray-600 rounded-lg text-white focus:outline-none focus:ring-2 focus:ring-accent"
+                  placeholder="No limit"
+                />
+              </div>
+
+              <div>
+                <label className="block text-sm font-medium text-gray-300 mb-2">
+                  Weekly Loss Limit (USD, empty = none)
+                </label>
+                <input
+                  type="number"
+                  value={formData.weekly_loss_limit ?? ''}
+                  onChange={(e) =>
+                    updateFormData({
+                      weekly_loss_limit: e.target.value
+                        ? parseFloat(e.target.value)
+                        : null,
+                    })
+                  }
+                  min="0"
+                  className="w-full px-4 py-2 bg-gray-700 border border-gray-600 rounded-lg text-white focus:outline-none focus:ring-2 focus:ring-accent"
+                  placeholder="No limit"
+                />
+              </div>
+            </div>
+
+            <div className="flex items-center gap-3">
+              <input
+                type="checkbox"
+                id="compound"
+                checked={formData.compound_enabled}
+                onChange={(e) =>
+                  updateFormData({ compound_enabled: e.target.checked })
+                }
+                className="w-4 h-4 text-accent bg-gray-700 border-gray-600 rounded focus:ring-accent"
+              />
+              <label htmlFor="compound" className="text-sm text-gray-300">
+                Enable Compounding (add profits to budget)
+              </label>
+            </div>
+          </div>
+        )}
+
+        {currentStep === 3 && (
+          <div className="space-y-6">
+            <h3 className="text-lg font-semibold mb-4">Review Configuration</h3>
+
+            <div className="grid grid-cols-2 gap-4 text-sm">
+              <div className="bg-gray-700 p-4 rounded-lg">
+                <h4 className="text-gray-400 mb-2">Basic Info</h4>
+                <p>
+                  <span className="text-gray-400">Name:</span>{' '}
+                  <span className="text-white">{formData.name}</span>
+                </p>
+                <p>
+                  <span className="text-gray-400">Pair:</span>{' '}
+                  <span className="text-white">{formData.trading_pair}</span>
+                </p>
+                <p>
+                  <span className="text-gray-400">Mode:</span>{' '}
+                  <span className={formData.is_dry_run ? 'text-paused' : 'text-running'}>
+                    {formData.is_dry_run ? 'Dry Run' : 'Live'}
+                  </span>
+                </p>
+              </div>
+
+              <div className="bg-gray-700 p-4 rounded-lg">
+                <h4 className="text-gray-400 mb-2">Strategy</h4>
+                <p>
+                  <span className="text-gray-400">Strategy:</span>{' '}
+                  <span className="text-white">
+                    {selectedStrategy?.display_name || formData.strategy}
+                  </span>
+                </p>
+              </div>
+
+              <div className="bg-gray-700 p-4 rounded-lg col-span-2">
+                <h4 className="text-gray-400 mb-2">Risk Settings</h4>
+                <div className="grid grid-cols-2 gap-2">
+                  <p>
+                    <span className="text-gray-400">Budget:</span>{' '}
+                    <span className="text-white">${formData.budget}</span>
+                  </p>
+                  <p>
+                    <span className="text-gray-400">Stop Loss:</span>{' '}
+                    <span className="text-white">{formData.stop_loss_percent}%</span>
+                  </p>
+                  <p>
+                    <span className="text-gray-400">Drawdown Limit:</span>{' '}
+                    <span className="text-white">{formData.drawdown_limit_percent}%</span>
+                  </p>
+                  <p>
+                    <span className="text-gray-400">Compounding:</span>{' '}
+                    <span className="text-white">
+                      {formData.compound_enabled ? 'Enabled' : 'Disabled'}
+                    </span>
+                  </p>
+                </div>
+              </div>
+            </div>
+
+            {createMutation.isError && (
+              <div className="bg-loss/20 text-loss px-4 py-3 rounded-lg">
+                Failed to create bot. Please try again.
+              </div>
+            )}
+          </div>
+        )}
+      </div>
+
+      {/* Navigation Buttons */}
+      <div className="flex justify-between">
+        <button
+          onClick={handleBack}
+          className="flex items-center gap-2 px-6 py-2 bg-gray-700 hover:bg-gray-600 text-white rounded-lg transition-colors"
+        >
+          <ArrowLeft size={18} />
+          {currentStep === 0 ? 'Cancel' : 'Back'}
+        </button>
+
+        <button
+          onClick={handleNext}
+          disabled={!canProceed() || createMutation.isPending}
+          className="flex items-center gap-2 px-6 py-2 bg-accent hover:bg-accent/80 text-white rounded-lg transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+        >
+          {createMutation.isPending ? (
+            'Creating...'
+          ) : currentStep === STEPS.length - 1 ? (
+            <>
+              Create Bot
+              <Check size={18} />
+            </>
+          ) : (
+            <>
+              Next
+              <ArrowRight size={18} />
+            </>
+          )}
+        </button>
+      </div>
+    </div>
+  )
+}
