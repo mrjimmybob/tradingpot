@@ -7,7 +7,7 @@ interface Strategy {
   name: string
   display_name: string
   description: string
-  params: Record<string, {
+  parameters: Record<string, {
     type: string
     default: number | string | boolean
     min?: number
@@ -235,7 +235,7 @@ export default function CreateBot() {
                     updateFormData({
                       strategy: strategy.name,
                       strategy_params: Object.fromEntries(
-                        Object.entries(strategy.params).map(([key, param]) => [
+                        Object.entries(strategy.parameters).map(([key, param]) => [
                           key,
                           param.default,
                         ])
@@ -254,11 +254,11 @@ export default function CreateBot() {
               ))}
             </div>
 
-            {selectedStrategy && Object.keys(selectedStrategy.params).length > 0 && (
+            {selectedStrategy && Object.keys(selectedStrategy.parameters).length > 0 && (
               <div className="mt-6">
                 <h4 className="text-md font-medium mb-4">Strategy Parameters</h4>
                 <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                  {Object.entries(selectedStrategy.params).map(([key, param]) => (
+                  {Object.entries(selectedStrategy.parameters).map(([key, param]) => (
                     <div key={key}>
                       <label className="block text-sm font-medium text-gray-300 mb-2">
                         {key.replace(/_/g, ' ')}
