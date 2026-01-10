@@ -1,0 +1,526 @@
+<project_specification>
+  <project_name>tradingbot</project_name>
+
+  <overview>
+    A comprehensive crypto trading bot system with multiple trading strategies, server-client architecture for managing multiple bot instances, web UI for monitoring and control, and full logging for tax compliance. Designed for personal use with safety-first approach including virtual wallets, stop losses, and kill switches. Starting with MEXC exchange, architected for easy expansion to other exchanges.
+  </overview>
+
+  <technology_stack>
+    <backend>
+      <runtime>Python 3.11+</runtime>
+      <async_framework>asyncio</async_framework>
+      <exchange_library>ccxt (unified API for 100+ exchanges)</exchange_library>
+      <web_framework>FastAPI</web_framework>
+      <database>SQLite with SQLAlchemy ORM</database>
+      <config_format>YAML</config_format>
+    </backend>
+    <frontend>
+      <framework>React 18</framework>
+      <styling>Tailwind CSS</styling>
+      <state_management>React Query</state_management>
+      <charts>Recharts (for P&L chart)</charts>
+    </frontend>
+    <communication>
+      <api>REST API</api>
+      <realtime>WebSocket for live updates</realtime>
+    </communication>
+  </technology_stack>
+
+  <prerequisites>
+    <environment_setup>
+      - Python 3.11 or higher
+      - Node.js 18+ for frontend build
+      - MEXC exchange account with API key/secret
+      - (Optional) CoinMarketCap API key
+      - (Optional) CoinGecko API key
+    </environment_setup>
+  </prerequisites>
+
+  <feature_count>180</feature_count>
+
+  <security_and_access_control>
+    <user_roles>
+      <role name="owner">
+        <permissions>
+          - Full access to all features
+          - No authentication required (personal use)
+        </permissions>
+      </role>
+    </user_roles>
+    <authentication>
+      <method>None (single-user local deployment)</method>
+    </authentication>
+    <trading_safety>
+      <virtual_wallet>Enforced budget cap per bot</virtual_wallet>
+      <stop_losses>Per-trade and per-bot drawdown limits</stop_losses>
+      <kill_switch>Per-bot and global emergency stop</kill_switch>
+      <consecutive_loss_protection>Strategy rotation then pause</consecutive_loss_protection>
+      <time_based_limits>Daily and weekly loss limits</time_based_limits>
+    </trading_safety>
+  </security_and_access_control>
+
+  <core_features>
+    <exchange_integration>
+      - Connect to MEXC via ccxt library
+      - Authenticate with API key/secret from config
+      - Place market buy/sell orders
+      - Place limit buy/sell orders
+      - Cancel pending orders
+      - Get order status
+      - Get account balance
+      - Get open positions
+      - Get order history
+      - Handle rate limiting automatically
+      - Handle connection errors with retry
+      - Auto-reconnect on disconnect
+      - Architecture supports adding other exchanges
+    </exchange_integration>
+
+    <trading_strategies>
+      - Adaptive Grid: Dynamic grid trading with configurable grid count, spacing, and range
+      - DCA Accumulator: Dollar-cost averaging with configurable intervals and amounts
+      - Breakdown Momentum: Trend-following on breakouts with volume confirmation
+      - Mean Reversion: Trade reversions to mean with Bollinger bands or similar
+      - Event Filler: React to market events/news with rapid execution
+      - TWAP: Time-weighted average price execution over configurable period
+      - VWAP: Volume-weighted average price targeting
+      - Arbitrage: Cross-exchange or cross-pair price difference exploitation
+      - Scalping: High-frequency small profit captures
+      - Auto Mode: Factor-based strategy selection (trend/volume/volatility)
+        - Configurable factor precedence order
+        - Ability to disable specific factors
+        - Automatic switching based on market conditions
+      - All strategies have configurable parameters with sensible defaults
+      - Strategy parameter validation
+    </trading_strategies>
+
+    <bot_management>
+      - Create new bot with: trading pair, strategy, budget, running time
+      - Running time options: hours, days, months, or until killed (default)
+      - Start bot (begins trading)
+      - Pause bot (no new orders, pending orders remain until fulfilled)
+      - Stop bot (prompts to cancel pending orders)
+      - Per-bot kill switch (cancels pending, never liquidates positions)
+      - Global kill switch (all bots)
+      - Edit bot configuration when paused or stopped
+      - Multiple bots can run on same trading pair (user responsibility)
+      - Bot state persistence in database
+      - Auto-resume running bots on server restart
+      - Each bot runs as async task with process isolation
+    </bot_management>
+
+    <dry_run_mode>
+      - Simulate trades with real market data
+      - No actual orders placed on exchange
+      - Track hypothetical P&L
+      - Log simulated trades to separate database table
+      - Can promote dry run bot to live
+      - Can copy dry run bot config to new live bot
+    </dry_run_mode>
+
+    <risk_management>
+      - Per-trade stop loss (percentage or absolute, configurable)
+      - Per-bot drawdown limit (percentage or absolute, configurable)
+      - Consecutive loss detection
+      - On consecutive losses: rotate to different strategy
+      - Max N strategy rotations without repeating losing strategy
+      - After max rotations with continued losses: pause bot and alert
+      - Daily loss limit (configurable)
+      - Weekly loss limit (configurable)
+      - Pause and alert when time-based limits hit
+      - Kelly criterion position sizing based on budget
+      - Risk parameter validation on bot creation
+    </risk_management>
+
+    <virtual_wallet>
+      - Budget cap separate from actual exchange balance
+      - Losses deducted from available budget
+      - Wins do NOT increase budget by default
+      - Compound option: enable to add profits to budget
+      - Track P&L against virtual allocation
+      - Prevent trades exceeding virtual wallet balance
+      - Budget validation before order placement
+    </virtual_wallet>
+
+    <external_data>
+      - CoinMarketCap integration (price, volume, market cap)
+      - CoinGecko integration (price, volume, market cap)
+      - Exchange price feeds (real-time)
+      - Fear/Greed index fetching
+      - Trending coins data
+      - Data source priority system (configurable)
+      - Same-priority sources: average values
+      - Configurable poll frequency (default: 5 minutes)
+      - Auto strategy adjustment based on market data
+      - Auto trading pair weight adjustment
+      - Extreme condition detection (crash detection)
+      - Auto-pause on extreme market conditions
+      - Data source fallback on API errors
+    </external_data>
+
+    <logging_accounting>
+      - SQLite database for all order data
+      - Order fields: ID, type, pair, amount, price, timestamp, fees, status, strategy, bot_id, running_balance
+      - Per-bot log directory: logs/{bot_id}/
+      - Per-bot fiscal log files (tax-ready): date, buy_price, sale_price, token
+      - Complete audit trail in database
+      - Tax data export: gains only (purchase price, sale price, date, token)
+      - P&L reports by bot, pair, strategy, time period
+      - Win rate calculation
+      - Average win/loss size calculation
+      - Fee totals report
+      - Log retention: forever
+    </logging_accounting>
+
+    <alerts>
+      - Email alerts for critical events
+      - Email on bot pause (consecutive losses)
+      - Email on loss limit reached
+      - Email on kill switch triggered
+      - Toast notifications in UI
+      - Configurable SMTP settings in config file
+    </alerts>
+
+    <user_interface>
+      - Dashboard home page
+        - Total P&L across all bots
+        - Bot list with status indicators (running/paused/stopped)
+        - Global kill switch button
+        - Quick stats (active trades, 24h volume, etc.)
+      - Bot detail page
+        - Live P&L for this bot
+        - Open positions list
+        - Strategy parameters display
+        - Edit config form (when paused/stopped)
+        - Start/Pause/Stop/Kill buttons
+      - Create bot wizard
+        - Select trading pair
+        - Select strategy
+        - Configure budget
+        - Configure running time
+        - Set risk parameters
+        - Dry run toggle
+      - Global P&L chart over time (single chart)
+      - Data tables for trades, orders, bots
+      - Real-time updates via WebSocket
+      - Toast notifications for events
+    </user_interface>
+
+    <configuration>
+      - All config in YAML files (no env vars, no DB config)
+      - config/exchanges.yaml: API keys for exchanges
+      - config/email.yaml: SMTP settings
+      - config/data_sources.yaml: API keys and priorities
+      - config/defaults.yaml: Default strategy parameters
+      - Config validation on startup
+      - Config error reporting
+    </configuration>
+
+    <server_architecture>
+      - FastAPI async server
+      - REST API for bot CRUD operations
+      - WebSocket for real-time UI updates
+      - Bot process management (async tasks)
+      - State persistence to SQLite
+      - Graceful shutdown (save state, cancel pending if requested)
+      - Health check endpoint
+      - Startup: auto-resume bots that were running
+    </server_architecture>
+  </core_features>
+
+  <database_schema>
+    <tables>
+      <bots>
+        - id (primary key)
+        - name
+        - trading_pair
+        - strategy
+        - strategy_params (JSON)
+        - budget (virtual wallet amount)
+        - compound_enabled (boolean)
+        - running_time_hours (null = forever)
+        - stop_loss_percent
+        - stop_loss_absolute
+        - drawdown_limit_percent
+        - drawdown_limit_absolute
+        - daily_loss_limit
+        - weekly_loss_limit
+        - max_strategy_rotations
+        - is_dry_run (boolean)
+        - status (created/running/paused/stopped)
+        - current_balance
+        - total_pnl
+        - created_at
+        - updated_at
+        - started_at
+        - paused_at
+      </bots>
+      <orders>
+        - id (primary key)
+        - bot_id (foreign key)
+        - exchange_order_id
+        - order_type (market_buy/market_sell/limit_buy/limit_sell)
+        - trading_pair
+        - amount
+        - price
+        - fees
+        - status (pending/filled/cancelled/failed)
+        - strategy_used
+        - running_balance_after
+        - is_simulated (boolean for dry run)
+        - created_at
+        - filled_at
+      </orders>
+      <positions>
+        - id (primary key)
+        - bot_id (foreign key)
+        - trading_pair
+        - side (long/short)
+        - entry_price
+        - current_price
+        - amount
+        - unrealized_pnl
+        - created_at
+        - updated_at
+      </positions>
+      <strategy_rotations>
+        - id (primary key)
+        - bot_id (foreign key)
+        - from_strategy
+        - to_strategy
+        - reason
+        - created_at
+      </strategy_rotations>
+      <alerts_log>
+        - id (primary key)
+        - bot_id (foreign key, nullable for global)
+        - alert_type
+        - message
+        - email_sent (boolean)
+        - created_at
+      </alerts_log>
+      <market_data_cache>
+        - id (primary key)
+        - source
+        - data_type
+        - trading_pair
+        - value
+        - fetched_at
+      </market_data_cache>
+      <pnl_snapshots>
+        - id (primary key)
+        - bot_id (foreign key, nullable for global)
+        - total_pnl
+        - snapshot_at
+      </pnl_snapshots>
+    </tables>
+  </database_schema>
+
+  <api_endpoints_summary>
+    <bots>
+      - GET /api/bots - List all bots
+      - POST /api/bots - Create new bot
+      - GET /api/bots/{id} - Get bot details
+      - PUT /api/bots/{id} - Update bot config
+      - DELETE /api/bots/{id} - Delete bot
+      - POST /api/bots/{id}/start - Start bot
+      - POST /api/bots/{id}/pause - Pause bot
+      - POST /api/bots/{id}/stop - Stop bot
+      - POST /api/bots/{id}/kill - Kill switch for bot
+      - POST /api/bots/{id}/go-live - Promote dry run to live
+      - POST /api/bots/{id}/copy - Copy bot config to new bot
+    </bots>
+    <global>
+      - POST /api/kill-all - Global kill switch
+      - GET /api/stats - Global statistics
+      - GET /api/pnl - Global P&L data for chart
+    </global>
+    <orders>
+      - GET /api/bots/{id}/orders - Get orders for bot
+      - GET /api/bots/{id}/positions - Get open positions
+    </orders>
+    <reports>
+      - GET /api/reports/pnl - P&L report with filters
+      - GET /api/reports/tax - Tax export (gains only)
+      - GET /api/reports/fees - Fee totals
+    </reports>
+    <config>
+      - GET /api/config/strategies - Available strategies and params
+      - GET /api/config/pairs - Available trading pairs from exchange
+    </config>
+    <health>
+      - GET /api/health - Server health check
+    </health>
+    <websocket>
+      - WS /ws - Real-time updates (bot status, orders, P&L)
+    </websocket>
+  </api_endpoints_summary>
+
+  <ui_layout>
+    <main_structure>
+      - Header: App title, global kill switch button, global P&L
+      - Sidebar: Navigation (Dashboard, Bots, Reports, Settings)
+      - Main content area: Dynamic based on route
+    </main_structure>
+    <pages>
+      - Dashboard: Stats cards, bot list, P&L chart
+      - Bot List: Table of all bots with status and actions
+      - Bot Detail: P&L, positions, params, controls
+      - Create Bot: Multi-step wizard form
+      - Reports: Tabs for P&L, Tax, Fees
+      - Settings: Config file editor (read-only display)
+    </pages>
+  </ui_layout>
+
+  <design_system>
+    <color_palette>
+      - Background: Dark theme (easier on eyes for monitoring)
+      - Profit/Positive: Green (#22c55e)
+      - Loss/Negative: Red (#ef4444)
+      - Running status: Blue (#3b82f6)
+      - Paused status: Yellow (#eab308)
+      - Stopped status: Gray (#6b7280)
+      - Accent: Indigo (#6366f1)
+    </color_palette>
+    <typography>
+      - Sans-serif font (Inter or system default)
+      - Monospace for numbers and prices
+    </typography>
+  </design_system>
+
+  <implementation_steps>
+    <step number="1">
+      <title>Core Infrastructure</title>
+      <tasks>
+        - Set up Python project structure
+        - Configure SQLAlchemy with SQLite
+        - Create database models
+        - Set up FastAPI server skeleton
+        - Implement config file loading (YAML)
+        - Create basic health check endpoint
+      </tasks>
+    </step>
+    <step number="2">
+      <title>Exchange Integration</title>
+      <tasks>
+        - Integrate ccxt library
+        - Implement MEXC connection
+        - Create order placement functions
+        - Implement balance and position queries
+        - Add error handling and retry logic
+        - Test with real exchange (small amounts)
+      </tasks>
+    </step>
+    <step number="3">
+      <title>Virtual Wallet and Safety</title>
+      <tasks>
+        - Implement virtual wallet logic
+        - Add stop loss checks
+        - Implement drawdown monitoring
+        - Create kill switch functionality
+        - Add consecutive loss tracking
+        - Implement strategy rotation logic
+      </tasks>
+    </step>
+    <step number="4">
+      <title>First Trading Strategy</title>
+      <tasks>
+        - Implement one strategy (suggest: DCA Accumulator as simplest)
+        - Add strategy parameter configuration
+        - Create dry run mode
+        - Test strategy logic thoroughly
+        - Verify with dry run before live
+      </tasks>
+    </step>
+    <step number="5">
+      <title>Bot Lifecycle Management</title>
+      <tasks>
+        - Implement bot CRUD operations
+        - Create bot state machine (created/running/paused/stopped)
+        - Add start/pause/stop logic
+        - Implement auto-resume on startup
+        - Add WebSocket for real-time updates
+      </tasks>
+    </step>
+    <step number="6">
+      <title>Logging and Accounting</title>
+      <tasks>
+        - Implement order logging to database
+        - Create per-bot log files
+        - Add fiscal/tax data extraction
+        - Build P&L calculation functions
+        - Create report endpoints
+      </tasks>
+    </step>
+    <step number="7">
+      <title>External Data Integration</title>
+      <tasks>
+        - Add CoinMarketCap integration
+        - Add CoinGecko integration
+        - Implement priority/averaging logic
+        - Create auto-adjustment triggers
+        - Add extreme condition detection
+      </tasks>
+    </step>
+    <step number="8">
+      <title>Additional Strategies</title>
+      <tasks>
+        - Implement remaining 9 strategies
+        - Add Auto Mode with factor selection
+        - Test each strategy in dry run
+        - Validate parameter configurations
+      </tasks>
+    </step>
+    <step number="9">
+      <title>Email Alerts</title>
+      <tasks>
+        - Implement SMTP email sending
+        - Add alert triggers
+        - Create alert log
+        - Test email delivery
+      </tasks>
+    </step>
+    <step number="10">
+      <title>Web UI</title>
+      <tasks>
+        - Set up React project with Tailwind
+        - Build dashboard layout
+        - Create bot list and detail pages
+        - Implement create bot wizard
+        - Add P&L chart
+        - Connect WebSocket for real-time
+        - Add toast notifications
+      </tasks>
+    </step>
+  </implementation_steps>
+
+  <success_criteria>
+    <functionality>
+      - Can create and run at least one bot with one strategy on MEXC
+      - Virtual wallet enforced from day one
+      - Stop losses and kill switch working
+      - Orders logged to database and files
+      - Bot can be started, paused, stopped via UI
+      - Dry run mode works with simulated P&L
+    </functionality>
+    <safety>
+      - Virtual wallet prevents exceeding budget
+      - Stop losses trigger correctly
+      - Kill switch cancels all pending orders
+      - Consecutive loss detection pauses bot
+      - No possibility of draining account due to bug
+    </safety>
+    <technical_quality>
+      - Critical paths have test coverage
+      - Error handling for exchange API failures
+      - Graceful degradation on external data source failures
+      - Clean shutdown preserves state
+    </technical_quality>
+    <usability>
+      - Web UI shows bot status clearly
+      - Can create bot without editing config files
+      - Tax data easily exportable
+      - Logs provide audit trail
+    </usability>
+  </success_criteria>
+</project_specification>

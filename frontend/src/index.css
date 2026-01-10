@@ -1,0 +1,49 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* Custom base styles */
+@layer base {
+  body {
+    @apply bg-gray-900 text-gray-100 antialiased;
+  }
+}
+
+/* Monospace font for numbers */
+.font-mono-numbers {
+  font-family: 'JetBrains Mono', 'Fira Code', Monaco, monospace;
+  font-variant-numeric: tabular-nums;
+}
+
+/* Status colors */
+.status-running {
+  @apply text-running;
+}
+
+.status-paused {
+  @apply text-paused;
+}
+
+.status-stopped {
+  @apply text-stopped;
+}
+
+.status-created {
+  @apply text-gray-400;
+}
+
+/* P&L colors */
+.pnl-positive {
+  @apply text-profit;
+}
+
+.pnl-negative {
+  @apply text-loss;
+}
+
+/* Focus ring for accessibility */
+@layer utilities {
+  .focus-ring {
+    @apply focus:outline-none focus:ring-2 focus:ring-accent focus:ring-offset-2 focus:ring-offset-gray-900;
+  }
+}
