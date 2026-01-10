@@ -1,4 +1,5 @@
 import { useParams, Link, useNavigate } from 'react-router-dom'
+import { useState } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import {
   ArrowLeft,
@@ -10,6 +11,9 @@ import {
   Copy,
   TrendingUp,
   AlertCircle,
+  Save,
+  X,
+  Check,
 } from 'lucide-react'
 
 interface Bot {
@@ -152,6 +156,58 @@ export default function BotDetail() {
     onSuccess: () => queryClient.invalidateQueries({ queryKey: ['bot', id] }),
   })
 
+  // Edit mode state
+  const [isEditing, setIsEditing] = useState(false)
+  const [editForm, setEditForm] = useState({
+    name: '',
+    budget: 0,
+    stop_loss_percent: 0,
+    drawdown_limit_percent: 0,
+    compound_enabled: false,
+    strategy_params: {} as Record<string, unknown>,
+  })
+  const [editSuccess, setEditSuccess] = useState(false)
+
+  const updateMutation = useMutation({
+    mutationFn: async (data: typeof editForm) => {
+      const res = await fetch(`/api/bots/${id}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(data),
+      })
+      if (!res.ok) throw new Error('Failed to update bot')
+      return res.json()
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['bot', id] })
+      setIsEditing(false)
+      setEditSuccess(true)
+      setTimeout(() => setEditSuccess(false), 3000)
+    },
+  })
+
+  const startEditing = () => {
+    if (bot) {
+      setEditForm({
+        name: bot.name,
+        budget: bot.budget,
+        stop_loss_percent: bot.stop_loss_percent || 0,
+        drawdown_limit_percent: bot.drawdown_limit_percent || 0,
+        compound_enabled: bot.compound_enabled,
+        strategy_params: bot.strategy_params || {},
+      })
+      setIsEditing(true)
+    }
+  }
+
+  const cancelEditing = () => {
+    setIsEditing(false)
+  }
+
+  const saveChanges = () => {
+    updateMutation.mutate(editForm)
+  }
+
   if (isLoading) {
     return (
       <div className="flex items-center justify-center h-64">
@@ -264,11 +320,34 @@ export default function BotDetail() {
               Kill
             </button>
           )}
-          {canEdit && (
-            <button className="flex items-center gap-2 px-4 py-2 bg-gray-700 text-white hover:bg-gray-600 rounded-lg">
+          {canEdit && !isEditing && (
+            <button
+              onClick={startEditing}
+              className="flex items-center gap-2 px-4 py-2 bg-gray-700 text-white hover:bg-gray-600 rounded-lg"
+            >
               <Edit size={18} />
               Edit
             </button>
+          )}
+          {isEditing && (
+            <>
+              <button
+                onClick={saveChanges}
+                disabled={updateMutation.isPending}
+                className="flex items-center gap-2 px-4 py-2 bg-profit text-white hover:bg-profit/80 rounded-lg"
+              >
+                <Save size={18} />
+                {updateMutation.isPending ? 'Saving...' : 'Save'}
+              </button>
+              <button
+                onClick={cancelEditing}
+                disabled={updateMutation.isPending}
+                className="flex items-center gap-2 px-4 py-2 bg-gray-700 text-white hover:bg-gray-600 rounded-lg"
+              >
+                <X size={18} />
+                Cancel
+              </button>
+            </>
           )}
           <button className="flex items-center gap-2 px-4 py-2 bg-gray-700 text-white hover:bg-gray-600 rounded-lg">
             <Copy size={18} />
@@ -276,6 +355,70 @@ export default function BotDetail() {
           </button>
         </div>
       </div>
+
+      {/* Success Message */}
+      {editSuccess && (
+        <div className="bg-profit/20 border border-profit text-profit px-4 py-3 rounded-lg flex items-center gap-2">
+          <Check size={18} />
+          Bot configuration updated successfully!
+        </div>
+      )}
+
+      {/* Edit Form */}
+      {isEditing && (
+        <div className="bg-gray-800 rounded-lg p-6">
+          <h3 className="text-lg font-semibold mb-4">Edit Configuration</h3>
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+            <div>
+              <label className="block text-sm text-gray-400 mb-1">Bot Name</label>
+              <input
+                type="text"
+                value={editForm.name}
+                onChange={(e) => setEditForm({ ...editForm, name: e.target.value })}
+                className="w-full px-3 py-2 bg-gray-700 border border-gray-600 rounded-lg text-white focus:border-accent focus:outline-none"
+              />
+            </div>
+            <div>
+              <label className="block text-sm text-gray-400 mb-1">Budget (USD)</label>
+              <input
+                type="number"
+                value={editForm.budget}
+                onChange={(e) => setEditForm({ ...editForm, budget: parseFloat(e.target.value) || 0 })}
+                className="w-full px-3 py-2 bg-gray-700 border border-gray-600 rounded-lg text-white focus:border-accent focus:outline-none"
+              />
+            </div>
+            <div>
+              <label className="block text-sm text-gray-400 mb-1">Stop Loss (%)</label>
+              <input
+                type="number"
+                value={editForm.stop_loss_percent}
+                onChange={(e) => setEditForm({ ...editForm, stop_loss_percent: parseFloat(e.target.value) || 0 })}
+                className="w-full px-3 py-2 bg-gray-700 border border-gray-600 rounded-lg text-white focus:border-accent focus:outline-none"
+              />
+            </div>
+            <div>
+              <label className="block text-sm text-gray-400 mb-1">Drawdown Limit (%)</label>
+              <input
+                type="number"
+                value={editForm.drawdown_limit_percent}
+                onChange={(e) => setEditForm({ ...editForm, drawdown_limit_percent: parseFloat(e.target.value) || 0 })}
+                className="w-full px-3 py-2 bg-gray-700 border border-gray-600 rounded-lg text-white focus:border-accent focus:outline-none"
+              />
+            </div>
+            <div className="md:col-span-2">
+              <label className="flex items-center gap-2 cursor-pointer">
+                <input
+                  type="checkbox"
+                  checked={editForm.compound_enabled}
+                  onChange={(e) => setEditForm({ ...editForm, compound_enabled: e.target.checked })}
+                  className="w-4 h-4 text-accent bg-gray-700 border-gray-600 rounded focus:ring-accent"
+                />
+                <span className="text-sm text-gray-300">Enable Compounding (add profits to budget)</span>
+              </label>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* Stats Cards */}
       <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
