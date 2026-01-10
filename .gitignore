@@ -1,0 +1,52 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+ENV/
+env/
+.venv/
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# Node
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Testing/Screenshots
+.playwright-mcp/
+
+# Databases
+*.db
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# Logs
+logs/*.log
+
+# Config secrets (but keep templates)
+config/exchanges.yaml
+config/email.yaml
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Build outputs
+frontend/dist/
