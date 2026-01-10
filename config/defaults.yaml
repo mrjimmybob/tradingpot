@@ -1,0 +1,22 @@
+# Default Parameters for Trading Bots
+
+# Risk Management Defaults
+risk:
+  stop_loss_percent: 5.0
+  drawdown_limit_percent: 10.0
+  max_strategy_rotations: 3
+  consecutive_losses_threshold: 3
+  daily_loss_limit: null  # null = no limit
+  weekly_loss_limit: null  # null = no limit
+
+# Virtual Wallet Defaults
+wallet:
+  default_budget: 100.0
+  compound_enabled: false
+
+# Trading Defaults
+trading:
+  default_dry_run: true
+  min_order_size: 1.0  # USD
+  max_order_size: 10000.0  # USD
+  default_fee_rate: 0.001  # 0.1%

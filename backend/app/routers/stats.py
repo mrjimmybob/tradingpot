@@ -8,6 +8,7 @@ from sqlalchemy import select, func
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..models import get_session, Bot, BotStatus, PnLSnapshot, Alert, Order, OrderStatus
+from ..services import trading_engine
 
 router = APIRouter()
 
@@ -111,18 +112,23 @@ async def kill_all_bots(
     session: AsyncSession = Depends(get_session),
 ):
     """Global kill switch - stops all running bots and cancels all pending orders."""
+    # First, kill all bots via trading engine
+    engine_killed = await trading_engine.kill_all_bots()
+
+    # Then update database for any bots not managed by engine
     result = await session.execute(
         select(Bot).where(Bot.status == BotStatus.RUNNING)
     )
     running_bots = result.scalars().all()
 
-    killed_count = 0
+    killed_count = engine_killed
     cancelled_orders_count = 0
 
     for bot in running_bots:
         bot.status = BotStatus.STOPPED
         bot.updated_at = datetime.utcnow()
-        killed_count += 1
+        if engine_killed == 0:  # Only count if not already killed by engine
+            killed_count += 1
 
         # Cancel all pending orders for this bot
         orders_result = await session.execute(
@@ -146,7 +152,7 @@ async def kill_all_bots(
         session.add(alert)
 
     # Log a global alert
-    if killed_count > 0:
+    if killed_count > 0 or cancelled_orders_count > 0:
         global_alert = Alert(
             bot_id=None,  # Global alert
             alert_type="global_kill_switch",

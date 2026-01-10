@@ -2,12 +2,13 @@
 
 from datetime import datetime
 from typing import List, Optional
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, status, BackgroundTasks
 from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..models import get_session, Bot, BotStatus, Order, Position
+from ..services import trading_engine
 
 router = APIRouter()
 
@@ -244,6 +245,7 @@ async def delete_bot(
 @router.post("/{bot_id}/start", response_model=BotResponse)
 async def start_bot(
     bot_id: int,
+    background_tasks: BackgroundTasks,
     session: AsyncSession = Depends(get_session),
 ):
     """Start a bot."""
@@ -262,12 +264,14 @@ async def start_bot(
             detail="Bot is already running"
         )
 
+    # Start the trading engine for this bot
+    background_tasks.add_task(trading_engine.start_bot, bot_id)
+
+    # Update status (will also be updated by trading engine)
     bot.status = BotStatus.RUNNING
     bot.started_at = datetime.utcnow()
     bot.paused_at = None
     bot.updated_at = datetime.utcnow()
-
-    # TODO: Actually start the trading task
 
     await session.commit()
     await session.refresh(bot)
@@ -277,6 +281,7 @@ async def start_bot(
 @router.post("/{bot_id}/pause", response_model=BotResponse)
 async def pause_bot(
     bot_id: int,
+    background_tasks: BackgroundTasks,
     session: AsyncSession = Depends(get_session),
 ):
     """Pause a running bot."""
@@ -295,11 +300,12 @@ async def pause_bot(
             detail="Can only pause a running bot"
         )
 
+    # Pause the trading engine for this bot
+    background_tasks.add_task(trading_engine.pause_bot, bot_id)
+
     bot.status = BotStatus.PAUSED
     bot.paused_at = datetime.utcnow()
     bot.updated_at = datetime.utcnow()
-
-    # TODO: Actually pause the trading task
 
     await session.commit()
     await session.refresh(bot)
@@ -310,6 +316,7 @@ async def pause_bot(
 async def stop_bot(
     bot_id: int,
     cancel_orders: bool = True,
+    background_tasks: BackgroundTasks = None,
     session: AsyncSession = Depends(get_session),
 ):
     """Stop a bot."""
@@ -328,11 +335,14 @@ async def stop_bot(
             detail="Bot is already stopped"
         )
 
+    # Stop the trading engine for this bot
+    if background_tasks:
+        background_tasks.add_task(trading_engine.stop_bot, bot_id, cancel_orders)
+    else:
+        await trading_engine.stop_bot(bot_id, cancel_orders)
+
     bot.status = BotStatus.STOPPED
     bot.updated_at = datetime.utcnow()
-
-    # TODO: Stop the trading task
-    # TODO: Cancel pending orders if cancel_orders is True
 
     await session.commit()
     await session.refresh(bot)
@@ -354,12 +364,21 @@ async def kill_bot(
             detail=f"Bot with id {bot_id} not found"
         )
 
+    # Kill the bot via trading engine
+    await trading_engine.kill_bot(bot_id)
+
     bot.status = BotStatus.STOPPED
     bot.updated_at = datetime.utcnow()
 
-    # TODO: Cancel all pending orders on exchange
-    # TODO: Log alert
-    # TODO: Send email notification
+    # Log alert
+    from ..models import Alert
+    alert = Alert(
+        bot_id=bot_id,
+        alert_type="kill_switch",
+        message=f"Kill switch activated for bot '{bot.name}' (ID: {bot_id})",
+        email_sent=False,
+    )
+    session.add(alert)
 
     await session.commit()
     await session.refresh(bot)
