@@ -14,6 +14,7 @@ import {
   Save,
   X,
   Check,
+  Rocket,
 } from 'lucide-react'
 
 interface Bot {
@@ -154,6 +155,27 @@ export default function BotDetail() {
       return res.json()
     },
     onSuccess: () => queryClient.invalidateQueries({ queryKey: ['bot', id] }),
+  })
+
+  const goLiveMutation = useMutation({
+    mutationFn: async () => {
+      const res = await fetch(`/api/bots/${id}/go-live`, { method: 'POST' })
+      if (!res.ok) throw new Error('Failed to promote bot to live')
+      return res.json()
+    },
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ['bot', id] }),
+  })
+
+  const copyMutation = useMutation({
+    mutationFn: async () => {
+      const res = await fetch(`/api/bots/${id}/copy`, { method: 'POST' })
+      if (!res.ok) throw new Error('Failed to copy bot')
+      return res.json()
+    },
+    onSuccess: (data) => {
+      queryClient.invalidateQueries({ queryKey: ['bots'] })
+      navigate(`/bots/${data.id}`)
+    },
   })
 
   // Edit mode state
@@ -349,9 +371,31 @@ export default function BotDetail() {
               </button>
             </>
           )}
-          <button className="flex items-center gap-2 px-4 py-2 bg-gray-700 text-white hover:bg-gray-600 rounded-lg">
+          {bot.is_dry_run && bot.status !== 'running' && (
+            <button
+              onClick={() => {
+                if (confirm('Are you sure you want to promote this bot to live trading? This will use real funds and place real orders on the exchange.')) {
+                  goLiveMutation.mutate()
+                }
+              }}
+              disabled={goLiveMutation.isPending}
+              className="flex items-center gap-2 px-4 py-2 bg-profit text-white hover:bg-profit/80 rounded-lg"
+            >
+              <Rocket size={18} />
+              {goLiveMutation.isPending ? 'Promoting...' : 'Go Live'}
+            </button>
+          )}
+          <button
+            onClick={() => {
+              if (confirm('Create a copy of this bot?')) {
+                copyMutation.mutate()
+              }
+            }}
+            disabled={copyMutation.isPending}
+            className="flex items-center gap-2 px-4 py-2 bg-gray-700 text-white hover:bg-gray-600 rounded-lg"
+          >
             <Copy size={18} />
-            Copy
+            {copyMutation.isPending ? 'Copying...' : 'Copy'}
           </button>
         </div>
       </div>
