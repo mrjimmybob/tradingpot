@@ -15,6 +15,19 @@ export default {
         stopped: '#6b7280', // Gray for stopped status
         accent: '#6366f1',  // Indigo accent
       },
+      textColor: {
+        profit: '#22c55e',
+        loss: '#ef4444',
+        running: '#3b82f6',
+        paused: '#eab308',
+        stopped: '#6b7280',
+        accent: '#6366f1',
+      },
+      ringColor: {
+        accent: '#6366f1',
+        profit: '#22c55e',
+        loss: '#ef4444',
+      },
       fontFamily: {
         mono: ['JetBrains Mono', 'Fira Code', 'Monaco', 'monospace'],
       },

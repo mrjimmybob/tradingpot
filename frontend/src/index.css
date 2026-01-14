@@ -17,15 +17,15 @@
 
 /* Status colors */
 .status-running {
-  @apply text-running;
+  @apply text-blue-500;
 }
 
 .status-paused {
-  @apply text-paused;
+  @apply text-yellow-500;
 }
 
 .status-stopped {
-  @apply text-stopped;
+  @apply text-gray-500;
 }
 
 .status-created {
@@ -34,16 +34,80 @@
 
 /* P&L colors */
 .pnl-positive {
-  @apply text-profit;
+  @apply text-green-500;
 }
 
 .pnl-negative {
-  @apply text-loss;
+  @apply text-red-500;
 }
 
-/* Focus ring for accessibility */
+/* Focus ring for accessibility - #156 */
 @layer utilities {
   .focus-ring {
-    @apply focus:outline-none focus:ring-2 focus:ring-accent focus:ring-offset-2 focus:ring-offset-gray-900;
+    @apply focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:ring-offset-2 focus:ring-offset-gray-900;
   }
+
+  /* #161: Visually hidden but accessible to screen readers */
+  .sr-only {
+    @apply absolute w-px h-px p-0 -m-px overflow-hidden whitespace-nowrap border-0;
+    clip: rect(0, 0, 0, 0);
+  }
+
+  /* #156: Ensure all interactive elements have visible focus */
+  .focus-visible-ring {
+    @apply focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500 focus-visible:ring-offset-2 focus-visible:ring-offset-gray-900;
+  }
+}
+
+/* #156: Global focus styles for buttons and links */
+@layer base {
+  button:focus-visible,
+  a:focus-visible,
+  [role="button"]:focus-visible {
+    @apply outline-none ring-2 ring-indigo-500 ring-offset-2 ring-offset-gray-900;
+  }
+
+  /* Ensure interactive table headers are focusable */
+  th[role="button"]:focus-visible,
+  th.cursor-pointer:focus-visible {
+    @apply outline-none ring-2 ring-indigo-500 ring-inset;
+  }
+}
+
+/* Modal animations */
+@keyframes fadeIn {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+@keyframes scaleIn {
+  from {
+    opacity: 0;
+    transform: scale(0.95);
+  }
+  to {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+
+.animate-fadeIn {
+  animation: fadeIn 0.15s ease-out;
+}
+
+.animate-scaleIn {
+  animation: scaleIn 0.15s ease-out;
+}
+
+/* Form error styling */
+.input-error {
+  @apply border-red-500 focus:ring-red-500;
+}
+
+.input-success {
+  @apply border-green-500 focus:ring-green-500;
 }
