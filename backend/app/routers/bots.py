@@ -3,14 +3,76 @@
 from datetime import datetime
 from typing import List, Optional
 from fastapi import APIRouter, Depends, HTTPException, status, BackgroundTasks
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..models import get_session, Bot, BotStatus, Order, Position
 from ..services import trading_engine
+from ..services.logging_service import ensure_bot_log_directory
+from .config import STRATEGIES
 
 router = APIRouter()
+
+
+def validate_strategy_params(strategy: str, params: dict) -> list[str]:
+    """Validate strategy parameters against strategy definitions.
+
+    Returns a list of validation errors (empty if valid).
+    """
+    errors = []
+
+    # Find the strategy definition
+    strategy_def = next((s for s in STRATEGIES if s.name == strategy), None)
+    if not strategy_def:
+        valid_strategies = [s.name for s in STRATEGIES]
+        errors.append(f"Unknown strategy '{strategy}'. Valid strategies: {', '.join(valid_strategies)}")
+        return errors
+
+    # Validate each provided parameter
+    for param_name, param_value in params.items():
+        if param_name not in strategy_def.parameters:
+            valid_params = list(strategy_def.parameters.keys())
+            errors.append(f"Unknown parameter '{param_name}' for strategy '{strategy}'. Valid parameters: {', '.join(valid_params)}")
+            continue
+
+        param_schema = strategy_def.parameters[param_name]
+        param_type = param_schema.get("type")
+
+        # Skip validation for None values (use default)
+        if param_value is None:
+            continue
+
+        # Type validation
+        if param_type == "number":
+            if not isinstance(param_value, (int, float)):
+                errors.append(f"Parameter '{param_name}' must be a number, got {type(param_value).__name__}")
+                continue
+
+            # Min/max validation
+            if "min" in param_schema and param_value < param_schema["min"]:
+                errors.append(f"Parameter '{param_name}' must be >= {param_schema['min']}, got {param_value}")
+            if "max" in param_schema and param_value > param_schema["max"]:
+                errors.append(f"Parameter '{param_name}' must be <= {param_schema['max']}, got {param_value}")
+
+        elif param_type == "boolean":
+            if not isinstance(param_value, bool):
+                errors.append(f"Parameter '{param_name}' must be a boolean, got {type(param_value).__name__}")
+
+        elif param_type == "string":
+            if not isinstance(param_value, str):
+                errors.append(f"Parameter '{param_name}' must be a string, got {type(param_value).__name__}")
+                continue
+
+            # Options validation
+            if "options" in param_schema and param_value not in param_schema["options"]:
+                errors.append(f"Parameter '{param_name}' must be one of {param_schema['options']}, got '{param_value}'")
+
+        elif param_type == "array":
+            if not isinstance(param_value, list):
+                errors.append(f"Parameter '{param_name}' must be an array, got {type(param_value).__name__}")
+
+    return errors
 
 
 # Pydantic schemas
@@ -32,6 +94,14 @@ class BotCreate(BaseModel):
     max_strategy_rotations: int = Field(default=3, ge=0)
     is_dry_run: bool = False
 
+    # #168: Reject whitespace-only input for required string fields
+    @field_validator('name', 'trading_pair', 'strategy')
+    @classmethod
+    def check_not_whitespace_only(cls, v: str, info) -> str:
+        if not v.strip():
+            raise ValueError(f'{info.field_name} cannot be empty or whitespace only')
+        return v
+
 
 class BotUpdate(BaseModel):
     """Schema for updating a bot."""
@@ -48,6 +118,14 @@ class BotUpdate(BaseModel):
     daily_loss_limit: Optional[float] = Field(default=None, ge=0)
     weekly_loss_limit: Optional[float] = Field(default=None, ge=0)
     max_strategy_rotations: Optional[int] = Field(default=None, ge=0)
+
+    # #168: Reject whitespace-only input for optional string fields (when provided)
+    @field_validator('name', 'strategy')
+    @classmethod
+    def check_not_whitespace_only(cls, v: Optional[str], info) -> Optional[str]:
+        if v is not None and not v.strip():
+            raise ValueError(f'{info.field_name} cannot be empty or whitespace only')
+        return v
 
 
 class BotResponse(BaseModel):
@@ -142,6 +220,17 @@ async def create_bot(
     session: AsyncSession = Depends(get_session),
 ):
     """Create a new bot."""
+    # Validate strategy and parameters
+    validation_errors = validate_strategy_params(bot_data.strategy, bot_data.strategy_params)
+    if validation_errors:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={
+                "message": "Invalid strategy parameters",
+                "errors": validation_errors
+            }
+        )
+
     bot = Bot(
         name=bot_data.name,
         trading_pair=bot_data.trading_pair,
@@ -164,6 +253,10 @@ async def create_bot(
     session.add(bot)
     await session.commit()
     await session.refresh(bot)
+
+    # Create per-bot log directory
+    ensure_bot_log_directory(bot.id)
+
     return bot
 
 
@@ -206,8 +299,23 @@ async def update_bot(
             detail="Cannot update a running bot. Pause or stop it first."
         )
 
-    # Update fields
+    # Validate strategy and parameters if either is being updated
     update_data = bot_data.model_dump(exclude_unset=True)
+    strategy_to_validate = update_data.get("strategy", bot.strategy)
+    params_to_validate = update_data.get("strategy_params", bot.strategy_params or {})
+
+    if "strategy" in update_data or "strategy_params" in update_data:
+        validation_errors = validate_strategy_params(strategy_to_validate, params_to_validate)
+        if validation_errors:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail={
+                    "message": "Invalid strategy parameters",
+                    "errors": validation_errors
+                }
+            )
+
+    # Update fields
     for field, value in update_data.items():
         setattr(bot, field, value)
 
@@ -427,6 +535,13 @@ async def copy_bot(
     session: AsyncSession = Depends(get_session),
 ):
     """Copy a bot's configuration to a new bot."""
+    # #168: Reject whitespace-only new_name
+    if new_name is not None and not new_name.strip():
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Bot name cannot be empty or whitespace only"
+        )
+
     result = await session.execute(select(Bot).where(Bot.id == bot_id))
     source_bot = result.scalar_one_or_none()
 

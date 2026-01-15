@@ -1,0 +1,38 @@
+# TradingBot Configuration
+# This file is validated on server startup
+
+server:
+  host: "0.0.0.0"
+  port: 8000
+  debug: false
+
+database:
+  url: "sqlite+aiosqlite:///./tradingbot.db"
+
+trading:
+  # Default values for bot execution
+  execution_interval_seconds: 1
+  pnl_snapshot_interval_seconds: 300
+
+  # Risk management defaults
+  default_stop_loss_percent: 10.0
+  default_daily_loss_limit: 500.0
+
+exchange:
+  # Exchange API configuration (for live trading)
+  api_key: ""
+  api_secret: ""
+  sandbox_mode: true
+
+email:
+  enabled: false
+  smtp_host: ""
+  smtp_port: 587
+  smtp_user: ""
+  smtp_password: ""
+  from_address: ""
+  to_address: ""
+
+logging:
+  level: "INFO"
+  format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"

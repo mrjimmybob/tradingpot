@@ -1,0 +1,35 @@
+sources:
+  fear_greed:
+    api_key: ''
+    cache_ttl_seconds: 1800
+    enabled: false
+    refresh_interval_seconds: 3600
+    settings: {}
+  market_conditions:
+    api_key: ''
+    cache_ttl_seconds: 180
+    enabled: false
+    refresh_interval_seconds: 300
+    settings: {}
+  news_api:
+    api_key: ''
+    cache_ttl_seconds: 300
+    enabled: false
+    refresh_interval_seconds: 600
+    settings:
+      keywords:
+      - bitcoin
+      - ethereum
+      - crypto
+  onchain_metrics:
+    api_key: ''
+    cache_ttl_seconds: 600
+    enabled: false
+    refresh_interval_seconds: 900
+    settings: {}
+  social_sentiment:
+    api_key: ''
+    cache_ttl_seconds: 600
+    enabled: false
+    refresh_interval_seconds: 900
+    settings: {}

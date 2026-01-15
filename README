@@ -1,0 +1,160 @@
+Here's how to run everything:
+  Ports
+  ┌─────────────┬──────┬────────────────────────────┐
+  │   Service   │ Port │            URL             │
+  ├─────────────┼──────┼────────────────────────────┤
+  │ Backend API │ 8000 │ http://localhost:8000      │
+  ├─────────────┼──────┼────────────────────────────┤
+  │ Frontend    │ 5173 │ http://localhost:5173      │
+  ├─────────────┼──────┼────────────────────────────┤
+  │ API Docs    │ 8000 │ http://localhost:8000/docs │
+  └─────────────┴──────┴────────────────────────────┘
+  ---
+  Running the Backend
+
+  cd D:\MyDocuments\Development\tradingbot\backend
+
+  # Install dependencies (first time only)
+  pip install -r requirements.txt
+
+  # Run the server
+  uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
+
+  ---
+  Running the Frontend
+
+  cd D:\MyDocuments\Development\tradingbot\frontend
+
+  # Install dependencies (first time only)
+  npm install
+
+  # Run dev server
+  npm run dev
+
+  ---
+  Running Tests
+
+  Frontend tests (Vitest):
+  cd D:\MyDocuments\Development\tradingbot\frontend
+  npm test
+
+  Backend tests (Pytest):
+  cd D:\MyDocuments\Development\tradingbot\backend
+  pytest
+
+  ---
+  Quick Start (Both Services)
+
+  Open two terminals:
+
+  Terminal 1 - Backend:
+  cd D:\MyDocuments\Development\tradingbot\backend
+  uvicorn app.main:app --reload
+
+  Terminal 2 - Frontend:
+  cd D:\MyDocuments\Development\tradingbot\frontend
+  npm run dev
+
+  Then open http://localhost:5173 in your browser.
+  
+
+
+---
+  Configuration Files Summary
+
+  Files You MUST Edit (for production)
+  File: backend/config.yaml
+  Purpose: Main backend config
+  What to Configure: Exchange API keys, email settings
+  ────────────────────────────────────────
+  File: backend/data_sources.yaml
+  Purpose: External data sources
+  What to Configure: API keys, enable/disable sources
+  backend/config.yaml - Key Settings:
+
+  server:
+    host: "0.0.0.0"      # Keep as-is
+    port: 8000           # Backend port
+
+  exchange:
+    api_key: ""          # YOUR EXCHANGE API KEY
+    api_secret: ""       # YOUR EXCHANGE SECRET
+    sandbox_mode: true   # Set false for live trading
+
+  email:
+    enabled: false       # Set true to enable alerts
+    smtp_host: ""        # e.g., smtp.gmail.com
+    smtp_port: 587
+    smtp_user: ""        # Your email
+    smtp_password: ""    # Your email password/app key
+    from_address: ""
+    to_address: ""       # Alert recipient
+
+  backend/data_sources.yaml - External Data:
+
+  sources:
+    fear_greed:
+      enabled: false     # Set true to enable (free, no API key)
+
+    market_conditions:
+      enabled: false     # Set true to enable (free CoinGecko)
+
+    news_api:
+      enabled: false
+      api_key: ""        # Get from https://newsapi.org/
+
+    # These need paid APIs in production:
+    onchain_metrics:
+      enabled: false
+      api_key: ""
+
+    social_sentiment:
+      enabled: false
+      api_key: ""
+
+  ---
+  Quick Start Checklist
+
+  1. Install dependencies:
+  # Backend
+  cd backend
+  pip install -r requirements.txt
+
+  # Frontend
+  cd frontend
+  npm install
+  2. Configure (minimum for dev):
+    - backend/config.yaml - No changes needed for dry-run mode
+    - backend/data_sources.yaml - Enable fear_greed and market_conditions if you want
+  external data
+  3. Run:
+  # Terminal 1 - Backend
+  cd backend
+  uvicorn app.main:app --reload
+
+  # Terminal 2 - Frontend
+  cd frontend
+  npm run dev
+  4. Access:
+    - Frontend: http://localhost:5173
+    - API Docs: http://localhost:8000/docs
+
+  ---
+  Files Created This Session
+
+  backend/
+    tests/
+      __init__.py
+      conftest.py
+      test_health.py
+      test_bots.py
+      test_data_sources.py
+      test_stats.py
+    pytest.ini
+
+  frontend/
+    src/tests/
+      setup.ts
+      utils.test.ts
+    vite.config.ts (updated)
+    package.json (updated)

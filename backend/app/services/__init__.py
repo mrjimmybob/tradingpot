@@ -25,6 +25,35 @@ from .trading_engine import (
     TradeSignal,
     trading_engine,
 )
+from .email import (
+    EmailService,
+    email_service,
+)
+from .websocket import (
+    WebSocketManager,
+    ws_manager,
+    MarketDataService,
+    MarketIndicators,
+    MEXCWebSocketConnector,
+)
+from .config import (
+    ConfigService,
+    config_service,
+    ConfigValidationException,
+    ConfigValidationError,
+)
+from .logging_service import (
+    BotLoggingService,
+    TradeLogEntry,
+    FiscalLogEntry,
+    ensure_bot_log_directory,
+)
+from .external_data import (
+    ExternalDataService,
+    external_data_service,
+    DataSourceType,
+    AggregatedSignals,
+)
 
 __all__ = [
     # Exchange
@@ -48,4 +77,28 @@ __all__ = [
     "TradingEngine",
     "TradeSignal",
     "trading_engine",
+    # Email
+    "EmailService",
+    "email_service",
+    # WebSocket
+    "WebSocketManager",
+    "ws_manager",
+    "MarketDataService",
+    "MarketIndicators",
+    "MEXCWebSocketConnector",
+    # Config
+    "ConfigService",
+    "config_service",
+    "ConfigValidationException",
+    "ConfigValidationError",
+    # Logging
+    "BotLoggingService",
+    "TradeLogEntry",
+    "FiscalLogEntry",
+    "ensure_bot_log_directory",
+    # External Data
+    "ExternalDataService",
+    "external_data_service",
+    "DataSourceType",
+    "AggregatedSignals",
 ]

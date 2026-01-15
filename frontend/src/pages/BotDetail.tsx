@@ -15,7 +15,12 @@ import {
   X,
   Check,
   Rocket,
+  Loader2,
 } from 'lucide-react'
+import { useToast } from '../components/Toast'
+import { useRealtimeBot, useRealtimePrice } from '../contexts/WebSocketContext'
+import { RealtimePrice } from '../components/RealtimePrice'
+import ProgressIndicator from '../components/ProgressIndicator'
 
 interface Bot {
   id: number
@@ -98,84 +103,146 @@ function getStatusColor(status: string): string {
   }
 }
 
+// #140, #141: Validate bot ID from URL parameter
+function isValidBotId(id: string | undefined): boolean {
+  if (!id) return false
+  const num = parseInt(id, 10)
+  return !isNaN(num) && num > 0 && String(num) === id
+}
+
 export default function BotDetail() {
   const { id } = useParams<{ id: string }>()
   const navigate = useNavigate()
   const queryClient = useQueryClient()
+  const toast = useToast()
+
+  // #140, #141: Validate URL parameter before making API call
+  const isValidId = isValidBotId(id)
 
   const { data: bot, isLoading, error } = useQuery({
     queryKey: ['bot', id],
     queryFn: () => fetchBot(id!),
-    enabled: !!id,
+    enabled: isValidId, // Only fetch if ID is valid
   })
 
   const { data: positions } = useQuery({
     queryKey: ['positions', id],
     queryFn: () => fetchPositions(id!),
-    enabled: !!id,
+    enabled: isValidId,
   })
 
   const { data: orders } = useQuery({
     queryKey: ['orders', id],
     queryFn: () => fetchOrders(id!),
-    enabled: !!id,
+    enabled: isValidId,
   })
+
+  // Real-time bot data from WebSocket
+  const realtimeBotData = useRealtimeBot(parseInt(id || '0'))
+
+  // Get real-time price for the trading pair
+  const realtimePrice = useRealtimePrice(bot?.trading_pair || '')
+
+  // Merge real-time data with query data
+  const displayPnl = realtimeBotData?.pnl ?? bot?.total_pnl ?? 0
+  const displayBalance = realtimeBotData?.current_balance ?? bot?.current_balance ?? 0
+  const displayPositions = realtimeBotData?.positions ?? positions
 
   const startMutation = useMutation({
     mutationFn: async () => {
       const res = await fetch(`/api/bots/${id}/start`, { method: 'POST' })
-      if (!res.ok) throw new Error('Failed to start bot')
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}))
+        throw new Error(data.detail || 'Failed to start bot')
+      }
       return res.json()
     },
-    onSuccess: () => queryClient.invalidateQueries({ queryKey: ['bot', id] }),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['bot', id] })
+      toast.success('Bot Started', `"${bot?.name}" is now running and executing trades`)
+    },
+    onError: (err: Error) => toast.error('Start Failed', err.message || 'Could not start the bot. Please try again.'),
   })
 
   const pauseMutation = useMutation({
     mutationFn: async () => {
       const res = await fetch(`/api/bots/${id}/pause`, { method: 'POST' })
-      if (!res.ok) throw new Error('Failed to pause bot')
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}))
+        throw new Error(data.detail || 'Failed to pause bot')
+      }
       return res.json()
     },
-    onSuccess: () => queryClient.invalidateQueries({ queryKey: ['bot', id] }),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['bot', id] })
+      toast.info('Bot Paused', `"${bot?.name}" has been paused. No new trades will be executed.`)
+    },
+    onError: (err: Error) => toast.error('Pause Failed', err.message || 'Could not pause the bot. Please try again.'),
   })
 
   const stopMutation = useMutation({
     mutationFn: async () => {
       const res = await fetch(`/api/bots/${id}/stop`, { method: 'POST' })
-      if (!res.ok) throw new Error('Failed to stop bot')
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}))
+        throw new Error(data.detail || 'Failed to stop bot')
+      }
       return res.json()
     },
-    onSuccess: () => queryClient.invalidateQueries({ queryKey: ['bot', id] }),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['bot', id] })
+      toast.info('Bot Stopped', `"${bot?.name}" has been stopped completely.`)
+    },
+    onError: (err: Error) => toast.error('Stop Failed', err.message || 'Could not stop the bot. Please try again.'),
   })
 
   const killMutation = useMutation({
     mutationFn: async () => {
       const res = await fetch(`/api/bots/${id}/kill`, { method: 'POST' })
-      if (!res.ok) throw new Error('Failed to kill bot')
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}))
+        throw new Error(data.detail || 'Failed to activate kill switch')
+      }
       return res.json()
     },
-    onSuccess: () => queryClient.invalidateQueries({ queryKey: ['bot', id] }),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['bot', id] })
+      toast.warning('Kill Switch Activated', `"${bot?.name}" has been emergency stopped. All pending orders cancelled.`)
+    },
+    onError: (err: Error) => toast.error('Kill Switch Failed', err.message || 'Could not activate kill switch. Please try again.'),
   })
 
   const goLiveMutation = useMutation({
     mutationFn: async () => {
       const res = await fetch(`/api/bots/${id}/go-live`, { method: 'POST' })
-      if (!res.ok) throw new Error('Failed to promote bot to live')
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}))
+        throw new Error(data.detail || 'Failed to promote bot to live')
+      }
       return res.json()
     },
-    onSuccess: () => queryClient.invalidateQueries({ queryKey: ['bot', id] }),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['bot', id] })
+      toast.success('Bot Promoted to Live', `"${bot?.name}" will now execute real trades with real funds.`)
+    },
+    onError: (err: Error) => toast.error('Promotion Failed', err.message || 'Could not promote bot to live. Please try again.'),
   })
 
   const copyMutation = useMutation({
     mutationFn: async () => {
       const res = await fetch(`/api/bots/${id}/copy`, { method: 'POST' })
-      if (!res.ok) throw new Error('Failed to copy bot')
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}))
+        throw new Error(data.detail || 'Failed to copy bot')
+      }
       return res.json()
     },
     onSuccess: (data) => {
       queryClient.invalidateQueries({ queryKey: ['bots'] })
+      toast.success('Bot Copied', `Created "${data.name}" with the same configuration as "${bot?.name}"`)
       navigate(`/bots/${data.id}`)
     },
+    onError: (err: Error) => toast.error('Copy Failed', err.message || 'Could not copy the bot. Please try again.'),
   })
 
   // Edit mode state
@@ -197,15 +264,20 @@ export default function BotDetail() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(data),
       })
-      if (!res.ok) throw new Error('Failed to update bot')
+      if (!res.ok) {
+        const errData = await res.json().catch(() => ({}))
+        throw new Error(errData.detail || 'Failed to update bot')
+      }
       return res.json()
     },
-    onSuccess: () => {
+    onSuccess: (data) => {
       queryClient.invalidateQueries({ queryKey: ['bot', id] })
       setIsEditing(false)
       setEditSuccess(true)
       setTimeout(() => setEditSuccess(false), 3000)
+      toast.success('Configuration Saved', `"${data.name}" settings have been updated successfully.`)
     },
+    onError: (err: Error) => toast.error('Update Failed', err.message || 'Could not save changes. Please try again.'),
   })
 
   const startEditing = () => {
@@ -234,6 +306,26 @@ export default function BotDetail() {
     return (
       <div className="flex items-center justify-center h-64">
         <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-accent"></div>
+      </div>
+    )
+  }
+
+  // #140, #141: Handle invalid/malformed bot ID in URL
+  if (!isValidId) {
+    return (
+      <div className="text-center py-16">
+        <AlertCircle size={64} className="mx-auto mb-4 text-loss" />
+        <h2 className="text-xl font-semibold mb-2">Invalid Bot ID</h2>
+        <p className="text-gray-400 mb-6">
+          The URL contains an invalid bot ID "{id}". Bot IDs must be positive numbers.
+        </p>
+        <Link
+          to="/bots"
+          className="inline-flex items-center gap-2 text-accent hover:text-accent/80"
+        >
+          <ArrowLeft size={18} />
+          Back to Bots
+        </Link>
       </div>
     )
   }
@@ -298,20 +390,28 @@ export default function BotDetail() {
             <button
               onClick={() => pauseMutation.mutate()}
               disabled={pauseMutation.isPending}
-              className="flex items-center gap-2 px-4 py-2 bg-paused/20 text-paused hover:bg-paused/30 rounded-lg"
+              className="flex items-center gap-2 px-4 py-2 bg-paused/20 text-paused hover:bg-paused/30 rounded-lg disabled:opacity-50"
             >
-              <Pause size={18} />
-              Pause
+              {pauseMutation.isPending ? (
+                <Loader2 size={18} className="animate-spin" />
+              ) : (
+                <Pause size={18} />
+              )}
+              {pauseMutation.isPending ? 'Pausing...' : 'Pause'}
             </button>
           )}
           {(bot.status === 'paused' || bot.status === 'created') && (
             <button
               onClick={() => startMutation.mutate()}
               disabled={startMutation.isPending}
-              className="flex items-center gap-2 px-4 py-2 bg-running/20 text-running hover:bg-running/30 rounded-lg"
+              className="flex items-center gap-2 px-4 py-2 bg-running/20 text-running hover:bg-running/30 rounded-lg disabled:opacity-50"
             >
-              <Play size={18} />
-              Start
+              {startMutation.isPending ? (
+                <Loader2 size={18} className="animate-spin" />
+              ) : (
+                <Play size={18} />
+              )}
+              {startMutation.isPending ? 'Starting...' : 'Start'}
             </button>
           )}
           {bot.status !== 'stopped' && (
@@ -322,10 +422,14 @@ export default function BotDetail() {
                 }
               }}
               disabled={stopMutation.isPending}
-              className="flex items-center gap-2 px-4 py-2 bg-stopped/20 text-stopped hover:bg-stopped/30 rounded-lg"
+              className="flex items-center gap-2 px-4 py-2 bg-stopped/20 text-stopped hover:bg-stopped/30 rounded-lg disabled:opacity-50"
             >
-              <Square size={18} />
-              Stop
+              {stopMutation.isPending ? (
+                <Loader2 size={18} className="animate-spin" />
+              ) : (
+                <Square size={18} />
+              )}
+              {stopMutation.isPending ? 'Stopping...' : 'Stop'}
             </button>
           )}
           {bot.status === 'running' && (
@@ -336,10 +440,14 @@ export default function BotDetail() {
                 }
               }}
               disabled={killMutation.isPending}
-              className="flex items-center gap-2 px-4 py-2 bg-red-600 text-white hover:bg-red-700 rounded-lg"
+              className="flex items-center gap-2 px-4 py-2 bg-red-600 text-white hover:bg-red-700 rounded-lg disabled:opacity-50"
             >
-              <Power size={18} />
-              Kill
+              {killMutation.isPending ? (
+                <Loader2 size={18} className="animate-spin" />
+              ) : (
+                <Power size={18} />
+              )}
+              {killMutation.isPending ? 'Killing...' : 'Kill'}
             </button>
           )}
           {canEdit && !isEditing && (
@@ -356,9 +464,13 @@ export default function BotDetail() {
               <button
                 onClick={saveChanges}
                 disabled={updateMutation.isPending}
-                className="flex items-center gap-2 px-4 py-2 bg-profit text-white hover:bg-profit/80 rounded-lg"
+                className="flex items-center gap-2 px-4 py-2 bg-profit text-white hover:bg-profit/80 rounded-lg disabled:opacity-50"
               >
-                <Save size={18} />
+                {updateMutation.isPending ? (
+                  <Loader2 size={18} className="animate-spin" />
+                ) : (
+                  <Save size={18} />
+                )}
                 {updateMutation.isPending ? 'Saving...' : 'Save'}
               </button>
               <button
@@ -379,9 +491,13 @@ export default function BotDetail() {
                 }
               }}
               disabled={goLiveMutation.isPending}
-              className="flex items-center gap-2 px-4 py-2 bg-profit text-white hover:bg-profit/80 rounded-lg"
+              className="flex items-center gap-2 px-4 py-2 bg-profit text-white hover:bg-profit/80 rounded-lg disabled:opacity-50"
             >
-              <Rocket size={18} />
+              {goLiveMutation.isPending ? (
+                <Loader2 size={18} className="animate-spin" />
+              ) : (
+                <Rocket size={18} />
+              )}
               {goLiveMutation.isPending ? 'Promoting...' : 'Go Live'}
             </button>
           )}
@@ -392,9 +508,13 @@ export default function BotDetail() {
               }
             }}
             disabled={copyMutation.isPending}
-            className="flex items-center gap-2 px-4 py-2 bg-gray-700 text-white hover:bg-gray-600 rounded-lg"
+            className="flex items-center gap-2 px-4 py-2 bg-gray-700 text-white hover:bg-gray-600 rounded-lg disabled:opacity-50"
           >
-            <Copy size={18} />
+            {copyMutation.isPending ? (
+              <Loader2 size={18} className="animate-spin" />
+            ) : (
+              <Copy size={18} />
+            )}
             {copyMutation.isPending ? 'Copying...' : 'Copy'}
           </button>
         </div>
@@ -470,28 +590,31 @@ export default function BotDetail() {
           <p className="text-gray-400 text-sm">Total P&L</p>
           <p
             className={`text-2xl font-bold font-mono-numbers mt-1 ${
-              bot.total_pnl >= 0 ? 'text-profit' : 'text-loss'
+              displayPnl >= 0 ? 'text-profit' : 'text-loss'
             }`}
           >
-            {bot.total_pnl >= 0 ? '+' : ''}${bot.total_pnl.toFixed(2)}
+            {displayPnl >= 0 ? '+' : ''}${displayPnl.toFixed(2)}
           </p>
         </div>
         <div className="bg-gray-800 rounded-lg p-6">
           <p className="text-gray-400 text-sm">Current Balance</p>
           <p className="text-2xl font-bold font-mono-numbers mt-1">
-            ${bot.current_balance.toFixed(2)}
+            ${displayBalance.toFixed(2)}
           </p>
         </div>
         <div className="bg-gray-800 rounded-lg p-6">
-          <p className="text-gray-400 text-sm">Budget</p>
-          <p className="text-2xl font-bold font-mono-numbers mt-1">
-            ${bot.budget.toFixed(2)}
-          </p>
+          <p className="text-gray-400 text-sm">Current Price</p>
+          <RealtimePrice
+            symbol={bot.trading_pair}
+            fallbackPrice={0}
+            showChange={true}
+            size="lg"
+          />
         </div>
         <div className="bg-gray-800 rounded-lg p-6">
           <p className="text-gray-400 text-sm">Open Positions</p>
           <p className="text-2xl font-bold font-mono-numbers mt-1">
-            {positions?.length ?? 0}
+            {displayPositions?.length ?? 0}
           </p>
         </div>
       </div>

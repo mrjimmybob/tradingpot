@@ -1,0 +1,164 @@
+Remaining Features: 56/180 (31.1% left) 
+
+Group 1: Strategy Execution (7 features)
+  ┌─────┬────────────────────────────────────┐
+  │ ID  │              Feature               │
+  ├─────┼────────────────────────────────────┤
+  │     │ DCA Accumulator strategy execution │
+  ├─────┼────────────────────────────────────┤
+  │     │ Adaptive Grid strategy execution   │
+  ├─────┼────────────────────────────────────┤
+  │     │ Mean Reversion strategy execution  │
+  ├─────┼────────────────────────────────────┤
+  │     │ TWAP strategy execution            │
+  ├─────┼────────────────────────────────────┤
+  │     │ VWAP strategy execution            │
+  ├─────┼────────────────────────────────────┤
+  │     │ Auto Mode strategy selection       │
+  ├─────┼────────────────────────────────────┤
+  │     │ Strategy parameter validation      │
+  └─────┴────────────────────────────────────┘
+
+Group 2: External Data Sources (7 features)
+  ┌─────┬─────────────────────────────────────┐
+  │ ID  │               Feature               │
+  ├─────┼─────────────────────────────────────┤
+  │     │ CoinMarketCap data integration      │
+  ├─────┼─────────────────────────────────────┤
+  │     │ CoinGecko data integration          │
+  ├─────┼─────────────────────────────────────┤
+  │     │ Data source priority system         │
+  ├─────┼─────────────────────────────────────┤
+  │     │ Same-priority data source averaging │
+  ├─────┼─────────────────────────────────────┤
+  │     │ Fear/Greed index fetching           │
+  ├─────┼─────────────────────────────────────┤
+  │     │ Extreme market condition detection  │
+  ├─────┼─────────────────────────────────────┤
+  │     │ Data source fallback on API error   │
+  └─────┴─────────────────────────────────────┘
+
+Group 3: Server Lifecycle & Logging (8 features)
+  ┌─────┬────────────────────────────────────┐
+  │ ID  │              Feature               │
+  ├─────┼────────────────────────────────────┤
+  │     │ Config file validation on startup  │
+  ├─────┼────────────────────────────────────┤
+  │     │ Auto-resume bots on server restart │
+  ├─────┼────────────────────────────────────┤
+  │     │ Graceful shutdown saves state      │
+  ├─────┼────────────────────────────────────┤
+  │     │ Order logging to database          │
+  ├─────┼────────────────────────────────────┤
+  │     │ Per-bot log directory creation     │
+  ├─────┼────────────────────────────────────┤
+  │     │ Fiscal log files for tax           │
+  ├─────┼────────────────────────────────────┤
+  │     │ Dry run trades logged separately   │
+  ├─────┼────────────────────────────────────┤
+  │     │ Dry run tracks hypothetical P&L    │
+  └─────┴────────────────────────────────────┘
+
+Group 4: UI/UX Polish (18 features)
+  ┌─────┬───────────────────────────────────────────┐
+  │ ID  │                  Feature                  │
+  ├─────┼───────────────────────────────────────────┤
+  │     │ Network error shows user-friendly message │
+  ├─────┼───────────────────────────────────────────┤
+  │     │ Form errors clear when corrected          │
+  ├─────┼───────────────────────────────────────────┤
+  │     │ Pagination works in bot list              │
+  ├─────┼───────────────────────────────────────────┤
+  │     │ Pagination resets when filter changes     │
+  ├─────┼───────────────────────────────────────────┤
+  │     │ Sort functionality in bot list            │
+  ├─────┼───────────────────────────────────────────┤
+  │     │ Filter persists after viewing detail      │
+  ├─────┼───────────────────────────────────────────┤
+  │     │ Modal close button works                  │
+  ├─────┼───────────────────────────────────────────┤
+  │     │ Modal closes on backdrop click            │
+  ├─────┼───────────────────────────────────────────┤
+  │     │ Success toast on bot creation             │
+  ├─────┼───────────────────────────────────────────┤
+  │     │ Error toast on failed action              │
+  ├─────┼───────────────────────────────────────────┤
+  │     │ Multiple toasts don't overlap             │
+  ├─────┼───────────────────────────────────────────┤
+  │     │ Success messages are specific             │
+  ├─────┼───────────────────────────────────────────┤
+  │     │ Error messages are specific               │
+  ├─────┼───────────────────────────────────────────┤
+  │     │ Progress indicator for long operations    │
+  └─────┴───────────────────────────────────────────┘
+
+Group 5: URL & State Management (6 features)
+  ┌─────┬────────────────────────────────────┐
+  │ ID  │              Feature               │
+  ├─────┼────────────────────────────────────┤
+  │     │ Data persists after logout/login   │
+  ├─────┼────────────────────────────────────┤
+  │     │ URL parameter for bot ID validated │
+  ├─────┼────────────────────────────────────┤
+  │     │ Malformed URL parameters handled   │
+  ├─────┼────────────────────────────────────┤
+  │     │ Query params reflected in UI       │
+  ├─────┼────────────────────────────────────┤
+  │     │ Shareable filtered URL             │
+  ├─────┼────────────────────────────────────┤
+  │     │ Date sorting works across months   │
+  └─────┴────────────────────────────────────┘
+
+Group 6: Search & Filtering (6 features)
+  ┌─────┬────────────────────────────────────────────────────┐
+  │ ID  │                      Feature                       │
+  ├─────┼────────────────────────────────────────────────────┤
+  │     │ Search with special characters                     │
+  ├─────┼────────────────────────────────────────────────────┤
+  │     │ Search with only spaces handled                    │
+  ├─────┼────────────────────────────────────────────────────┤
+  │     │ Very long search string handled                    │
+  ├─────┼────────────────────────────────────────────────────┤
+  │     │ Filter + search + sort work together               │
+  ├─────┼────────────────────────────────────────────────────┤
+  │     │ Whitespace-only input rejected for required fields │
+  ├─────┼────────────────────────────────────────────────────┤
+  │    *│ Server-side validation matches client-side         │ finished ?
+  └─────┴────────────────────────────────────────────────────┘
+
+Group 7: Accessibility (3 features)
+  ┌─────┬───────────────────────────────────────────────────┐
+  │ ID  │                      Feature                      │
+  ├─────┼───────────────────────────────────────────────────┤
+  │     │ Tab navigation works through interactive elements │
+  ├─────┼───────────────────────────────────────────────────┤
+  │     │ ARIA labels on icon-only buttons                  │
+  ├─────┼───────────────────────────────────────────────────┤
+  │     │ Information not conveyed by color alone           │
+  └─────┴───────────────────────────────────────────────────┘
+
+Group 8: Performance & Export (4 features)
+  ┌─────┬─────────────────────────────────────────────┐
+  │ ID  │                   Feature                   │
+  ├─────┼─────────────────────────────────────────────┤
+  │     │ No console errors during normal operation   │
+  ├─────┼─────────────────────────────────────────────┤
+  │     │ Data export includes all created records    │
+  ├─────┼─────────────────────────────────────────────┤
+  │     │ Filtered export only includes filtered data │
+  ├─────┼─────────────────────────────────────────────┤
+  │     │ Search responds quickly                     │
+  ├─────┼─────────────────────────────────────────────┤
+  │     │ P&L chart loads with many data points       │
+  └─────┴─────────────────────────────────────────────┘
+  No console errors during normal operation, Data export includes all created records, Filtered export only includes filtered data, Search responds quickly and P&L chart loads with many data points  
+  ---
+  Recommended Priority:
+  1. Strategy Execution - Core trading functionality
+  2. External Data Sources - Market intelligence for strategies
+  3. Server Lifecycle - Production readiness
+  4. UI/UX Polish - User experience
+  5. Accessibility - Compliance and usability
+
+  Would you like me to implement any specific group of features?
+  

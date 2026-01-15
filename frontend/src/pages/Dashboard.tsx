@@ -1,5 +1,6 @@
 import { Link } from 'react-router-dom'
 import { useQuery } from '@tanstack/react-query'
+import { useMemo } from 'react'
 import {
   TrendingUp,
   TrendingDown,
@@ -9,6 +10,27 @@ import {
   AlertCircle,
 } from 'lucide-react'
 import { LineChart, Line, XAxis, YAxis, Tooltip, ResponsiveContainer } from 'recharts'
+
+// #178: Constants for chart performance optimization
+const MAX_CHART_POINTS = 200 // Maximum points to render for performance
+const LARGE_DATASET_THRESHOLD = 100 // Disable animations above this
+
+// #178: Sample data points for large datasets to maintain performance
+function sampleDataPoints<T>(data: T[], maxPoints: number): T[] {
+  if (data.length <= maxPoints) return data
+
+  // Always include first and last points, sample the rest evenly
+  const result: T[] = [data[0]]
+  const step = (data.length - 2) / (maxPoints - 2)
+
+  for (let i = 1; i < maxPoints - 1; i++) {
+    const index = Math.round(i * step)
+    result.push(data[index])
+  }
+
+  result.push(data[data.length - 1])
+  return result
+}
 
 interface Stats {
   total_bots: number
@@ -75,12 +97,19 @@ function StatCard({
           <Icon size={24} className="text-accent" />
         </div>
       </div>
+      {/* #161: Trend with screen reader text (not just color/icon) */}
       {trend && (
         <div className="mt-2">
           {trend === 'up' ? (
-            <TrendingUp size={16} className="text-profit inline mr-1" />
+            <>
+              <TrendingUp size={16} className="text-profit inline mr-1" aria-hidden="true" />
+              <span className="sr-only">Trending up</span>
+            </>
           ) : (
-            <TrendingDown size={16} className="text-loss inline mr-1" />
+            <>
+              <TrendingDown size={16} className="text-loss inline mr-1" aria-hidden="true" />
+              <span className="sr-only">Trending down</span>
+            </>
           )}
         </div>
       )}
@@ -116,6 +145,23 @@ export default function Dashboard() {
     queryKey: ['bots-summary'],
     queryFn: fetchBots,
   })
+
+  // #178: Optimize chart data for large datasets
+  const { chartData, isLargeDataset, dataPointCount } = useMemo(() => {
+    if (!pnlHistory || pnlHistory.length === 0) {
+      return { chartData: [], isLargeDataset: false, dataPointCount: 0 }
+    }
+
+    const count = pnlHistory.length
+    const isLarge = count > LARGE_DATASET_THRESHOLD
+    const sampled = sampleDataPoints(pnlHistory, MAX_CHART_POINTS)
+
+    return {
+      chartData: sampled,
+      isLargeDataset: isLarge,
+      dataPointCount: count,
+    }
+  }, [pnlHistory])
 
   if (statsLoading || pnlLoading || botsLoading) {
     return (
@@ -165,22 +211,34 @@ export default function Dashboard() {
         />
       </div>
 
-      {/* P&L Chart */}
+      {/* P&L Chart - #178: Optimized for large datasets */}
       <div className="bg-gray-800 rounded-lg p-6">
-        <h3 className="text-lg font-semibold mb-4">P&L Over Time</h3>
-        {pnlHistory && pnlHistory.length > 0 ? (
+        <div className="flex items-center justify-between mb-4">
+          <h3 className="text-lg font-semibold">P&L Over Time</h3>
+          {dataPointCount > 0 && (
+            <span className="text-xs text-gray-500">
+              {dataPointCount > MAX_CHART_POINTS
+                ? `Showing ${chartData.length} of ${dataPointCount} points`
+                : `${dataPointCount} data points`}
+            </span>
+          )}
+        </div>
+        {chartData.length > 0 ? (
           <ResponsiveContainer width="100%" height={300}>
-            <LineChart data={pnlHistory}>
+            <LineChart data={chartData}>
               <XAxis
                 dataKey="timestamp"
                 stroke="#6b7280"
-                tick={{ fill: '#9ca3af' }}
+                tick={{ fill: '#9ca3af', fontSize: 12 }}
                 tickFormatter={(value) => new Date(value).toLocaleDateString()}
+                interval="preserveStartEnd"
+                minTickGap={50}
               />
               <YAxis
                 stroke="#6b7280"
-                tick={{ fill: '#9ca3af' }}
+                tick={{ fill: '#9ca3af', fontSize: 12 }}
                 tickFormatter={(value) => `$${value}`}
+                width={60}
               />
               <Tooltip
                 contentStyle={{
@@ -197,6 +255,8 @@ export default function Dashboard() {
                 stroke="#6366f1"
                 strokeWidth={2}
                 dot={false}
+                isAnimationActive={!isLargeDataset}
+                animationDuration={isLargeDataset ? 0 : 300}
               />
             </LineChart>
           </ResponsiveContainer>

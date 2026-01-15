@@ -8,7 +8,7 @@ from sqlalchemy import select, func
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..models import get_session, Bot, BotStatus, PnLSnapshot, Alert, Order, OrderStatus
-from ..services import trading_engine
+from ..services import trading_engine, email_service
 
 router = APIRouter()
 
@@ -112,19 +112,37 @@ async def kill_all_bots(
     session: AsyncSession = Depends(get_session),
 ):
     """Global kill switch - stops all running bots and cancels all pending orders."""
-    # First, kill all bots via trading engine
-    engine_killed = await trading_engine.kill_all_bots()
-
-    # Then update database for any bots not managed by engine
+    # Get all running bots BEFORE killing them (for email)
     result = await session.execute(
         select(Bot).where(Bot.status == BotStatus.RUNNING)
     )
     running_bots = result.scalars().all()
 
+    # Collect bot info for email
+    affected_bots = [
+        {
+            "id": bot.id,
+            "name": bot.name,
+            "trading_pair": bot.trading_pair,
+            "pnl": bot.total_pnl,
+        }
+        for bot in running_bots
+    ]
+    total_pnl = sum(bot.total_pnl for bot in running_bots)
+
+    # First, kill all bots via trading engine
+    engine_killed = await trading_engine.kill_all_bots()
+
+    # Refresh running bots status
+    result = await session.execute(
+        select(Bot).where(Bot.status == BotStatus.RUNNING)
+    )
+    still_running_bots = result.scalars().all()
+
     killed_count = engine_killed
     cancelled_orders_count = 0
 
-    for bot in running_bots:
+    for bot in still_running_bots:
         bot.status = BotStatus.STOPPED
         bot.updated_at = datetime.utcnow()
         if engine_killed == 0:  # Only count if not already killed by engine
@@ -147,12 +165,12 @@ async def kill_all_bots(
             bot_id=bot.id,
             alert_type="kill_switch",
             message=f"Global kill switch activated for bot '{bot.name}' (ID: {bot.id})",
-            email_sent=False  # Email sending would be handled separately
+            email_sent=False
         )
         session.add(alert)
 
-    # Log a global alert
-    if killed_count > 0 or cancelled_orders_count > 0:
+    # Log a global alert and send email
+    if killed_count > 0 or len(affected_bots) > 0:
         global_alert = Alert(
             bot_id=None,  # Global alert
             alert_type="global_kill_switch",
@@ -161,8 +179,16 @@ async def kill_all_bots(
         )
         session.add(global_alert)
 
-        # Log to console (email would go here in production)
+        # Log to console
         print(f"[ALERT] Global kill switch activated. Stopped {killed_count} bots.")
+
+        # Send email notification
+        if affected_bots:
+            email_sent = email_service.send_kill_switch_alert(
+                affected_bots=affected_bots,
+                total_pnl=total_pnl,
+            )
+            global_alert.email_sent = email_sent
 
     await session.commit()
 

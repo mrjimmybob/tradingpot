@@ -10,6 +10,9 @@ import {
   Menu,
   X,
 } from 'lucide-react'
+import { useToast } from './Toast'
+import { ConnectionStatus } from './ConnectionStatus'
+import { useRealtimeStats } from '../contexts/WebSocketContext'
 
 interface Stats {
   total_pnl: number
@@ -41,6 +44,7 @@ export default function Layout() {
   const [sidebarOpen, setSidebarOpen] = useState(false)
   const [isKilling, setIsKilling] = useState(false)
   const queryClient = useQueryClient()
+  const toast = useToast()
 
   const { data: stats } = useQuery({
     queryKey: ['stats'],
@@ -48,7 +52,9 @@ export default function Layout() {
     refetchInterval: 5000, // Refetch every 5 seconds
   })
 
-  const globalPnL = stats?.total_pnl ?? 0
+  // Use real-time stats if available
+  const realtimeStats = useRealtimeStats()
+  const globalPnL = realtimeStats?.total_pnl ?? stats?.total_pnl ?? 0
 
   const handleGlobalKillSwitch = async () => {
     if (confirm('Are you sure you want to activate the global kill switch? This will stop all running bots.')) {
@@ -58,10 +64,10 @@ export default function Layout() {
         // Invalidate queries to refresh data
         queryClient.invalidateQueries({ queryKey: ['stats'] })
         queryClient.invalidateQueries({ queryKey: ['bots'] })
-        console.log('Global kill switch activated')
+        toast.warning('Global Kill Switch Activated', 'All running bots have been stopped')
       } catch (error) {
         console.error('Failed to kill all bots:', error)
-        alert('Failed to activate global kill switch')
+        toast.error('Kill Switch Failed', 'Failed to activate global kill switch')
       } finally {
         setIsKilling(false)
       }
@@ -85,6 +91,9 @@ export default function Layout() {
           </div>
 
           <div className="flex items-center gap-6">
+            {/* Connection Status */}
+            <ConnectionStatus />
+
             {/* Global P&L */}
             <div className="hidden sm:block">
               <span className="text-gray-400 text-sm mr-2">Global P&L:</span>

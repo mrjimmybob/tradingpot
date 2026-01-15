@@ -30,7 +30,9 @@ STRATEGIES = [
         description="Dollar-cost averaging with configurable intervals and amounts",
         parameters={
             "interval_minutes": {"type": "number", "default": 60, "min": 1, "description": "Buy interval in minutes"},
-            "amount_percent": {"type": "number", "default": 10, "min": 1, "max": 100, "description": "Percent of budget per buy"},
+            "amount_percent": {"type": "number", "default": 10, "min": 1, "max": 100, "description": "Percent of balance per buy"},
+            "amount_usd": {"type": "number", "default": None, "min": 1, "description": "Fixed USD amount per buy (overrides percent)"},
+            "immediate_first_buy": {"type": "boolean", "default": True, "description": "Execute first buy immediately on start"},
         }
     ),
     StrategyInfo(
@@ -41,6 +43,7 @@ STRATEGIES = [
             "grid_count": {"type": "number", "default": 10, "min": 2, "max": 100, "description": "Number of grid levels"},
             "grid_spacing_percent": {"type": "number", "default": 1.0, "min": 0.1, "max": 10, "description": "Spacing between levels (%)"},
             "range_percent": {"type": "number", "default": 10, "min": 1, "max": 50, "description": "Total grid range (%)"},
+            "order_size_percent": {"type": "number", "default": 10, "min": 1, "max": 50, "description": "Order size per level (% of budget)"},
         }
     ),
     StrategyInfo(
@@ -50,6 +53,8 @@ STRATEGIES = [
         parameters={
             "bollinger_period": {"type": "number", "default": 20, "min": 5, "max": 100, "description": "Bollinger band period"},
             "bollinger_std": {"type": "number", "default": 2.0, "min": 0.5, "max": 4, "description": "Standard deviation multiplier"},
+            "order_size_percent": {"type": "number", "default": 20, "min": 5, "max": 100, "description": "Order size (% of budget)"},
+            "exit_at_mean": {"type": "boolean", "default": True, "description": "Exit at mean instead of upper band"},
         }
     ),
     StrategyInfo(
@@ -68,14 +73,18 @@ STRATEGIES = [
         parameters={
             "execution_period_minutes": {"type": "number", "default": 60, "min": 1, "description": "Execution period in minutes"},
             "slice_count": {"type": "number", "default": 10, "min": 2, "max": 100, "description": "Number of order slices"},
+            "total_amount_usd": {"type": "number", "default": None, "min": 1, "description": "Total amount to execute (USD)"},
+            "side": {"type": "string", "default": "buy", "options": ["buy", "sell"], "description": "Order side"},
         }
     ),
     StrategyInfo(
         name="vwap",
         display_name="VWAP",
-        description="Volume-weighted average price targeting",
+        description="Volume-weighted average price targeting - buy below VWAP, sell above",
         parameters={
             "lookback_period_minutes": {"type": "number", "default": 30, "min": 5, "description": "VWAP lookback period in minutes"},
+            "deviation_threshold_percent": {"type": "number", "default": 0.5, "min": 0.1, "max": 5, "description": "Min deviation to trigger trade (%)"},
+            "order_size_percent": {"type": "number", "default": 20, "min": 5, "max": 100, "description": "Order size (% of budget)"},
         }
     ),
     StrategyInfo(
@@ -106,11 +115,12 @@ STRATEGIES = [
     StrategyInfo(
         name="auto_mode",
         display_name="Auto Mode",
-        description="Factor-based strategy selection (trend/volume/volatility)",
+        description="Factor-based strategy selection - automatically adapts to market conditions",
         parameters={
-            "factor_precedence": {"type": "array", "default": ["trend", "volume", "volatility"], "description": "Order of factor importance"},
+            "factor_precedence": {"type": "array", "default": ["trend", "volatility", "volume"], "description": "Order of factor importance"},
             "disabled_factors": {"type": "array", "default": [], "description": "Factors to disable"},
-            "switch_threshold": {"type": "number", "default": 0.7, "min": 0.1, "max": 1, "description": "Threshold to trigger strategy switch"},
+            "switch_threshold": {"type": "number", "default": 0.7, "min": 0.1, "max": 1, "description": "Confidence threshold to switch strategy"},
+            "min_switch_interval_minutes": {"type": "number", "default": 15, "min": 1, "description": "Minimum time between strategy switches"},
         }
     ),
 ]
