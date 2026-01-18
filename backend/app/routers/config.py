@@ -57,13 +57,50 @@ STRATEGIES = [
             "exit_at_mean": {"type": "boolean", "default": True, "description": "Exit at mean instead of upper band"},
         }
     ),
+    # Note: breakdown_momentum strategy was removed (stub implementation, overlaps with other strategies)
     StrategyInfo(
-        name="breakdown_momentum",
-        display_name="Breakdown Momentum",
-        description="Trend-following on breakouts with volume confirmation",
+        name="trend_following",
+        display_name="Trend Following",
+        description="Conservative long-only momentum strategy using EMA crossover and ATR-based stops",
         parameters={
-            "breakout_threshold_percent": {"type": "number", "default": 2.0, "min": 0.5, "max": 10, "description": "Breakout threshold (%)"},
-            "volume_threshold_multiplier": {"type": "number", "default": 1.5, "min": 1, "max": 5, "description": "Volume threshold multiplier"},
+            "short_period": {"type": "number", "default": 50, "min": 10, "max": 100, "description": "EMA short period"},
+            "long_period": {"type": "number", "default": 200, "min": 50, "max": 500, "description": "EMA long period"},
+            "atr_period": {"type": "number", "default": 14, "min": 5, "max": 50, "description": "ATR period for volatility"},
+            "atr_multiplier": {"type": "number", "default": 2.0, "min": 1, "max": 5, "description": "ATR multiplier for stop loss"},
+            "risk_percent": {"type": "number", "default": 1.0, "min": 0.5, "max": 5, "description": "Percent of capital to risk per trade"},
+        }
+    ),
+    StrategyInfo(
+        name="cross_sectional_momentum",
+        display_name="Cross-Sectional Momentum",
+        description="Relative strength strategy that ranks assets by performance and holds top performers only",
+        parameters={
+            "universe": {"type": "array", "default": ["BTC/USDT", "ETH/USDT", "SOL/USDT", "XRP/USDT", "ADA/USDT", "DOGE/USDT", "DOT/USDT", "LINK/USDT", "AVAX/USDT", "MATIC/USDT"], "description": "List of symbols to compare"},
+            "lookback_days": {"type": "number", "default": 60, "min": 7, "max": 180, "description": "Days to calculate momentum"},
+            "top_n": {"type": "number", "default": 3, "min": 1, "max": 10, "description": "Number of top assets to hold"},
+            "rebalance_hours": {"type": "number", "default": 168, "min": 24, "max": 720, "description": "Hours between rebalances (168 = weekly)"},
+            "allocation_percent": {"type": "number", "default": 100, "min": 10, "max": 100, "description": "Percent of capital to allocate"},
+            "trend_filter_enabled": {"type": "boolean", "default": False, "description": "Enable global trend filter"},
+            "trend_filter_symbol": {"type": "string", "default": "BTC/USDT", "description": "Symbol for trend filter"},
+            "trend_filter_ema": {"type": "number", "default": 200, "min": 50, "max": 500, "description": "EMA period for trend filter"},
+        }
+    ),
+    StrategyInfo(
+        name="volatility_breakout",
+        display_name="Volatility Breakout",
+        description="Enters on price breakouts following low-volatility compression using Bollinger Bands and ATR",
+        parameters={
+            "bb_period": {"type": "number", "default": 20, "min": 10, "max": 50, "description": "Bollinger Band period"},
+            "bb_std": {"type": "number", "default": 2.0, "min": 1, "max": 3, "description": "Bollinger Band standard deviation"},
+            "atr_period": {"type": "number", "default": 14, "min": 5, "max": 50, "description": "ATR period"},
+            "compression_method": {"type": "string", "default": "bb_width", "options": ["bb_width", "atr_average"], "description": "Compression detection method"},
+            "compression_percentile": {"type": "number", "default": 20, "min": 5, "max": 50, "description": "BB width percentile threshold (%)"},
+            "atr_threshold_multiplier": {"type": "number", "default": 0.8, "min": 0.5, "max": 1.5, "description": "ATR threshold vs average"},
+            "min_compression_bars": {"type": "number", "default": 5, "min": 2, "max": 20, "description": "Minimum compression duration (bars)"},
+            "atr_stop_multiplier": {"type": "number", "default": 2.0, "min": 1, "max": 5, "description": "ATR stop loss multiplier"},
+            "risk_percent": {"type": "number", "default": 1.0, "min": 0.5, "max": 5, "description": "Percent of capital to risk per trade"},
+            "cooldown_hours": {"type": "number", "default": 24, "min": 1, "max": 168, "description": "Hours between breakout attempts"},
+            "failed_breakout_bars": {"type": "number", "default": 3, "min": 1, "max": 10, "description": "Bars to check for failed breakout"},
         }
     ),
     StrategyInfo(
@@ -90,28 +127,21 @@ STRATEGIES = [
     StrategyInfo(
         name="scalping",
         display_name="Scalping",
-        description="High-frequency small profit captures",
+        description="Conservative tactical strategy for quick profits from micro-breakouts with strict risk controls",
         parameters={
-            "take_profit_percent": {"type": "number", "default": 0.5, "min": 0.1, "max": 5, "description": "Take profit (%)"},
-            "max_position_time_seconds": {"type": "number", "default": 300, "min": 10, "description": "Max position hold time (seconds)"},
+            "short_ema": {"type": "number", "default": 5, "min": 3, "max": 20, "description": "Short EMA period for momentum"},
+            "long_ema": {"type": "number", "default": 15, "min": 10, "max": 50, "description": "Long EMA period for momentum"},
+            "take_profit_percent": {"type": "number", "default": 0.5, "min": 0.1, "max": 2, "description": "Profit target (%)"},
+            "stop_loss_percent": {"type": "number", "default": 0.5, "min": 0.1, "max": 2, "description": "Stop loss (%)"},
+            "max_position_time_seconds": {"type": "number", "default": 300, "min": 60, "max": 1800, "description": "Max position hold time (seconds)"},
+            "position_size_percent": {"type": "number", "default": 5, "min": 1, "max": 20, "description": "Position size (% of balance)"},
+            "cooldown_minutes": {"type": "number", "default": 10, "min": 1, "max": 60, "description": "Cooldown between trades (minutes)"},
+            "max_trades_per_hour": {"type": "number", "default": 3, "min": 1, "max": 10, "description": "Maximum trades per hour"},
+            "max_trades_per_day": {"type": "number", "default": 20, "min": 1, "max": 100, "description": "Maximum trades per day"},
+            "trend_filter_ema": {"type": "number", "default": 50, "min": 0, "max": 200, "description": "Global trend filter EMA (0 = disabled)"},
         }
     ),
-    StrategyInfo(
-        name="arbitrage",
-        display_name="Arbitrage",
-        description="Cross-exchange or cross-pair price difference exploitation",
-        parameters={
-            "min_spread_percent": {"type": "number", "default": 0.3, "min": 0.1, "max": 5, "description": "Minimum spread to trade (%)"},
-        }
-    ),
-    StrategyInfo(
-        name="event_filler",
-        display_name="Event Filler",
-        description="React to market events/news with rapid execution",
-        parameters={
-            "event_sources": {"type": "array", "default": [], "description": "List of event sources to monitor"},
-        }
-    ),
+    # Note: arbitrage and event_filler strategies were removed (placeholders without implementation)
     StrategyInfo(
         name="auto_mode",
         display_name="Auto Mode",

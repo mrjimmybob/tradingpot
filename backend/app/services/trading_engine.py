@@ -348,12 +348,12 @@ class TradingEngine:
             "dca_accumulator": self._strategy_dca,
             "adaptive_grid": self._strategy_grid,
             "mean_reversion": self._strategy_mean_reversion,
-            "breakdown_momentum": self._strategy_momentum,
+            "trend_following": self._strategy_trend_following,
+            "cross_sectional_momentum": self._strategy_cross_sectional_momentum,
+            "volatility_breakout": self._strategy_volatility_breakout,
             "twap": self._strategy_twap,
             "vwap": self._strategy_vwap,
             "scalping": self._strategy_scalping,
-            "arbitrage": self._strategy_arbitrage,
-            "event_filler": self._strategy_event,
             "auto_mode": self._strategy_auto,
         }
         return strategies.get(strategy_name)
@@ -713,19 +713,842 @@ class TradingEngine:
         # Keep only the last max_len prices
         self._price_histories[bot_id] = history[-max_len:]
 
-    async def _strategy_momentum(
+    # Note: _strategy_momentum (breakdown_momentum) was removed (stub implementation, overlaps with other strategies)
+
+    async def _strategy_trend_following(
         self,
         bot: Bot,
         current_price: float,
         params: dict,
         session: AsyncSession,
     ) -> Optional[TradeSignal]:
-        """Breakdown momentum strategy."""
-        breakout_threshold = params.get("breakout_threshold_percent", 2.0) / 100
+        """Trend Following (time-series momentum) strategy.
 
-        # Get recent price history to detect breakout
-        # Simplified implementation
-        return TradeSignal(action="hold", amount=0, reason="Momentum: Watching for breakout")
+        Conservative long-only momentum strategy using EMA crossover and ATR-based stops.
+        Enters when price > EMA(long) and EMA(short) > EMA(long).
+        Exits when price closes below EMA(long) or trailing stop hit.
+
+        Parameters:
+            short_period: EMA short period (default: 50)
+            long_period: EMA long period (default: 200)
+            atr_period: ATR period (default: 14)
+            atr_multiplier: ATR multiplier for stop loss (default: 2.0)
+            risk_percent: Percent of capital to risk per trade (default: 1.0)
+        """
+        short_period = params.get("short_period", 50)
+        long_period = params.get("long_period", 200)
+        atr_period = params.get("atr_period", 14)
+        atr_multiplier = params.get("atr_multiplier", 2.0)
+        risk_percent = params.get("risk_percent", 1.0) / 100
+
+        # Get price history
+        price_history = self._get_price_history(bot.id)
+
+        # Add current price to history
+        price_history.append(current_price)
+        self._save_price_history(bot.id, price_history, max_len=max(long_period + 50, 250))
+
+        # Need enough data for EMA calculation
+        if len(price_history) < long_period:
+            return TradeSignal(
+                action="hold",
+                amount=0,
+                reason=f"Trend Following: Collecting data ({len(price_history)}/{long_period})"
+            )
+
+        # Calculate EMA (Exponential Moving Average)
+        def calculate_ema(prices: list, period: int) -> float:
+            """Calculate EMA using standard formula."""
+            if len(prices) < period:
+                return sum(prices) / len(prices)  # Fall back to SMA
+
+            # Use SMA for the first value
+            k = 2 / (period + 1)  # Smoothing factor
+            ema = sum(prices[:period]) / period
+
+            # Calculate EMA for remaining values
+            for price in prices[period:]:
+                ema = (price * k) + (ema * (1 - k))
+
+            return ema
+
+        # Calculate ATR (Average True Range) for volatility
+        def calculate_atr(prices: list, period: int) -> float:
+            """Calculate ATR from price history."""
+            if len(prices) < period + 1:
+                # Not enough data, use simple range
+                return max(prices[-period:]) - min(prices[-period:]) if len(prices) >= period else 0
+
+            true_ranges = []
+            for i in range(1, len(prices)):
+                high_low = abs(prices[i] - prices[i-1])
+                true_ranges.append(high_low)
+
+            # Use last 'period' true ranges
+            recent_trs = true_ranges[-period:]
+            return sum(recent_trs) / len(recent_trs)
+
+        # Calculate indicators
+        ema_short = calculate_ema(price_history, short_period)
+        ema_long = calculate_ema(price_history, long_period)
+        atr = calculate_atr(price_history, atr_period)
+
+        # Get current positions
+        positions = await self._get_bot_positions(bot.id, session)
+        has_position = len(positions) > 0
+
+        # Get or initialize trailing stop state
+        if not hasattr(self, "_trend_states"):
+            self._trend_states = {}
+
+        state = self._trend_states.get(bot.id, {"trailing_stop": None, "highest_price": None})
+
+        logger.debug(
+            f"Bot {bot.id}: Trend Following - Price: ${current_price:.2f}, "
+            f"EMA({short_period}): ${ema_short:.2f}, EMA({long_period}): ${ema_long:.2f}, "
+            f"ATR: ${atr:.2f}"
+        )
+
+        # Trading logic
+        if not has_position:
+            # No position - look for entry signal
+            # Entry: price > EMA(long) AND EMA(short) > EMA(long)
+            if current_price > ema_long and ema_short > ema_long:
+                # Volatility-adjusted position sizing
+                # Risk fixed percentage of capital, position size based on ATR
+                risk_amount = bot.current_balance * risk_percent
+
+                if atr > 0:
+                    # Position size = risk_amount / (ATR * atr_multiplier)
+                    # This gives us the position size in quote currency (USDT)
+                    position_size = risk_amount / (atr * atr_multiplier)
+                else:
+                    # Fallback: use risk_amount directly if ATR is 0
+                    position_size = risk_amount
+
+                # Cap position size at available balance
+                buy_amount = min(position_size, bot.current_balance)
+
+                if buy_amount < 1:
+                    return TradeSignal(
+                        action="hold",
+                        amount=0,
+                        reason="Trend Following: Insufficient balance for entry"
+                    )
+
+                logger.info(
+                    f"Bot {bot.id}: Trend Following ENTRY - "
+                    f"Price ${current_price:.2f} > EMA({long_period}) ${ema_long:.2f}, "
+                    f"EMA({short_period}) ${ema_short:.2f} > EMA({long_period})"
+                )
+
+                # Initialize trailing stop
+                trailing_stop_price = current_price - (atr * atr_multiplier)
+                self._trend_states[bot.id] = {
+                    "trailing_stop": trailing_stop_price,
+                    "highest_price": current_price,
+                }
+
+                return TradeSignal(
+                    action="buy",
+                    amount=buy_amount,
+                    order_type="market",
+                    reason=f"Trend Following: Bullish trend detected (EMA cross confirmed)",
+                )
+
+            # Check entry conditions and provide feedback
+            if current_price <= ema_long:
+                return TradeSignal(
+                    action="hold",
+                    amount=0,
+                    reason=f"Trend Following: Price ${current_price:.2f} below EMA({long_period}) ${ema_long:.2f}"
+                )
+            elif ema_short <= ema_long:
+                return TradeSignal(
+                    action="hold",
+                    amount=0,
+                    reason=f"Trend Following: Waiting for EMA crossover (short ${ema_short:.2f} <= long ${ema_long:.2f})"
+                )
+            else:
+                return TradeSignal(
+                    action="hold",
+                    amount=0,
+                    reason="Trend Following: Waiting for entry conditions"
+                )
+
+        else:
+            # Have position - manage exit
+            for pos in positions:
+                # Update trailing stop if price made new high
+                if state["highest_price"] is None or current_price > state["highest_price"]:
+                    state["highest_price"] = current_price
+                    state["trailing_stop"] = current_price - (atr * atr_multiplier)
+                    self._trend_states[bot.id] = state
+
+                # Exit condition 1: Price closes below EMA(long)
+                if current_price < ema_long:
+                    sell_amount = pos.amount * current_price
+
+                    logger.info(
+                        f"Bot {bot.id}: Trend Following EXIT (trend break) - "
+                        f"Price ${current_price:.2f} < EMA({long_period}) ${ema_long:.2f}"
+                    )
+
+                    # Clear state
+                    self._trend_states[bot.id] = {"trailing_stop": None, "highest_price": None}
+
+                    return TradeSignal(
+                        action="sell",
+                        amount=sell_amount,
+                        order_type="market",
+                        reason=f"Trend Following: Exit on trend break (price < EMA({long_period}))",
+                    )
+
+                # Exit condition 2: Trailing stop hit
+                if state["trailing_stop"] is not None and current_price <= state["trailing_stop"]:
+                    sell_amount = pos.amount * current_price
+
+                    logger.info(
+                        f"Bot {bot.id}: Trend Following EXIT (trailing stop) - "
+                        f"Price ${current_price:.2f} <= Stop ${state['trailing_stop']:.2f}"
+                    )
+
+                    # Clear state
+                    self._trend_states[bot.id] = {"trailing_stop": None, "highest_price": None}
+
+                    return TradeSignal(
+                        action="sell",
+                        amount=sell_amount,
+                        order_type="market",
+                        reason=f"Trend Following: Exit on trailing stop (${state['trailing_stop']:.2f})",
+                    )
+
+            # Hold position - trend still valid
+            return TradeSignal(
+                action="hold",
+                amount=0,
+                reason=f"Trend Following: Holding position, stop at ${state['trailing_stop']:.2f if state['trailing_stop'] else 'N/A'}"
+            )
+
+    async def _strategy_cross_sectional_momentum(
+        self,
+        bot: Bot,
+        current_price: float,
+        params: dict,
+        session: AsyncSession,
+    ) -> Optional[TradeSignal]:
+        """Cross-Sectional Momentum (relative strength) strategy.
+
+        Ranks assets by relative performance and only holds positions in top performers.
+        Each bot tracks its own trading_pair and enters/exits based on whether
+        that pair is in the top N ranked assets.
+
+        Parameters:
+            universe: List of symbols to compare (default: common pairs)
+            lookback_days: Days to calculate momentum (default: 60)
+            top_n: Number of top assets to hold (default: 3)
+            rebalance_hours: Hours between rebalances (default: 168 = weekly)
+            allocation_percent: Percent of capital to allocate (default: 100)
+            trend_filter_enabled: Enable global trend filter (default: False)
+            trend_filter_symbol: Symbol for trend filter (default: BTC/USDT)
+            trend_filter_ema: EMA period for trend filter (default: 200)
+        """
+        # Get parameters
+        universe = params.get("universe", [
+            "BTC/USDT", "ETH/USDT", "SOL/USDT", "XRP/USDT", "ADA/USDT",
+            "DOGE/USDT", "DOT/USDT", "LINK/USDT", "AVAX/USDT", "MATIC/USDT"
+        ])
+        lookback_days = params.get("lookback_days", 60)
+        top_n = params.get("top_n", 3)
+        rebalance_hours = params.get("rebalance_hours", 168)  # Weekly
+        allocation_percent = params.get("allocation_percent", 100) / 100
+        trend_filter_enabled = params.get("trend_filter_enabled", False)
+        trend_filter_symbol = params.get("trend_filter_symbol", "BTC/USDT")
+        trend_filter_ema = params.get("trend_filter_ema", 200)
+
+        # Ensure bot's trading pair is in the universe
+        if bot.trading_pair not in universe:
+            universe.append(bot.trading_pair)
+
+        # Initialize state tracking for cross-sectional data
+        if not hasattr(self, "_cross_sectional_states"):
+            self._cross_sectional_states = {}
+
+        state = self._cross_sectional_states.get(bot.id, {
+            "price_data": {},  # {symbol: [prices]}
+            "last_rebalance": None,
+            "current_rank": None,
+            "last_top_n": [],
+        })
+
+        # Get exchange service for fetching multiple ticker prices
+        exchange = self._exchange_services.get(bot.id)
+        if not exchange:
+            return TradeSignal(
+                action="hold",
+                amount=0,
+                reason="Cross-Sectional: Exchange not available"
+            )
+
+        # Fetch current prices for all symbols in universe
+        try:
+            current_prices = {}
+            for symbol in universe:
+                ticker = await exchange.get_ticker(symbol)
+                if ticker:
+                    current_prices[symbol] = ticker.last
+
+                    # Store price in history
+                    if symbol not in state["price_data"]:
+                        state["price_data"][symbol] = []
+
+                    state["price_data"][symbol].append({
+                        "price": ticker.last,
+                        "timestamp": datetime.utcnow().isoformat()
+                    })
+
+                    # Keep only last 90 days of data (assuming ~daily samples)
+                    state["price_data"][symbol] = state["price_data"][symbol][-90:]
+
+        except Exception as e:
+            logger.error(f"Bot {bot.id}: Cross-Sectional failed to fetch prices: {e}")
+            return TradeSignal(
+                action="hold",
+                amount=0,
+                reason=f"Cross-Sectional: Error fetching prices"
+            )
+
+        # Check if we have enough historical data
+        min_data_points = min(lookback_days, 30)  # Need at least 30 data points
+        symbols_with_data = [
+            sym for sym, prices in state["price_data"].items()
+            if len(prices) >= min_data_points
+        ]
+
+        if len(symbols_with_data) < 2:
+            # Not enough data yet
+            self._cross_sectional_states[bot.id] = state
+            return TradeSignal(
+                action="hold",
+                amount=0,
+                reason=f"Cross-Sectional: Collecting data ({len(symbols_with_data)} symbols ready)"
+            )
+
+        # Check if it's time to rebalance
+        now = datetime.utcnow()
+        should_rebalance = False
+
+        if state["last_rebalance"] is None:
+            should_rebalance = True
+        else:
+            last_rebalance_time = datetime.fromisoformat(state["last_rebalance"])
+            hours_since = (now - last_rebalance_time).total_seconds() / 3600
+            if hours_since >= rebalance_hours:
+                should_rebalance = True
+
+        # Calculate momentum for all symbols with sufficient data
+        def calculate_momentum(prices: list, lookback: int) -> float:
+            """Calculate simple total return over lookback period."""
+            if len(prices) < 2:
+                return 0.0
+
+            # Use min of lookback and available data
+            n = min(lookback, len(prices))
+            if n < 2:
+                return 0.0
+
+            # Simple return: (current - start) / start
+            start_price = prices[-n]["price"]
+            end_price = prices[-1]["price"]
+
+            if start_price <= 0:
+                return 0.0
+
+            return (end_price - start_price) / start_price
+
+        # Rank all symbols by momentum
+        momentum_scores = {}
+        for symbol in symbols_with_data:
+            prices = state["price_data"][symbol]
+            momentum = calculate_momentum(prices, lookback_days)
+            momentum_scores[symbol] = momentum
+
+        # Sort by momentum (descending)
+        ranked_symbols = sorted(
+            momentum_scores.items(),
+            key=lambda x: x[1],
+            reverse=True
+        )
+
+        # Get top N symbols
+        top_n_symbols = [sym for sym, score in ranked_symbols[:top_n]]
+
+        # Find rank of bot's trading pair
+        bot_rank = None
+        for idx, (sym, score) in enumerate(ranked_symbols):
+            if sym == bot.trading_pair:
+                bot_rank = idx + 1
+                break
+
+        logger.debug(
+            f"Bot {bot.id}: Cross-Sectional - {bot.trading_pair} ranked #{bot_rank} "
+            f"with {momentum_scores.get(bot.trading_pair, 0):.2%} momentum"
+        )
+
+        # Check trend filter if enabled
+        trend_filter_passed = True
+        if trend_filter_enabled:
+            filter_symbol_data = state["price_data"].get(trend_filter_symbol, [])
+            if len(filter_symbol_data) >= trend_filter_ema:
+                # Calculate EMA for trend filter
+                prices = [p["price"] for p in filter_symbol_data]
+
+                def calculate_ema(prices: list, period: int) -> float:
+                    """Calculate EMA."""
+                    if len(prices) < period:
+                        return sum(prices) / len(prices)
+
+                    k = 2 / (period + 1)
+                    ema = sum(prices[:period]) / period
+                    for price in prices[period:]:
+                        ema = (price * k) + (ema * (1 - k))
+                    return ema
+
+                ema = calculate_ema(prices, trend_filter_ema)
+                current_filter_price = filter_symbol_data[-1]["price"]
+                trend_filter_passed = current_filter_price > ema
+
+                if not trend_filter_passed:
+                    logger.info(
+                        f"Bot {bot.id}: Cross-Sectional trend filter FAILED - "
+                        f"{trend_filter_symbol} ${current_filter_price:.2f} < EMA ${ema:.2f}"
+                    )
+
+        # Get current positions
+        positions = await self._get_bot_positions(bot.id, session)
+        has_position = len(positions) > 0
+
+        # Decision logic
+        is_in_top_n = bot.trading_pair in top_n_symbols
+
+        # Update state
+        state["current_rank"] = bot_rank
+        state["last_top_n"] = top_n_symbols
+
+        if should_rebalance:
+            state["last_rebalance"] = now.isoformat()
+            logger.info(
+                f"Bot {bot.id}: Cross-Sectional REBALANCE - Top {top_n}: {', '.join(top_n_symbols)}"
+            )
+
+        self._cross_sectional_states[bot.id] = state
+
+        # Exit if trend filter fails (regardless of rank)
+        if trend_filter_enabled and not trend_filter_passed:
+            if has_position:
+                for pos in positions:
+                    sell_amount = pos.amount * current_price
+
+                    logger.info(
+                        f"Bot {bot.id}: Cross-Sectional EXIT (trend filter) - "
+                        f"Selling {bot.trading_pair}"
+                    )
+
+                    return TradeSignal(
+                        action="sell",
+                        amount=sell_amount,
+                        order_type="market",
+                        reason="Cross-Sectional: Exit due to trend filter failure",
+                    )
+
+            return TradeSignal(
+                action="hold",
+                amount=0,
+                reason=f"Cross-Sectional: Trend filter failed, staying out"
+            )
+
+        # Trading logic based on rebalancing schedule
+        if should_rebalance or not has_position:
+            # Entry: pair is in top N and no position
+            if is_in_top_n and not has_position:
+                # Calculate position size
+                buy_amount = bot.current_balance * allocation_percent
+
+                if buy_amount < 1:
+                    return TradeSignal(
+                        action="hold",
+                        amount=0,
+                        reason="Cross-Sectional: Insufficient balance for entry"
+                    )
+
+                logger.info(
+                    f"Bot {bot.id}: Cross-Sectional ENTRY - "
+                    f"{bot.trading_pair} ranked #{bot_rank} (top {top_n}), "
+                    f"momentum: {momentum_scores.get(bot.trading_pair, 0):.2%}"
+                )
+
+                return TradeSignal(
+                    action="buy",
+                    amount=buy_amount,
+                    order_type="market",
+                    reason=f"Cross-Sectional: Entry at rank #{bot_rank} (momentum: {momentum_scores.get(bot.trading_pair, 0):.2%})",
+                )
+
+            # Exit: pair fell out of top N and has position
+            elif not is_in_top_n and has_position:
+                for pos in positions:
+                    sell_amount = pos.amount * current_price
+
+                    logger.info(
+                        f"Bot {bot.id}: Cross-Sectional EXIT - "
+                        f"{bot.trading_pair} fell to rank #{bot_rank} (out of top {top_n})"
+                    )
+
+                    return TradeSignal(
+                        action="sell",
+                        amount=sell_amount,
+                        order_type="market",
+                        reason=f"Cross-Sectional: Exit, fell to rank #{bot_rank}",
+                    )
+
+        # Hold current state
+        if has_position:
+            return TradeSignal(
+                action="hold",
+                amount=0,
+                reason=f"Cross-Sectional: Holding rank #{bot_rank}, next rebalance in {rebalance_hours - ((now - datetime.fromisoformat(state['last_rebalance'])).total_seconds() / 3600):.1f}h"
+            )
+        else:
+            if is_in_top_n:
+                return TradeSignal(
+                    action="hold",
+                    amount=0,
+                    reason=f"Cross-Sectional: In top {top_n} (#{bot_rank}), waiting for rebalance"
+                )
+            else:
+                return TradeSignal(
+                    action="hold",
+                    amount=0,
+                    reason=f"Cross-Sectional: Rank #{bot_rank}, not in top {top_n}"
+                )
+
+    async def _strategy_volatility_breakout(
+        self,
+        bot: Bot,
+        current_price: float,
+        params: dict,
+        session: AsyncSession,
+    ) -> Optional[TradeSignal]:
+        """Volatility Breakout (volatility expansion) strategy.
+
+        Enters on price breakouts following low-volatility compression regimes.
+        Uses Bollinger Bands to detect compression and breakouts, ATR for stops.
+
+        Parameters:
+            bb_period: Bollinger Band period (default: 20)
+            bb_std: Bollinger Band standard deviation (default: 2.0)
+            atr_period: ATR period (default: 14)
+            compression_method: "bb_width" or "atr_average" (default: "bb_width")
+            compression_percentile: BB width percentile threshold (default: 20)
+            atr_threshold_multiplier: ATR threshold vs average (default: 0.8)
+            min_compression_bars: Minimum bars of compression (default: 5)
+            atr_stop_multiplier: ATR stop loss multiplier (default: 2.0)
+            risk_percent: Percent of capital to risk (default: 1.0)
+            cooldown_hours: Hours to wait between breakout attempts (default: 24)
+            failed_breakout_bars: Bars to check for failed breakout (default: 3)
+        """
+        # Get parameters
+        bb_period = params.get("bb_period", 20)
+        bb_std = params.get("bb_std", 2.0)
+        atr_period = params.get("atr_period", 14)
+        compression_method = params.get("compression_method", "bb_width")
+        compression_percentile = params.get("compression_percentile", 20)
+        atr_threshold_mult = params.get("atr_threshold_multiplier", 0.8)
+        min_compression_bars = params.get("min_compression_bars", 5)
+        atr_stop_mult = params.get("atr_stop_multiplier", 2.0)
+        risk_percent = params.get("risk_percent", 1.0) / 100
+        cooldown_hours = params.get("cooldown_hours", 24)
+        failed_breakout_bars = params.get("failed_breakout_bars", 3)
+
+        # Get price history
+        price_history = self._get_price_history(bot.id)
+
+        # Add current price to history
+        price_history.append(current_price)
+        self._save_price_history(bot.id, price_history, max_len=max(bb_period + 100, 150))
+
+        # Need enough data for calculations
+        if len(price_history) < bb_period:
+            return TradeSignal(
+                action="hold",
+                amount=0,
+                reason=f"Volatility Breakout: Collecting data ({len(price_history)}/{bb_period})"
+            )
+
+        # Calculate Bollinger Bands
+        def calculate_bollinger_bands(prices: list, period: int, std_mult: float):
+            """Calculate Bollinger Bands."""
+            recent_prices = prices[-period:]
+            sma = sum(recent_prices) / len(recent_prices)
+
+            # Calculate standard deviation
+            variance = sum((p - sma) ** 2 for p in recent_prices) / len(recent_prices)
+            std_dev = variance ** 0.5
+
+            upper_band = sma + (std_mult * std_dev)
+            lower_band = sma - (std_mult * std_dev)
+            bandwidth = (upper_band - lower_band) / sma if sma > 0 else 0
+
+            return sma, upper_band, lower_band, bandwidth
+
+        # Calculate ATR
+        def calculate_atr(prices: list, period: int) -> float:
+            """Calculate ATR from price history."""
+            if len(prices) < period + 1:
+                return max(prices[-period:]) - min(prices[-period:]) if len(prices) >= period else 0
+
+            true_ranges = []
+            for i in range(1, len(prices)):
+                high_low = abs(prices[i] - prices[i-1])
+                true_ranges.append(high_low)
+
+            recent_trs = true_ranges[-period:]
+            return sum(recent_trs) / len(recent_trs)
+
+        # Current indicators
+        sma, upper_band, lower_band, bb_width = calculate_bollinger_bands(
+            price_history, bb_period, bb_std
+        )
+        atr = calculate_atr(price_history, atr_period)
+
+        # Initialize state tracking
+        if not hasattr(self, "_volatility_breakout_states"):
+            self._volatility_breakout_states = {}
+
+        state = self._volatility_breakout_states.get(bot.id, {
+            "bb_width_history": [],
+            "atr_history": [],
+            "compression_detected": False,
+            "compression_start": None,
+            "compression_bars": 0,
+            "last_breakout_attempt": None,
+            "trailing_stop": None,
+            "entry_price": None,
+            "bars_since_entry": 0,
+        })
+
+        # Track historical Bollinger width and ATR for compression detection
+        state["bb_width_history"].append(bb_width)
+        state["bb_width_history"] = state["bb_width_history"][-100:]  # Keep last 100
+
+        state["atr_history"].append(atr)
+        state["atr_history"] = state["atr_history"][-100:]  # Keep last 100
+
+        # Get current positions
+        positions = await self._get_bot_positions(bot.id, session)
+        has_position = len(positions) > 0
+
+        logger.debug(
+            f"Bot {bot.id}: Volatility Breakout - Price: ${current_price:.2f}, "
+            f"BB: [${lower_band:.2f}, ${sma:.2f}, ${upper_band:.2f}], "
+            f"Width: {bb_width:.4f}, ATR: ${atr:.2f}"
+        )
+
+        # === POSITION EXIT LOGIC ===
+        if has_position:
+            for pos in positions:
+                # Update trailing stop if price made new high
+                if state["entry_price"] is not None:
+                    state["bars_since_entry"] += 1
+
+                    # Check for failed breakout (price closes back inside BB shortly after entry)
+                    if state["bars_since_entry"] <= failed_breakout_bars:
+                        if current_price < upper_band:
+                            sell_amount = pos.amount * current_price
+
+                            logger.info(
+                                f"Bot {bot.id}: Volatility Breakout EXIT (failed breakout) - "
+                                f"Price ${current_price:.2f} fell back inside BB after {state['bars_since_entry']} bars"
+                            )
+
+                            # Clear state
+                            state["trailing_stop"] = None
+                            state["entry_price"] = None
+                            state["bars_since_entry"] = 0
+                            state["compression_detected"] = False
+                            state["compression_bars"] = 0
+                            self._volatility_breakout_states[bot.id] = state
+
+                            return TradeSignal(
+                                action="sell",
+                                amount=sell_amount,
+                                order_type="market",
+                                reason="Volatility Breakout: Failed breakout, price back inside BB",
+                            )
+
+                # Update trailing stop
+                if state["trailing_stop"] is None or current_price > pos.entry_price:
+                    state["trailing_stop"] = current_price - (atr * atr_stop_mult)
+                    if current_price > pos.entry_price:
+                        # Only update trailing stop higher if profitable
+                        state["trailing_stop"] = max(
+                            state["trailing_stop"],
+                            state.get("trailing_stop", 0)
+                        )
+
+                # Check trailing stop
+                if state["trailing_stop"] is not None and current_price <= state["trailing_stop"]:
+                    sell_amount = pos.amount * current_price
+
+                    logger.info(
+                        f"Bot {bot.id}: Volatility Breakout EXIT (trailing stop) - "
+                        f"Price ${current_price:.2f} <= Stop ${state['trailing_stop']:.2f}"
+                    )
+
+                    # Clear state
+                    state["trailing_stop"] = None
+                    state["entry_price"] = None
+                    state["bars_since_entry"] = 0
+                    state["compression_detected"] = False
+                    state["compression_bars"] = 0
+                    self._volatility_breakout_states[bot.id] = state
+
+                    return TradeSignal(
+                        action="sell",
+                        amount=sell_amount,
+                        order_type="market",
+                        reason=f"Volatility Breakout: Trailing stop hit (${state['trailing_stop']:.2f})",
+                    )
+
+            # Update state and hold
+            self._volatility_breakout_states[bot.id] = state
+
+            return TradeSignal(
+                action="hold",
+                amount=0,
+                reason=f"Volatility Breakout: Holding position, stop at ${state['trailing_stop']:.2f if state['trailing_stop'] else 'N/A'}"
+            )
+
+        # === ENTRY LOGIC (no position) ===
+
+        # Check cooldown period
+        if state["last_breakout_attempt"] is not None:
+            last_attempt = datetime.fromisoformat(state["last_breakout_attempt"])
+            hours_since = (datetime.utcnow() - last_attempt).total_seconds() / 3600
+
+            if hours_since < cooldown_hours:
+                self._volatility_breakout_states[bot.id] = state
+                return TradeSignal(
+                    action="hold",
+                    amount=0,
+                    reason=f"Volatility Breakout: Cooldown active ({cooldown_hours - hours_since:.1f}h remaining)"
+                )
+
+        # Detect volatility compression
+        is_compressed = False
+
+        if compression_method == "bb_width":
+            # Use Bollinger Band width percentile
+            if len(state["bb_width_history"]) >= 20:
+                # Calculate percentile
+                sorted_widths = sorted(state["bb_width_history"])
+                percentile_index = int(len(sorted_widths) * (compression_percentile / 100))
+                percentile_value = sorted_widths[percentile_index]
+
+                is_compressed = bb_width <= percentile_value
+
+        elif compression_method == "atr_average":
+            # Use ATR below its rolling average
+            if len(state["atr_history"]) >= 20:
+                avg_atr = sum(state["atr_history"][-20:]) / 20
+                is_compressed = atr <= (avg_atr * atr_threshold_mult)
+
+        # Track compression duration
+        if is_compressed:
+            if not state["compression_detected"]:
+                state["compression_detected"] = True
+                state["compression_start"] = datetime.utcnow().isoformat()
+                state["compression_bars"] = 1
+            else:
+                state["compression_bars"] += 1
+        else:
+            # Compression ended
+            if state["compression_detected"]:
+                state["compression_detected"] = False
+                state["compression_start"] = None
+                state["compression_bars"] = 0
+
+        # Check if compression has persisted long enough
+        compression_satisfied = (
+            state["compression_detected"] and
+            state["compression_bars"] >= min_compression_bars
+        )
+
+        # Breakout entry condition
+        if compression_satisfied and current_price > upper_band:
+            # Volatility-adjusted position sizing
+            risk_amount = bot.current_balance * risk_percent
+
+            if atr > 0:
+                # Position size = risk_amount / (ATR * stop_multiplier)
+                position_size = risk_amount / (atr * atr_stop_mult)
+            else:
+                position_size = risk_amount
+
+            # Cap at available balance
+            buy_amount = min(position_size, bot.current_balance)
+
+            if buy_amount < 1:
+                self._volatility_breakout_states[bot.id] = state
+                return TradeSignal(
+                    action="hold",
+                    amount=0,
+                    reason="Volatility Breakout: Insufficient balance for entry"
+                )
+
+            logger.info(
+                f"Bot {bot.id}: Volatility Breakout ENTRY - "
+                f"Breakout after {state['compression_bars']} bars compression, "
+                f"Price ${current_price:.2f} > Upper BB ${upper_band:.2f}"
+            )
+
+            # Initialize trailing stop
+            state["trailing_stop"] = current_price - (atr * atr_stop_mult)
+            state["entry_price"] = current_price
+            state["bars_since_entry"] = 0
+            state["last_breakout_attempt"] = datetime.utcnow().isoformat()
+
+            self._volatility_breakout_states[bot.id] = state
+
+            return TradeSignal(
+                action="buy",
+                amount=buy_amount,
+                order_type="market",
+                reason=f"Volatility Breakout: Breakout after {state['compression_bars']} bars compression",
+            )
+
+        # Update state and hold
+        self._volatility_breakout_states[bot.id] = state
+
+        # Provide feedback on current state
+        if compression_satisfied:
+            return TradeSignal(
+                action="hold",
+                amount=0,
+                reason=f"Volatility Breakout: Compression active ({state['compression_bars']} bars), waiting for breakout above ${upper_band:.2f}"
+            )
+        elif state["compression_detected"]:
+            return TradeSignal(
+                action="hold",
+                amount=0,
+                reason=f"Volatility Breakout: Compression building ({state['compression_bars']}/{min_compression_bars} bars)"
+            )
+        else:
+            return TradeSignal(
+                action="hold",
+                amount=0,
+                reason=f"Volatility Breakout: Watching for compression (BB width: {bb_width:.4f})"
+            )
 
     async def _strategy_twap(
         self,
@@ -1018,53 +1841,304 @@ class TradingEngine:
         params: dict,
         session: AsyncSession,
     ) -> Optional[TradeSignal]:
-        """Scalping strategy for quick profits."""
+        """Scalping strategy - Conservative, tightly constrained tactical strategy.
+
+        Designed for spot-only, long-only trading with strict risk controls.
+        Captures small profits from micro-breakouts and short-term momentum.
+
+        Behavioral constraints (mandatory):
+        - No averaging down
+        - No pyramiding (one position at a time)
+        - Hard cooldown between trades
+        - Maximum trades per hour/day limits
+        - Very small position sizing
+
+        Parameters:
+            short_ema: Short EMA period for momentum (default: 5)
+            long_ema: Long EMA period for momentum (default: 15)
+            take_profit_percent: Profit target (default: 0.5%)
+            stop_loss_percent: Stop loss (default: 0.5%, risk-reward 1:1)
+            max_position_time_seconds: Time-based exit (default: 300 = 5 minutes)
+            position_size_percent: Position size (default: 5% of balance, very small)
+            cooldown_minutes: Cooldown between trades (default: 10 minutes)
+            max_trades_per_hour: Maximum trades per hour (default: 3)
+            max_trades_per_day: Maximum trades per day (default: 20)
+            trend_filter_ema: Global trend filter EMA (default: 50, 0 = disabled)
+        """
+        # Get parameters
+        short_ema = params.get("short_ema", 5)
+        long_ema = params.get("long_ema", 15)
         take_profit = params.get("take_profit_percent", 0.5) / 100
+        stop_loss = params.get("stop_loss_percent", 0.5) / 100
+        max_position_time = params.get("max_position_time_seconds", 300)
+        position_size_pct = params.get("position_size_percent", 5) / 100
+        cooldown_minutes = params.get("cooldown_minutes", 10)
+        max_trades_hour = params.get("max_trades_per_hour", 3)
+        max_trades_day = params.get("max_trades_per_day", 20)
+        trend_filter_ema = params.get("trend_filter_ema", 50)
 
-        positions = await self._get_bot_positions(bot.id, session)
+        # Get price history
+        price_history = self._get_price_history(bot.id)
+        price_history.append(current_price)
+        self._save_price_history(bot.id, price_history, max_len=max(trend_filter_ema + 20, 100))
 
-        if not positions:
-            # Enter position
-            amount = bot.current_balance * 0.2
+        # Need minimum data for EMA calculation
+        min_data = max(long_ema, trend_filter_ema if trend_filter_ema > 0 else 0)
+        if len(price_history) < min_data:
             return TradeSignal(
-                action="buy",
-                amount=amount,
-                order_type="market",
-                reason="Scalp: Entry",
+                action="hold",
+                amount=0,
+                reason=f"Scalping: Collecting data ({len(price_history)}/{min_data})"
             )
 
-        # Check for take profit
-        for pos in positions:
-            gain = (current_price - pos.entry_price) / pos.entry_price
-            if gain >= take_profit:
+        # Calculate EMAs
+        def calculate_ema(prices: list, period: int) -> float:
+            """Calculate EMA."""
+            if len(prices) < period:
+                return sum(prices) / len(prices)
+            k = 2 / (period + 1)
+            ema = sum(prices[:period]) / period
+            for price in prices[period:]:
+                ema = (price * k) + (ema * (1 - k))
+            return ema
+
+        ema_short = calculate_ema(price_history, short_ema)
+        ema_long = calculate_ema(price_history, long_ema)
+
+        # Global trend filter (optional)
+        trend_filter_passed = True
+        if trend_filter_ema > 0:
+            ema_trend = calculate_ema(price_history, trend_filter_ema)
+            trend_filter_passed = current_price > ema_trend
+
+        # Initialize scalping state
+        if not hasattr(self, "_scalping_states"):
+            self._scalping_states = {}
+
+        state = self._scalping_states.get(bot.id, {
+            "entry_time": None,
+            "entry_price": None,
+            "last_trade_time": None,
+            "trades_today": [],
+            "trades_this_hour": [],
+        })
+
+        # Get current positions
+        positions = await self._get_bot_positions(bot.id, session)
+        has_position = len(positions) > 0
+
+        now = datetime.utcnow()
+
+        # Clean up old trade tracking (remove trades older than 1 day)
+        cutoff_day = (now - timedelta(days=1)).isoformat()
+        state["trades_today"] = [t for t in state["trades_today"] if t > cutoff_day]
+
+        # Clean up trades older than 1 hour
+        cutoff_hour = (now - timedelta(hours=1)).isoformat()
+        state["trades_this_hour"] = [t for t in state["trades_this_hour"] if t > cutoff_hour]
+
+        logger.debug(
+            f"Bot {bot.id}: Scalping - Price: ${current_price:.2f}, "
+            f"EMA({short_ema}): ${ema_short:.2f}, EMA({long_ema}): ${ema_long:.2f}, "
+            f"Trades today: {len(state['trades_today'])}, this hour: {len(state['trades_this_hour'])}"
+        )
+
+        # === EXIT LOGIC (position held) ===
+        if has_position:
+            for pos in positions:
+                # Update entry tracking if not set
+                if state["entry_time"] is None:
+                    state["entry_time"] = pos.created_at.isoformat() if hasattr(pos, 'created_at') else now.isoformat()
+                    state["entry_price"] = pos.entry_price
+
+                entry_time = datetime.fromisoformat(state["entry_time"])
+                time_in_position = (now - entry_time).total_seconds()
+
+                gain = (current_price - pos.entry_price) / pos.entry_price
+                sell_amount = pos.amount * current_price
+
+                # Exit 1: Take profit hit
+                if gain >= take_profit:
+                    logger.info(
+                        f"Bot {bot.id}: Scalping EXIT (take profit) - "
+                        f"Gain: {gain*100:.2f}% at ${current_price:.2f}"
+                    )
+
+                    # Track trade and reset state
+                    state["trades_today"].append(now.isoformat())
+                    state["trades_this_hour"].append(now.isoformat())
+                    state["last_trade_time"] = now.isoformat()
+                    state["entry_time"] = None
+                    state["entry_price"] = None
+                    self._scalping_states[bot.id] = state
+
+                    return TradeSignal(
+                        action="sell",
+                        amount=sell_amount,
+                        order_type="market",
+                        reason=f"Scalping: Take profit {gain*100:.2f}%",
+                    )
+
+                # Exit 2: Stop loss hit
+                if gain <= -stop_loss:
+                    logger.info(
+                        f"Bot {bot.id}: Scalping EXIT (stop loss) - "
+                        f"Loss: {gain*100:.2f}% at ${current_price:.2f}"
+                    )
+
+                    # Track trade and reset state
+                    state["trades_today"].append(now.isoformat())
+                    state["trades_this_hour"].append(now.isoformat())
+                    state["last_trade_time"] = now.isoformat()
+                    state["entry_time"] = None
+                    state["entry_price"] = None
+                    self._scalping_states[bot.id] = state
+
+                    return TradeSignal(
+                        action="sell",
+                        amount=sell_amount,
+                        order_type="market",
+                        reason=f"Scalping: Stop loss {gain*100:.2f}%",
+                    )
+
+                # Exit 3: Time-based exit
+                if time_in_position >= max_position_time:
+                    logger.info(
+                        f"Bot {bot.id}: Scalping EXIT (time limit) - "
+                        f"Held for {time_in_position:.0f}s, P&L: {gain*100:.2f}%"
+                    )
+
+                    # Track trade and reset state
+                    state["trades_today"].append(now.isoformat())
+                    state["trades_this_hour"].append(now.isoformat())
+                    state["last_trade_time"] = now.isoformat()
+                    state["entry_time"] = None
+                    state["entry_price"] = None
+                    self._scalping_states[bot.id] = state
+
+                    return TradeSignal(
+                        action="sell",
+                        amount=sell_amount,
+                        order_type="market",
+                        reason=f"Scalping: Time exit at {time_in_position:.0f}s (P&L: {gain*100:.2f}%)",
+                    )
+
+                # Exit 4: Trend filter failure (macro risk)
+                if not trend_filter_passed:
+                    logger.info(
+                        f"Bot {bot.id}: Scalping EXIT (trend filter) - "
+                        f"Price fell below global trend"
+                    )
+
+                    state["entry_time"] = None
+                    state["entry_price"] = None
+                    self._scalping_states[bot.id] = state
+
+                    return TradeSignal(
+                        action="sell",
+                        amount=sell_amount,
+                        order_type="market",
+                        reason="Scalping: Exit on trend filter failure",
+                    )
+
+            # Hold position, waiting for exit condition
+            self._scalping_states[bot.id] = state
+            return TradeSignal(
+                action="hold",
+                amount=0,
+                reason=f"Scalping: Holding, target +{take_profit*100:.2f}%, stop -{stop_loss*100:.2f}%"
+            )
+
+        # === ENTRY LOGIC (no position) ===
+
+        # Check trade limits (hard constraints to prevent overtrading)
+        if len(state["trades_today"]) >= max_trades_day:
+            self._scalping_states[bot.id] = state
+            return TradeSignal(
+                action="hold",
+                amount=0,
+                reason=f"Scalping: Daily trade limit reached ({max_trades_day})"
+            )
+
+        if len(state["trades_this_hour"]) >= max_trades_hour:
+            self._scalping_states[bot.id] = state
+            return TradeSignal(
+                action="hold",
+                amount=0,
+                reason=f"Scalping: Hourly trade limit reached ({max_trades_hour})"
+            )
+
+        # Check cooldown period
+        if state["last_trade_time"] is not None:
+            last_trade = datetime.fromisoformat(state["last_trade_time"])
+            minutes_since_trade = (now - last_trade).total_seconds() / 60
+
+            if minutes_since_trade < cooldown_minutes:
+                self._scalping_states[bot.id] = state
                 return TradeSignal(
-                    action="sell",
-                    amount=pos.amount * pos.entry_price,
-                    order_type="market",
-                    reason=f"Scalp: Take profit at {gain*100:.2f}%",
+                    action="hold",
+                    amount=0,
+                    reason=f"Scalping: Cooldown active ({cooldown_minutes - minutes_since_trade:.1f}m remaining)"
                 )
 
-        return TradeSignal(action="hold", amount=0, reason="Scalp: Waiting for target")
+        # Check trend filter
+        if not trend_filter_passed:
+            self._scalping_states[bot.id] = state
+            return TradeSignal(
+                action="hold",
+                amount=0,
+                reason="Scalping: Trend filter failed, staying out"
+            )
 
-    async def _strategy_arbitrage(
-        self,
-        bot: Bot,
-        current_price: float,
-        params: dict,
-        session: AsyncSession,
-    ) -> Optional[TradeSignal]:
-        """Arbitrage strategy."""
-        return TradeSignal(action="hold", amount=0, reason="Arbitrage: Scanning for opportunities")
+        # Entry signal: Short EMA crosses above Long EMA (micro momentum)
+        # Also check that price is above short EMA (confirmation)
+        if ema_short > ema_long and current_price > ema_short:
+            # Calculate position size (very small, conservative)
+            position_amount = bot.current_balance * position_size_pct
 
-    async def _strategy_event(
-        self,
-        bot: Bot,
-        current_price: float,
-        params: dict,
-        session: AsyncSession,
-    ) -> Optional[TradeSignal]:
-        """Event-driven strategy."""
-        return TradeSignal(action="hold", amount=0, reason="Event: Monitoring")
+            if position_amount < 1:
+                self._scalping_states[bot.id] = state
+                return TradeSignal(
+                    action="hold",
+                    amount=0,
+                    reason="Scalping: Insufficient balance for entry"
+                )
+
+            logger.info(
+                f"Bot {bot.id}: Scalping ENTRY - "
+                f"EMA({short_ema}) ${ema_short:.2f} > EMA({long_ema}) ${ema_long:.2f}, "
+                f"Price: ${current_price:.2f}"
+            )
+
+            # Set entry tracking
+            state["entry_time"] = now.isoformat()
+            state["entry_price"] = current_price
+            self._scalping_states[bot.id] = state
+
+            return TradeSignal(
+                action="buy",
+                amount=position_amount,
+                order_type="market",
+                reason=f"Scalping: EMA cross entry (target +{take_profit*100:.2f}%)",
+            )
+
+        # No entry signal
+        self._scalping_states[bot.id] = state
+
+        if ema_short <= ema_long:
+            return TradeSignal(
+                action="hold",
+                amount=0,
+                reason=f"Scalping: Waiting for momentum (EMA({short_ema}) <= EMA({long_ema}))"
+            )
+        else:
+            return TradeSignal(
+                action="hold",
+                amount=0,
+                reason="Scalping: Waiting for price confirmation above EMA"
+            )
+
+    # Note: _strategy_arbitrage and _strategy_event were removed (placeholders without implementation)
 
     async def _strategy_auto(
         self,
@@ -1675,7 +2749,6 @@ class TradingEngine:
             "dca_accumulator",
             "adaptive_grid",
             "mean_reversion",
-            "breakdown_momentum",
             "twap",
             "scalping",
         ]

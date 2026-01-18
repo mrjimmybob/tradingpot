@@ -50,3 +50,4 @@ Thumbs.db
 
 # Build outputs
 frontend/dist/
+.aider*
