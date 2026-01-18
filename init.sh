@@ -178,10 +178,6 @@ strategies:
     breakout_threshold_percent: 2.0
     volume_threshold_multiplier: 1.5
 
-  scalping:
-    take_profit_percent: 0.5
-    max_position_time_seconds: 300
-
   arbitrage:
     min_spread_percent: 0.3
 

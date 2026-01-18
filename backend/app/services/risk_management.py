@@ -353,6 +353,11 @@ class RiskManagementService:
     ) -> Tuple[bool, str]:
         """Rotate bot to a different strategy.
 
+        IMPORTANT: This method NEVER modifies Bot.strategy for auto_mode bots.
+        Auto_mode is a meta-strategy (policy engine) that governs itself.
+        Risk events can only pause trading or reduce activity, but cannot
+        override auto_mode's strategy selection policy.
+
         Args:
             bot_id: The bot ID
             new_strategy: The new strategy name
@@ -369,6 +374,22 @@ class RiskManagementService:
 
         old_strategy = bot.strategy
 
+        # CRITICAL: Do NOT rotate auto_mode bots
+        # Auto_mode is a policy engine that manages its own strategy selection
+        if old_strategy == "auto_mode":
+            logger.warning(
+                f"Bot {bot_id}: Risk-based strategy rotation blocked - "
+                f"auto_mode cannot be disabled by risk events. "
+                f"Reason: {reason}. "
+                f"Consider pausing bot or adjusting auto_mode parameters instead."
+            )
+            await self._log_alert(
+                bot_id,
+                "rotation_blocked",
+                f"Strategy rotation blocked for auto_mode bot. Reason: {reason}"
+            )
+            return False, "Cannot rotate auto_mode - it is a policy engine that governs itself"
+
         # Record rotation
         rotation = StrategyRotation(
             bot_id=bot_id,
@@ -378,7 +399,7 @@ class RiskManagementService:
         )
         self.session.add(rotation)
 
-        # Update bot strategy
+        # Update bot strategy (only for non-auto_mode bots)
         bot.strategy = new_strategy
         bot.updated_at = datetime.utcnow()
 
