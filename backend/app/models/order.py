@@ -41,6 +41,14 @@ class Order(Base):
     status = Column(SQLEnum(OrderStatus), default=OrderStatus.PENDING)
     strategy_used = Column(String(50), nullable=False)
     running_balance_after = Column(Float, nullable=True)
+    reason = Column(String(500), nullable=True)  # Trade/rejection reason
+
+    # Execution cost modeling (nullable, backward compatible)
+    modeled_exchange_fee = Column(Float, nullable=True)
+    modeled_spread_cost = Column(Float, nullable=True)
+    modeled_slippage_cost = Column(Float, nullable=True)
+    modeled_total_cost = Column(Float, nullable=True)
+    realized_total_cost = Column(Float, nullable=True)  # Future-proof for actual cost tracking
 
     # Dry run flag
     is_simulated = Column(Boolean, default=False)
@@ -51,6 +59,8 @@ class Order(Base):
 
     # Relationships
     bot = relationship("Bot", back_populates="orders")
+    trades = relationship("Trade", back_populates="order", cascade="all, delete-orphan")
+    ledger_entries = relationship("WalletLedger", back_populates="order")
 
     def __repr__(self):
         return f"<Order(id={self.id}, type={self.order_type.value}, status={self.status.value})>"

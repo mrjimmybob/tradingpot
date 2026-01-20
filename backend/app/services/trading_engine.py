@@ -6,6 +6,7 @@ import logging
 from datetime import datetime, timedelta
 from typing import Optional, Dict, Any, Callable, Awaitable
 from dataclasses import dataclass
+from pathlib import Path
 
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, update
@@ -13,6 +14,7 @@ from sqlalchemy import select, update
 from ..models import (
     Bot, BotStatus, Order, OrderType, OrderStatus,
     Position, PositionSide, PnLSnapshot,
+    Trade, TradeSide,
     async_session_maker,
 )
 from .exchange import ExchangeService, SimulatedExchangeService, OrderSide
@@ -25,6 +27,11 @@ from .logging_service import (
     FiscalLogEntry,
     ensure_bot_log_directory,
 )
+from .execution_cost_model import ExecutionCostModel, get_cost_model
+from .portfolio_risk import PortfolioRiskService
+from .strategy_capacity import StrategyCapacityService
+from .ledger_writer import LedgerWriterService
+from .accounting import TradeRecorderService, FIFOTaxEngine, CSVExportService
 
 logger = logging.getLogger(__name__)
 
@@ -2662,117 +2669,281 @@ class TradingEngine:
         params: dict,
         session: AsyncSession,
     ) -> Optional[TradeSignal]:
-        """Auto Mode - Regime-based strategy selection policy.
+        """Auto Mode - Risk-first, regime-aware, performance-adaptive strategy allocator.
 
-        Detects market regimes (trend, volatility, liquidity) and selects the most
-        appropriate strategy based on explicit capability declarations.
+        This is a POLICY ENGINE, not a trading strategy. It selects, switches, and
+        force-exits strategies based on:
+        1. Market regime compatibility
+        2. Per-strategy performance tracking
+        3. Risk-adjusted dynamic priority scoring
+        4. Capital preservation bias
 
-        This is a POLICY ENGINE, not a strategy itself. It delegates execution to
-        the selected strategy while maintaining regime awareness and preventing
-        excessive switching.
+        MANDATORY: Uses 60-second bar system only. All regime detection and performance
+        metrics operate on completed bar closes only.
 
         Parameters:
             min_switch_interval_minutes: Minimum time between strategy switches (default: 15)
+            bar_interval_seconds: Bar aggregation interval (default: 60)
+            cooldown_hours_default: Default cooldown after failure (default: 6)
+            max_failures_before_blacklist: Hard stop threshold (default: 3)
+            performance_window_bars: Rolling window for PnL calculation (default: 20)
 
         DEPRECATED parameters (backward compatibility only, ignored):
             factor_precedence: Legacy parameter (ignored)
             disabled_factors: Legacy parameter (ignored)
             switch_threshold: Legacy parameter (ignored)
         """
+        # === PARAMETER EXTRACTION ===
         min_switch_interval = params.get("min_switch_interval_minutes", 15)
+        bar_interval_seconds = params.get("bar_interval_seconds", 60)
+        cooldown_hours_default = params.get("cooldown_hours_default", 6)
+        max_failures_before_blacklist = params.get("max_failures_before_blacklist", 3)
+        performance_window_bars = params.get("performance_window_bars", 20)
 
-        # Get auto mode state
+        # === STATE INITIALIZATION ===
         auto_state = self._get_auto_state(bot.id)
+        now = datetime.utcnow()
 
-        # Initialize state if needed
         if "current_strategy" not in auto_state:
             auto_state["current_strategy"] = "dca_accumulator"
             auto_state["last_switch_time"] = None
-            auto_state["price_history"] = []
+            auto_state["last_bar_close_time"] = None
+            auto_state["current_bar"] = {"open": current_price, "high": current_price, "low": current_price, "close": current_price}
+            auto_state["bar_history"] = []  # List of completed bar close prices
             auto_state["current_regime"] = None
             auto_state["regime_change_count"] = 0
+            auto_state["strategy_metrics"] = {}  # Per-strategy performance tracking
             self._save_auto_state(bot.id, auto_state)
 
-        # Update price history
-        auto_state["price_history"].append({
-            "timestamp": datetime.utcnow().isoformat(),
-            "price": current_price,
-        })
+        # === BAR AGGREGATION (60-second bars) ===
+        # Update current bar high/low
+        current_bar = auto_state["current_bar"]
+        current_bar["high"] = max(current_bar["high"], current_price)
+        current_bar["low"] = min(current_bar["low"], current_price)
+        current_bar["close"] = current_price
 
-        # Keep last 100 price points (sufficient for regime detection)
-        auto_state["price_history"] = auto_state["price_history"][-100:]
+        # Check if bar should close
+        last_bar_close = auto_state.get("last_bar_close_time")
+        bar_closed = False
 
-        # === REGIME DETECTION ===
-        previous_regime = auto_state.get("current_regime")
-        current_regime = self._detect_market_regime(
-            auto_state["price_history"],
-            previous_regime
-        )
+        if last_bar_close is None:
+            # First bar, initialize
+            auto_state["last_bar_close_time"] = now.isoformat()
+            bar_closed = False
+        else:
+            last_bar_time = datetime.fromisoformat(last_bar_close)
+            time_since_bar = (now - last_bar_time).total_seconds()
 
-        # Check if regime actually changed (confirmed transition)
-        regime_changed = False
-        if previous_regime:
-            prev_trend = previous_regime.get("trend_state")
-            prev_vol = previous_regime.get("volatility_state")
-            prev_liq = previous_regime.get("liquidity_state")
+            if time_since_bar >= bar_interval_seconds:
+                # Bar closed, append to history
+                auto_state["bar_history"].append({
+                    "timestamp": now.isoformat(),
+                    "close": current_bar["close"],
+                    "high": current_bar["high"],
+                    "low": current_bar["low"],
+                    "open": current_bar["open"]
+                })
 
-            curr_trend = current_regime.get("trend_state")
-            curr_vol = current_regime.get("volatility_state")
-            curr_liq = current_regime.get("liquidity_state")
+                # Keep last 100 bars
+                auto_state["bar_history"] = auto_state["bar_history"][-100:]
 
-            if prev_trend != curr_trend or prev_vol != curr_vol or prev_liq != curr_liq:
-                regime_changed = True
-                auto_state["regime_change_count"] = auto_state.get("regime_change_count", 0) + 1
+                # Reset current bar
+                auto_state["current_bar"] = {
+                    "open": current_price,
+                    "high": current_price,
+                    "low": current_price,
+                    "close": current_price
+                }
+                auto_state["last_bar_close_time"] = now.isoformat()
+                bar_closed = True
 
-                # Log regime transition
-                logger.info(
-                    f"Bot {bot.id}: Auto Mode regime change detected - "
-                    f"trend:{prev_trend}→{curr_trend}, vol:{prev_vol}→{curr_vol}, liq:{prev_liq}→{curr_liq} "
-                    f"(total regime changes: {auto_state['regime_change_count']})"
-                )
+        # === REGIME DETECTION (ON BAR CLOSE ONLY) ===
+        if bar_closed and len(auto_state["bar_history"]) >= 20:
+            previous_regime = auto_state.get("current_regime")
+            current_regime = self._detect_market_regime_bar_based(
+                auto_state["bar_history"],
+                previous_regime
+            )
 
-        auto_state["current_regime"] = current_regime
+            # Check if regime actually changed
+            if previous_regime:
+                prev_trend = previous_regime.get("trend_state")
+                prev_vol = previous_regime.get("volatility_state")
+                prev_liq = previous_regime.get("liquidity_state")
 
-        # === STRATEGY ELIGIBILITY FILTERING ===
+                curr_trend = current_regime.get("trend_state")
+                curr_vol = current_regime.get("volatility_state")
+                curr_liq = current_regime.get("liquidity_state")
+
+                if prev_trend != curr_trend or prev_vol != curr_vol or prev_liq != curr_liq:
+                    auto_state["regime_change_count"] = auto_state.get("regime_change_count", 0) + 1
+                    logger.info(
+                        f"Bot {bot.id}: Auto Mode regime change detected - "
+                        f"trend:{prev_trend}→{curr_trend}, vol:{prev_vol}→{curr_vol}, liq:{prev_liq}→{curr_liq} "
+                        f"(total changes: {auto_state['regime_change_count']})"
+                    )
+
+            auto_state["current_regime"] = current_regime
+        elif not auto_state.get("current_regime"):
+            # No regime yet, use neutral
+            auto_state["current_regime"] = {
+                "trend_state": "flat",
+                "volatility_state": "medium",
+                "liquidity_state": "normal"
+            }
+
+        current_regime = auto_state["current_regime"]
+
+        # === UPDATE PERFORMANCE METRICS (ON BAR CLOSE ONLY) ===
+        if bar_closed:
+            await self._update_strategy_performance_metrics(
+                bot.id,
+                auto_state,
+                session,
+                performance_window_bars
+            )
+
+        # === STRATEGY ELIGIBILITY FILTERING (HARD GATE) ===
         capabilities = self._get_strategy_capabilities()
-        eligible_strategies = self._filter_eligible_strategies(current_regime, capabilities)
+        strategy_metrics = auto_state.get("strategy_metrics", {})
 
-        # Log eligibility (debug level)
-        eligible_names = [s[0] for s in eligible_strategies]
-        logger.debug(
-            f"Bot {bot.id}: Auto Mode eligible strategies for regime "
-            f"(trend={current_regime['trend_state']}, vol={current_regime['volatility_state']}, "
-            f"liq={current_regime['liquidity_state']}): {eligible_names}"
-        )
+        # Create strategy capacity service for capacity checks
+        strategy_capacity = StrategyCapacityService(session)
+
+        eligible_strategies = []
+        ineligible_reasons = {}
+
+        for strategy_name, caps in capabilities.items():
+            # Check 1: Regime, cooldown, blacklist, kill switch
+            is_eligible, reason = self._is_strategy_eligible(
+                strategy_name,
+                caps,
+                current_regime,
+                strategy_metrics.get(strategy_name, {}),
+                now,
+                max_failures_before_blacklist
+            )
+
+            if not is_eligible:
+                ineligible_reasons[strategy_name] = reason
+                continue
+
+            # Check 2: Strategy capacity limits (NEW)
+            is_at_capacity, capacity_reason = await strategy_capacity.is_strategy_at_capacity(
+                strategy_name,
+                owner_id=None,  # TODO: Add owner_id when Bot model has it
+            )
+
+            if is_at_capacity:
+                ineligible_reasons[strategy_name] = f"strategy capacity: {capacity_reason}"
+                continue
+
+            # All checks passed
+            eligible_strategies.append(strategy_name)
+
+        # Fallback to dca_accumulator if no strategies eligible
+        if not eligible_strategies:
+            logger.warning(
+                f"Bot {bot.id}: Auto Mode - no eligible strategies, forcing dca_accumulator. "
+                f"Ineligible reasons: {ineligible_reasons}"
+            )
+            eligible_strategies = ["dca_accumulator"]
+
+        # === DYNAMIC PRIORITY SCORING ===
+        scored_strategies = []
+        for strategy_name in eligible_strategies:
+            caps = capabilities[strategy_name]
+            metrics = strategy_metrics.get(strategy_name, {})
+            effective_priority = self._score_strategy(strategy_name, caps, metrics)
+            scored_strategies.append((strategy_name, effective_priority, caps, metrics))
+
+        # Sort by effective priority (descending)
+        scored_strategies.sort(key=lambda x: x[1], reverse=True)
+
+        # === FORCE-EXIT CHECK ===
+        current_strategy = auto_state["current_strategy"]
+        force_exit_signal = None
+
+        # Check if current strategy is ineligible
+        if current_strategy not in eligible_strategies:
+            force_exit_reason = ineligible_reasons.get(current_strategy, "unknown")
+            logger.warning(
+                f"Bot {bot.id}: Auto Mode FORCE EXIT - {current_strategy} became ineligible: {force_exit_reason}"
+            )
+            force_exit_signal = TradeSignal(
+                action="sell",
+                amount=0,  # Sell all
+                reason=f"Auto Mode FORCE EXIT: {current_strategy} ineligible ({force_exit_reason})"
+            )
+
+            # Record failure
+            self._record_strategy_failure(auto_state, current_strategy, force_exit_reason, now, cooldown_hours_default)
 
         # === STRATEGY SELECTION WITH INERTIA ===
-        current_strategy = auto_state["current_strategy"]
-        selected_strategy, should_switch, reason = self._select_strategy_from_eligible(
-            eligible_strategies,
-            current_strategy,
-            auto_state,
-            min_switch_interval
-        )
+        best_strategy, best_priority, best_caps, best_metrics = scored_strategies[0]
+        selected_strategy = current_strategy
+        should_switch = False
+        switch_reason = ""
+
+        if current_strategy not in eligible_strategies:
+            # Must switch, current is ineligible
+            selected_strategy = best_strategy
+            should_switch = True
+            switch_reason = f"current strategy ineligible, switching to {best_strategy}"
+        elif best_strategy != current_strategy:
+            # Check if better strategy available
+            current_priority = next((s[1] for s in scored_strategies if s[0] == current_strategy), 0)
+
+            if best_priority > current_priority:
+                # Check min switch interval
+                last_switch = auto_state.get("last_switch_time")
+                if last_switch:
+                    time_since_switch = (now - datetime.fromisoformat(last_switch)).total_seconds() / 60
+                    if time_since_switch < min_switch_interval:
+                        switch_reason = f"better strategy {best_strategy} available but too soon (last switch {time_since_switch:.1f}m ago)"
+                    else:
+                        selected_strategy = best_strategy
+                        should_switch = True
+                        switch_reason = f"higher priority strategy {best_strategy} (priority {best_priority:.2f} > {current_priority:.2f})"
+                else:
+                    selected_strategy = best_strategy
+                    should_switch = True
+                    switch_reason = f"higher priority strategy {best_strategy} (priority {best_priority:.2f})"
+            else:
+                switch_reason = f"current strategy {current_strategy} still optimal (priority {current_priority:.2f})"
+        else:
+            switch_reason = f"current strategy {current_strategy} is best (priority {best_priority:.2f})"
 
         # === STRATEGY SWITCHING ===
-        if should_switch and selected_strategy != current_strategy:
+        if should_switch:
             logger.info(
-                f"Bot {bot.id}: Auto Mode switching strategy - "
-                f"{current_strategy} → {selected_strategy} "
-                f"(reason: {reason})"
+                f"Bot {bot.id}: Auto Mode SWITCHING - {current_strategy} → {selected_strategy} ({switch_reason})"
             )
             auto_state["current_strategy"] = selected_strategy
-            auto_state["last_switch_time"] = datetime.utcnow().isoformat()
+            auto_state["last_switch_time"] = now.isoformat()
             current_strategy = selected_strategy
-        elif selected_strategy != current_strategy:
-            # Wanted to switch but blocked by inertia
-            logger.debug(
-                f"Bot {bot.id}: Auto Mode keeping {current_strategy} "
-                f"(reason: {reason})"
-            )
+        else:
+            logger.debug(f"Bot {bot.id}: Auto Mode HOLDING {current_strategy} ({switch_reason})")
+
+        # === DECISION LOGGING ===
+        self._log_auto_mode_decision(
+            bot.id,
+            current_regime,
+            eligible_strategies,
+            scored_strategies,
+            current_strategy,
+            should_switch,
+            switch_reason,
+            ineligible_reasons,
+            strategy_metrics
+        )
 
         # Save updated state
         self._save_auto_state(bot.id, auto_state)
+
+        # === FORCE EXIT EXECUTION ===
+        if force_exit_signal:
+            return force_exit_signal
 
         # === STRATEGY EXECUTION ===
         strategy_executor = self._get_strategy_executor(current_strategy)
@@ -2789,14 +2960,16 @@ class TradingEngine:
         signal = await strategy_executor(bot, current_price, params, session)
 
         if signal:
-            # Add auto mode context to reason (include regime info)
+            # Add auto mode context to reason
             regime_str = f"{current_regime['trend_state']}/{current_regime['volatility_state']}/{current_regime['liquidity_state']}"
             signal.reason = f"[Auto:{current_strategy}|{regime_str}] {signal.reason}"
 
         return signal
 
-    def _detect_market_regime(self, price_history: list, current_regime: dict) -> dict:
-        """Detect current market regime from price history.
+    def _detect_market_regime_bar_based(self, bar_history: list, current_regime: dict) -> dict:
+        """Detect current market regime from completed bar closes only.
+
+        MANDATORY: Operates on 60-second bar closes only. No tick data.
 
         Returns a discrete regime state with:
         - trend_state: "up", "down", or "flat"
@@ -2805,7 +2978,7 @@ class TradingEngine:
 
         Regime changes require persistence over multiple bars to avoid noise.
         """
-        if len(price_history) < 20:
+        if len(bar_history) < 20:
             # Not enough data, return neutral regime
             return {
                 "trend_state": "flat",
@@ -2814,20 +2987,18 @@ class TradingEngine:
                 "persistence_bars": 0
             }
 
-        prices = [p["price"] for p in price_history]
-        n = len(prices)
+        # Extract close prices from bars
+        closes = [bar["close"] for bar in bar_history]
+        n = len(closes)
 
-        # === TREND STATE (using EMA slope on higher timeframe) ===
-        # Calculate 20-period and 50-period EMAs
-        ema_20 = self._calculate_ema(prices, 20)
-        ema_50 = self._calculate_ema(prices, 50) if n >= 50 else ema_20
+        # === TREND STATE (using EMA slope on bar closes) ===
+        ema_20 = self._calculate_ema(closes, 20)
+        ema_50 = self._calculate_ema(closes, 50) if n >= 50 else ema_20
 
-        # Trend determination based on EMA slope and crossover
         ema_20_current = ema_20[-1]
         ema_20_prev = ema_20[-5] if len(ema_20) >= 5 else ema_20[0]
         ema_slope_pct = ((ema_20_current - ema_20_prev) / ema_20_prev) * 100 if ema_20_prev > 0 else 0
 
-        # Determine trend state
         if ema_slope_pct > 0.5 and ema_20_current > ema_50[-1]:
             new_trend = "up"
         elif ema_slope_pct < -0.5 and ema_20_current < ema_50[-1]:
@@ -2835,13 +3006,12 @@ class TradingEngine:
         else:
             new_trend = "flat"
 
-        # === VOLATILITY STATE (using ATR percentile) ===
-        # Calculate ATR (Average True Range) for last 14 periods
+        # === VOLATILITY STATE (using true range from bars) ===
+        # Calculate ATR using actual bar high/low
         atr_values = []
         for i in range(max(1, n - 30), n):
-            high = max(prices[max(0, i - 5):i + 1])
-            low = min(prices[max(0, i - 5):i + 1])
-            tr = high - low
+            bar = bar_history[i]
+            tr = bar["high"] - bar["low"]
             atr_values.append(tr)
 
         if atr_values:
@@ -2858,19 +3028,17 @@ class TradingEngine:
         else:
             new_volatility = "medium"
 
-        # === LIQUIDITY STATE (proxy using price range stability) ===
-        # High liquidity = stable, tight price action
-        # Low liquidity = erratic, wide swings
+        # === LIQUIDITY STATE (proxy using bar range stability) ===
         recent_ranges = []
-        for i in range(max(10, n - 20), n, 2):
-            range_val = (max(prices[i:i + 2]) - min(prices[i:i + 2])) / prices[i] if prices[i] > 0 else 0
+        for i in range(max(10, n - 20), n):
+            bar = bar_history[i]
+            range_val = (bar["high"] - bar["low"]) / bar["close"] if bar["close"] > 0 else 0
             recent_ranges.append(range_val)
 
         if recent_ranges:
             avg_range = sum(recent_ranges) / len(recent_ranges)
             range_std = (sum((r - avg_range) ** 2 for r in recent_ranges) / len(recent_ranges)) ** 0.5
 
-            # Low std = high liquidity (stable), high std = low liquidity (erratic)
             if range_std < 0.002:
                 new_liquidity = "high"
             elif range_std > 0.005:
@@ -2880,12 +3048,10 @@ class TradingEngine:
         else:
             new_liquidity = "normal"
 
-        # === REGIME PERSISTENCE (require N bars before switching) ===
-        # This prevents noise from causing frequent regime switches
-        persistence_required = 3  # Require 3 bars of consistency
+        # === REGIME PERSISTENCE ===
+        persistence_required = 3
 
         if not current_regime:
-            # First run, accept new regime immediately
             return {
                 "trend_state": new_trend,
                 "volatility_state": new_volatility,
@@ -2893,7 +3059,6 @@ class TradingEngine:
                 "persistence_bars": persistence_required
             }
 
-        # Check if regime has changed
         regime_changed = (
             new_trend != current_regime.get("trend_state") or
             new_volatility != current_regime.get("volatility_state") or
@@ -2901,10 +3066,8 @@ class TradingEngine:
         )
 
         if regime_changed:
-            # Start counting persistence
             persistence_bars = current_regime.get("persistence_bars", 0) + 1
             if persistence_bars >= persistence_required:
-                # Regime change confirmed, accept new regime
                 return {
                     "trend_state": new_trend,
                     "volatility_state": new_volatility,
@@ -2912,18 +3075,13 @@ class TradingEngine:
                     "persistence_bars": 0
                 }
             else:
-                # Keep old regime, but track persistence
                 return {
                     "trend_state": current_regime.get("trend_state"),
                     "volatility_state": current_regime.get("volatility_state"),
                     "liquidity_state": current_regime.get("liquidity_state"),
                     "persistence_bars": persistence_bars,
-                    "candidate_trend": new_trend,
-                    "candidate_volatility": new_volatility,
-                    "candidate_liquidity": new_liquidity
                 }
         else:
-            # Regime unchanged, reset persistence counter
             return {
                 "trend_state": new_trend,
                 "volatility_state": new_volatility,
@@ -2944,6 +3102,312 @@ class TradingEngine:
             ema_values.append(ema)
 
         return ema_values
+
+    def _is_strategy_eligible(
+        self,
+        strategy_name: str,
+        capabilities: dict,
+        current_regime: dict,
+        strategy_metrics: dict,
+        now: datetime,
+        max_failures: int
+    ) -> tuple:
+        """Check if strategy passes eligibility filter (HARD GATE).
+
+        A strategy is eligible ONLY if ALL conditions hold:
+        1. Current regime matches its allowed_regimes
+        2. Strategy is not in cooldown
+        3. Strategy is not blacklisted
+        4. Strategy has not exceeded failure threshold
+
+        Args:
+            strategy_name: Name of strategy
+            capabilities: Strategy capability dict
+            current_regime: Current regime state
+            strategy_metrics: Performance metrics for this strategy
+            now: Current datetime
+            max_failures: Maximum failures before blacklist
+
+        Returns:
+            (is_eligible: bool, reason: str)
+        """
+        # Check 1: Regime compatibility
+        allowed = capabilities.get("allowed_regimes", [])
+        trend = current_regime.get("trend_state", "flat")
+        volatility = current_regime.get("volatility_state", "medium")
+        liquidity = current_regime.get("liquidity_state", "normal")
+
+        regime_tags = [
+            f"trend_{trend}",
+            f"volatility_{volatility}",
+            f"liquidity_{liquidity}"
+        ]
+
+        if "all" not in allowed:
+            matches = [tag for tag in regime_tags if tag in allowed]
+            if not matches:
+                return False, f"regime mismatch (need {allowed}, got {regime_tags})"
+
+        # Check 2: Cooldown
+        cooldown_until = strategy_metrics.get("cooldown_until")
+        if cooldown_until:
+            cooldown_time = datetime.fromisoformat(cooldown_until)
+            if now < cooldown_time:
+                remaining = (cooldown_time - now).total_seconds() / 3600
+                return False, f"in cooldown ({remaining:.1f}h remaining)"
+
+        # Check 3: Blacklist (exceeds failure threshold)
+        failure_count = strategy_metrics.get("failure_count", 0)
+        if failure_count >= max_failures:
+            return False, f"blacklisted (failures: {failure_count} >= {max_failures})"
+
+        # Check 4: Hard stop check (strategy metrics indicate kill switch)
+        if strategy_metrics.get("kill_switch_active"):
+            return False, "kill switch active"
+
+        return True, "eligible"
+
+    def _score_strategy(
+        self,
+        strategy_name: str,
+        capabilities: dict,
+        strategy_metrics: dict
+    ) -> float:
+        """Calculate risk-adjusted effective priority for a strategy.
+
+        Formula:
+            effective_priority = base_priority + performance_bonus - risk_penalty
+
+        Where:
+            - performance_bonus is proportional to recent_pnl_pct (capped)
+            - risk_penalty grows aggressively with drawdown and failures
+            - Risk penalty MUST dominate performance bonus
+
+        Args:
+            strategy_name: Name of strategy
+            capabilities: Strategy capability dict
+            strategy_metrics: Performance metrics
+
+        Returns:
+            Effective priority score (float)
+        """
+        base_priority = capabilities.get("priority", 0)
+
+        # Performance bonus (capped at +2.0)
+        recent_pnl_pct = strategy_metrics.get("recent_pnl_pct", 0.0)
+        performance_bonus = min(2.0, max(-2.0, recent_pnl_pct / 5.0))  # +/-20% PnL = +/-4 bonus, capped at +/-2
+
+        # Risk penalty (aggressive)
+        risk_penalty = 0.0
+
+        # Drawdown penalty (exponential)
+        max_drawdown_pct = strategy_metrics.get("max_drawdown_pct", 0.0)
+        if max_drawdown_pct > 0:
+            # Penalty grows exponentially: 5% = -1, 10% = -4, 15% = -9, 20% = -16
+            risk_penalty += (max_drawdown_pct / 5.0) ** 2
+
+        # Failure penalty (linear and heavy)
+        failure_count = strategy_metrics.get("failure_count", 0)
+        risk_penalty += failure_count * 5.0  # Each failure = -5 priority
+
+        # Recent exit penalty (discourage recently exited strategies)
+        last_exit_time = strategy_metrics.get("last_exit_time")
+        if last_exit_time:
+            try:
+                exit_time = datetime.fromisoformat(last_exit_time)
+                hours_since_exit = (datetime.utcnow() - exit_time).total_seconds() / 3600
+                if hours_since_exit < 1:
+                    risk_penalty += 3.0  # Heavy penalty if exited < 1h ago
+                elif hours_since_exit < 6:
+                    risk_penalty += 1.0  # Moderate penalty if exited < 6h ago
+            except (ValueError, TypeError):
+                pass
+
+        effective_priority = base_priority + performance_bonus - risk_penalty
+
+        return effective_priority
+
+    async def _update_strategy_performance_metrics(
+        self,
+        bot_id: int,
+        auto_state: dict,
+        session: AsyncSession,
+        performance_window: int
+    ) -> None:
+        """Update per-strategy performance metrics on bar close.
+
+        Tracks:
+        - recent_pnl_pct: Rolling window PnL percentage
+        - max_drawdown_pct: Maximum drawdown observed
+        - failure_count: Number of failures
+        - last_exit_time: Timestamp of last exit
+
+        Args:
+            bot_id: Bot ID
+            auto_state: Auto mode state
+            session: Database session
+            performance_window: Number of bars for rolling window
+        """
+        # Get recent orders to calculate PnL
+        query = select(Order).where(
+            Order.bot_id == bot_id,
+            Order.status == OrderStatus.FILLED
+        ).order_by(Order.filled_at.desc()).limit(50)
+
+        result = await session.execute(query)
+        orders = result.scalars().all()
+
+        if not orders:
+            return
+
+        # Group orders by strategy (extracted from reason field)
+        strategy_pnl = {}
+        strategy_orders = {}
+
+        for order in orders:
+            # Extract strategy from reason (format: "[Auto:strategy_name|regime] reason")
+            reason = order.reason or ""
+            if reason.startswith("[Auto:"):
+                strategy_part = reason.split("|")[0].replace("[Auto:", "")
+                strategy_name = strategy_part.strip()
+
+                if strategy_name not in strategy_pnl:
+                    strategy_pnl[strategy_name] = []
+                    strategy_orders[strategy_name] = []
+
+                # Calculate order PnL (simplified)
+                if order.running_balance_after is not None:
+                    strategy_orders[strategy_name].append(order)
+
+        # Update metrics for each strategy
+        strategy_metrics = auto_state.get("strategy_metrics", {})
+
+        for strategy_name, orders_list in strategy_orders.items():
+            if strategy_name not in strategy_metrics:
+                strategy_metrics[strategy_name] = {
+                    "recent_pnl_pct": 0.0,
+                    "max_drawdown_pct": 0.0,
+                    "failure_count": 0,
+                    "last_exit_time": None,
+                    "cooldown_until": None
+                }
+
+            metrics = strategy_metrics[strategy_name]
+
+            # Calculate recent PnL (simplified - use running balance changes)
+            if len(orders_list) >= 2:
+                recent_orders = orders_list[:min(performance_window, len(orders_list))]
+                start_balance = recent_orders[-1].running_balance_after
+                end_balance = recent_orders[0].running_balance_after
+
+                if start_balance and start_balance > 0:
+                    pnl_pct = ((end_balance - start_balance) / start_balance) * 100
+                    metrics["recent_pnl_pct"] = pnl_pct
+
+                    # Update max drawdown
+                    if pnl_pct < 0:
+                        metrics["max_drawdown_pct"] = max(metrics["max_drawdown_pct"], abs(pnl_pct))
+
+        auto_state["strategy_metrics"] = strategy_metrics
+
+    def _record_strategy_failure(
+        self,
+        auto_state: dict,
+        strategy_name: str,
+        reason: str,
+        now: datetime,
+        cooldown_hours: float
+    ) -> None:
+        """Record strategy failure and apply cooldown.
+
+        Args:
+            auto_state: Auto mode state
+            strategy_name: Name of failed strategy
+            reason: Failure reason
+            now: Current datetime
+            cooldown_hours: Hours to apply cooldown
+        """
+        strategy_metrics = auto_state.get("strategy_metrics", {})
+
+        if strategy_name not in strategy_metrics:
+            strategy_metrics[strategy_name] = {
+                "recent_pnl_pct": 0.0,
+                "max_drawdown_pct": 0.0,
+                "failure_count": 0,
+                "last_exit_time": None,
+                "cooldown_until": None
+            }
+
+        metrics = strategy_metrics[strategy_name]
+        metrics["failure_count"] = metrics.get("failure_count", 0) + 1
+        metrics["last_exit_time"] = now.isoformat()
+        metrics["cooldown_until"] = (now + timedelta(hours=cooldown_hours)).isoformat()
+
+        logger.warning(
+            f"Strategy {strategy_name} failure recorded: {reason}. "
+            f"Total failures: {metrics['failure_count']}, cooldown until {metrics['cooldown_until']}"
+        )
+
+        auto_state["strategy_metrics"] = strategy_metrics
+
+    def _log_auto_mode_decision(
+        self,
+        bot_id: int,
+        current_regime: dict,
+        eligible_strategies: list,
+        scored_strategies: list,
+        selected_strategy: str,
+        should_switch: bool,
+        switch_reason: str,
+        ineligible_reasons: dict,
+        strategy_metrics: dict
+    ) -> None:
+        """Log comprehensive auto mode decision for auditing.
+
+        MANDATORY: Every decision must log:
+        - Current regime
+        - Eligible strategies
+        - Scores per strategy
+        - Switch / no-switch reason
+        - Force-exit reason (if any)
+        - Cooldown / blacklist status
+
+        Args:
+            bot_id: Bot ID
+            current_regime: Current regime state
+            eligible_strategies: List of eligible strategy names
+            scored_strategies: List of (name, score, caps, metrics) tuples
+            selected_strategy: Selected strategy
+            should_switch: Whether switching occurred
+            switch_reason: Reason for switch/no-switch
+            ineligible_reasons: Map of ineligible strategies to reasons
+            strategy_metrics: All strategy metrics
+        """
+        regime_str = f"{current_regime['trend_state']}/{current_regime['volatility_state']}/{current_regime['liquidity_state']}"
+
+        log_msg = f"\n{'=' * 80}\n"
+        log_msg += f"Bot {bot_id}: Auto Mode Decision\n"
+        log_msg += f"{'-' * 80}\n"
+        log_msg += f"Regime: {regime_str}\n"
+        log_msg += f"Selected: {selected_strategy} (switched: {should_switch})\n"
+        log_msg += f"Reason: {switch_reason}\n"
+        log_msg += f"\n"
+
+        log_msg += f"Eligible Strategies ({len(eligible_strategies)}):\n"
+        for name, score, caps, metrics in scored_strategies:
+            pnl = metrics.get("recent_pnl_pct", 0.0)
+            dd = metrics.get("max_drawdown_pct", 0.0)
+            failures = metrics.get("failure_count", 0)
+            log_msg += f"  - {name:30s} score={score:6.2f} pnl={pnl:+6.2f}% dd={dd:5.2f}% failures={failures}\n"
+
+        if ineligible_reasons:
+            log_msg += f"\nIneligible Strategies ({len(ineligible_reasons)}):\n"
+            for name, reason in ineligible_reasons.items():
+                log_msg += f"  - {name:30s} {reason}\n"
+
+        log_msg += f"{'=' * 80}\n"
+
+        logger.info(log_msg)
 
     def _get_strategy_capabilities(self) -> dict:
         """Get strategy capability declarations for regime-based selection.
@@ -3126,10 +3590,21 @@ class TradingEngine:
         current_price: float,
         session: AsyncSession,
     ) -> Optional[Order]:
-        """Execute a trade based on signal.
+        """Execute a trade based on signal with FULL SAFETY BOUNDARY LAYER.
+
+        MANDATORY TRADE LIFECYCLE (enforced in order):
+        1. Strategy generates TradeSignal
+        2. Auto_mode approves strategy (if applicable)
+        3. **Portfolio risk caps checked** ← Step 3
+        4. **Strategy capacity checked** ← Step 4
+        5. **Execution cost estimated** ← Step 5
+        6. **Order size adjusted** ← Step 6
+        7. Per-bot risk checks (existing)
+        8. Execute trade ← Step 8
+
+        This method implements steps 3-8.
 
         Separates alpha (strategy decision) from execution (how to execute).
-
         Strategy signals decide WHAT to trade and WHY.
         Execution layer decides HOW to execute the trade.
 
@@ -3143,8 +3618,88 @@ class TradingEngine:
         Returns:
             Order if executed, None otherwise
         """
-        # === EXECUTION LAYER ROUTING ===
-        # Determine execution method (default to market if not specified)
+        # === STEP 3: PORTFOLIO RISK CAPS CHECK ===
+        portfolio_risk = PortfolioRiskService(session)
+        portfolio_check = await portfolio_risk.check_portfolio_risk(
+            bot.id,
+            signal.amount,
+            signal.action,
+        )
+
+        if not portfolio_check.ok:
+            logger.warning(
+                f"Bot {bot.id}: Trade REJECTED by portfolio risk caps - "
+                f"{portfolio_check.violated_cap}: {portfolio_check.details}"
+            )
+            return None
+
+        # Apply portfolio-level order resize if needed
+        if portfolio_check.action == "resize" and portfolio_check.adjusted_amount:
+            original_amount = signal.amount
+            signal.amount = portfolio_check.adjusted_amount
+            logger.info(
+                f"Bot {bot.id}: Order resized by portfolio caps - "
+                f"${original_amount:.2f} → ${signal.amount:.2f}"
+            )
+
+        # === STEP 4: STRATEGY CAPACITY CHECK ===
+        if signal.action == "buy":  # Only check capacity for buys
+            strategy_capacity = StrategyCapacityService(session)
+            capacity_check = await strategy_capacity.check_capacity_for_trade(
+                bot.id,
+                bot.strategy,
+                signal.amount,
+            )
+
+            if not capacity_check.ok:
+                logger.warning(
+                    f"Bot {bot.id}: Trade REJECTED by strategy capacity limits - "
+                    f"{capacity_check.reason}"
+                )
+                return None
+
+            # Apply strategy capacity resize if needed
+            if capacity_check.adjusted_amount and capacity_check.adjusted_amount < signal.amount:
+                original_amount = signal.amount
+                signal.amount = capacity_check.adjusted_amount
+                logger.info(
+                    f"Bot {bot.id}: Order resized by strategy capacity - "
+                    f"${original_amount:.2f} → ${signal.amount:.2f}"
+                )
+
+        # === STEP 5: EXECUTION COST ESTIMATION ===
+        # Get cost model (defaults to 0 cost, preserving current behavior)
+        cost_model = get_cost_model(
+            exchange_fee_pct=bot.exchange_fee or 0.0,
+            market_spread_pct=0.0,  # TODO: Make configurable per bot
+            slippage_pct=0.0,       # TODO: Make configurable per bot
+            impact_pct=0.0,         # Not used for spot
+        )
+
+        cost_estimate = cost_model.estimate_cost(
+            side=signal.action,
+            notional_usd=signal.amount,
+            price=current_price,
+        )
+
+        logger.debug(
+            f"Bot {bot.id}: Estimated execution cost - "
+            f"${cost_estimate.total_cost:.4f} "
+            f"(fee=${cost_estimate.exchange_fee:.4f}, "
+            f"spread=${cost_estimate.spread_cost:.4f}, "
+            f"slip=${cost_estimate.slippage_cost:.4f})"
+        )
+
+        # === STEP 6: ORDER SIZE VALIDATION ===
+        # Ensure order size is still meaningful after adjustments
+        min_order_size = 10.0  # $10 minimum
+        if signal.amount < min_order_size:
+            logger.warning(
+                f"Bot {bot.id}: Trade REJECTED - order size ${signal.amount:.2f} < ${min_order_size:.2f} minimum"
+            )
+            return None
+
+        # === STEP 7: EXECUTION LAYER ROUTING ===
         execution_mode = signal.execution or "market"
 
         # Route to appropriate execution handler
@@ -3155,7 +3710,6 @@ class TradingEngine:
             logger.info(f"Bot {bot.id}: Executing {signal.action} using VWAP")
             return await self._execute_vwap(bot, exchange, signal, current_price, session)
         elif execution_mode in ["market", "limit"]:
-            # Standard market/limit execution (existing logic)
             pass
         else:
             logger.warning(
@@ -3164,7 +3718,7 @@ class TradingEngine:
             )
             execution_mode = "market"
 
-        # === STANDARD MARKET/LIMIT EXECUTION ===
+        # === STEP 8: EXECUTE TRADE ===
         # Calculate amount in base currency
         amount_base = signal.amount / current_price
 
@@ -3196,7 +3750,7 @@ class TradingEngine:
         }
         order_type = order_type_map.get((signal.action, signal.order_type), OrderType.MARKET_BUY)
 
-        # Create order record
+        # Create order record WITH EXECUTION COST MODELING
         order = Order(
             bot_id=bot.id,
             exchange_order_id=exchange_order.id,
@@ -3208,22 +3762,80 @@ class TradingEngine:
             status=OrderStatus.FILLED if exchange_order.status == "closed" else OrderStatus.PENDING,
             strategy_used=bot.strategy,
             is_simulated=bot.is_dry_run,
+            reason=signal.reason,  # NEW: Track trade reason
+            # NEW: Attach modeled execution costs
+            modeled_exchange_fee=cost_estimate.exchange_fee,
+            modeled_spread_cost=cost_estimate.spread_cost,
+            modeled_slippage_cost=cost_estimate.slippage_cost,
+            modeled_total_cost=cost_estimate.total_cost,
         )
 
         if order.status == OrderStatus.FILLED:
             order.filled_at = datetime.utcnow()
 
         session.add(order)
+        await session.flush()  # Get order.id for trade recording
 
-        # Update wallet
-        wallet = VirtualWalletService(session)
+        # === ACCOUNTING-GRADE LEDGER INTEGRATION ===
+        # CRITICAL: This is the single source of truth for all financial transactions
+        # All balance changes, tax lots, and realized gains are recorded here
+
+        # Parse trading pair to get base and quote assets
+        base_asset, quote_asset = bot.trading_pair.split('/')
+
+        # Determine owner_id (TODO: Get from Bot model when owner_id field exists)
+        owner_id = str(bot.id)  # FIXME: Use bot.owner_id when available
+
+        # Record trade execution (creates Trade record + ledger entries)
+        trade_recorder = TradeRecorderService(session)
+        trade = await trade_recorder.record_trade(
+            order_id=order.id,
+            owner_id=owner_id,
+            bot_id=bot.id,
+            exchange=bot.exchange if hasattr(bot, 'exchange') else 'simulated',
+            trading_pair=bot.trading_pair,
+            side=TradeSide.BUY if signal.action == "buy" else TradeSide.SELL,
+            base_asset=base_asset,
+            quote_asset=quote_asset,
+            base_amount=exchange_order.amount,
+            quote_amount=signal.amount,
+            price=exchange_order.price,
+            fee_amount=exchange_order.fee,
+            fee_asset=quote_asset,
+            modeled_cost=cost_estimate.total_cost,
+            exchange_trade_id=exchange_order.id,
+            executed_at=datetime.utcnow(),
+            strategy_used=bot.strategy,
+        )
+
+        # Process tax lots (FIFO cost basis tracking)
+        tax_engine = FIFOTaxEngine(session)
         if signal.action == "buy":
-            # Buying uses quote currency
-            await wallet.record_trade_result(bot.id, -exchange_order.fee, 0)
+            # BUY creates a new tax lot
+            await tax_engine.process_buy(trade)
+            logger.info(
+                f"Bot {bot.id}: Created tax lot for {trade.base_amount:.8f} {base_asset} "
+                f"@ ${trade.get_cost_basis_per_unit():.2f}/unit"
+            )
         else:
-            # Selling - calculate P&L
-            # For simplicity, just record fees for now
-            await wallet.record_trade_result(bot.id, -exchange_order.fee, 0)
+            # SELL consumes tax lots in FIFO order and records realized gains
+            realized_gains = await tax_engine.process_sell(trade)
+            if realized_gains:
+                total_gain = sum(g.gain_loss for g in realized_gains)
+                logger.info(
+                    f"Bot {bot.id}: Realized gain/loss ${total_gain:+.2f} "
+                    f"from {len(realized_gains)} tax lot(s)"
+                )
+
+        # Update wallet (LEGACY - kept for backward compatibility)
+        # NOTE: Ledger entries are already created by trade_recorder
+        wallet = VirtualWalletService(session)
+        total_cost = exchange_order.fee + cost_estimate.total_cost
+
+        if signal.action == "buy":
+            await wallet.record_trade_result(bot.id, -total_cost, 0)
+        else:
+            await wallet.record_trade_result(bot.id, -total_cost, 0)
 
         # Update running balance
         result = await session.execute(select(Bot).where(Bot.id == bot.id))
@@ -3231,7 +3843,7 @@ class TradingEngine:
         if updated_bot:
             order.running_balance_after = updated_bot.current_balance
 
-        # Update/create position
+        # Update/create position (derived state cache)
         if signal.action == "buy":
             await self._open_or_add_position(
                 bot.id, bot.trading_pair, exchange_order.amount,
@@ -3243,11 +3855,21 @@ class TradingEngine:
                 exchange_order.price, session, wallet
             )
 
+        # Commit all changes (order, trade, ledger entries, tax lots, gains)
         await session.commit()
+
+        # Export to CSV (async, best-effort - failures don't block trading)
+        try:
+            csv_exporter = CSVExportService(session)
+            log_path = Path(f"backend/logs/{bot.id}/trades.csv")
+            await csv_exporter.export_trades_csv(bot.id, log_path)
+        except Exception as e:
+            logger.warning(f"Bot {bot.id}: Failed to export trades CSV: {e}")
 
         logger.info(
             f"Bot {bot.id}: Executed {signal.action} order - "
-            f"{exchange_order.amount:.6f} @ ${exchange_order.price:.2f}"
+            f"{exchange_order.amount:.6f} @ ${exchange_order.price:.2f} "
+            f"(costs: ${cost_estimate.total_cost:.4f})"
         )
 
         # Log trade to per-bot file

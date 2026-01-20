@@ -12,7 +12,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from .models import init_db
 from .routers import bots, health, stats, reports, config as config_router, alerts
 from .routers import websocket as ws_router
-from .routers import data_sources
+from .routers import data_sources, portfolio, ledger
 from .services.websocket import ws_manager
 from .services.config import config_service, ConfigValidationException
 from .services import trading_engine
@@ -94,6 +94,8 @@ app.include_router(config_router.router, prefix="/api/config", tags=["Config"])
 app.include_router(alerts.router, prefix="/api/alerts", tags=["Alerts"])
 app.include_router(ws_router.router, prefix="/api", tags=["WebSocket"])
 app.include_router(data_sources.router, prefix="/api/data-sources", tags=["Data Sources"])
+app.include_router(portfolio.router, prefix="/api", tags=["Portfolio"])
+app.include_router(ledger.router, prefix="/api", tags=["Ledger"])
 
 
 @app.get("/")

@@ -512,7 +512,10 @@ class RiskManagementService:
         bot_id: int,
         start_time: datetime,
     ) -> float:
-        """Calculate total loss for a period.
+        """Calculate total loss for a period WITH EXECUTION COSTS.
+
+        IMPORTANT: This now includes modeled execution costs in loss calculation.
+        This provides more accurate risk assessment by including all trading costs.
 
         Args:
             bot_id: The bot ID
@@ -521,7 +524,7 @@ class RiskManagementService:
         Returns:
             Total loss amount (positive number)
         """
-        # Get filled sell orders to calculate realized losses
+        # Get filled orders to calculate realized losses
         query = select(Order).where(
             and_(
                 Order.bot_id == bot_id,
@@ -532,15 +535,15 @@ class RiskManagementService:
         result = await self.session.execute(query)
         orders = result.scalars().all()
 
-        # Calculate total P&L from orders
-        # Note: This is simplified - real implementation would match buy/sell pairs
+        # Calculate total P&L from orders (cost-aware)
         total_loss = 0.0
         for order in orders:
-            if order.running_balance_after is not None:
-                # Use running balance to track losses
-                pass
-            # For now, sum up fees as minimum loss
+            # Include exchange fees
             total_loss += order.fees
+
+            # NEW: Include modeled execution costs
+            if order.modeled_total_cost is not None:
+                total_loss += order.modeled_total_cost
 
         return total_loss
 

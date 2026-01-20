@@ -8,6 +8,10 @@ from .alert import Alert
 from .strategy_rotation import StrategyRotation
 from .market_data import MarketDataCache
 from .pnl_snapshot import PnLSnapshot
+from .portfolio_risk import PortfolioRisk
+from .wallet_ledger import WalletLedger, LedgerReason
+from .trade import Trade, TradeSide
+from .tax_lot import TaxLot, RealizedGain
 
 __all__ = [
     "Base",
@@ -26,4 +30,11 @@ __all__ = [
     "StrategyRotation",
     "MarketDataCache",
     "PnLSnapshot",
+    "PortfolioRisk",
+    "WalletLedger",
+    "LedgerReason",
+    "Trade",
+    "TradeSide",
+    "TaxLot",
+    "RealizedGain",
 ]

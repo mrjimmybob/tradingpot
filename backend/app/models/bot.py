@@ -65,6 +65,8 @@ class Bot(Base):
     strategy_rotations = relationship("StrategyRotation", back_populates="bot", cascade="all, delete-orphan")
     alerts = relationship("Alert", back_populates="bot", cascade="all, delete-orphan")
     pnl_snapshots = relationship("PnLSnapshot", back_populates="bot", cascade="all, delete-orphan")
+    ledger_entries = relationship("WalletLedger", back_populates="bot", cascade="all, delete-orphan")
+    trades = relationship("Trade", back_populates="bot", cascade="all, delete-orphan")
 
     def __repr__(self):
         return f"<Bot(id={self.id}, name='{self.name}', status={self.status.value})>"
