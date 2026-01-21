@@ -2,13 +2,10 @@
 
 A comprehensive crypto trading bot system with multiple trading strategies, server-client architecture for managing multiple bot instances, web UI for monitoring and control, and full logging for tax compliance.
 
-## Warning
+> [!Warning]
+>This is a AI spec driven project for testing purposes only, it is neither complete nor secure. This has completely and 100% been writen by AI.
+>                    *** DO NOT USE WITH YOUR MONEY ***
 
-This is a AI spec driven project for testing purposes only. This has completely and 100% been writen by AI. DO NOT USE WITH YOUR MONEY.
-
-Let me put this clearer.
-                                                 DO NOT USE WITH YOUR MONEY.
-                                                 
 ## Features
 
 - **10 Trading Strategies**: DCA Accumulator, Adaptive Grid, Mean Reversion, Breakdown Momentum, TWAP, VWAP, Scalping, Arbitrage, Event Filler, and Auto Mode
