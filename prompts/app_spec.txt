@@ -85,7 +85,6 @@
       - TWAP: Time-weighted average price execution over configurable period
       - VWAP: Volume-weighted average price targeting
       - Arbitrage: Cross-exchange or cross-pair price difference exploitation
-      - Scalping: High-frequency small profit captures
       - Auto Mode: Factor-based strategy selection (trend/volume/volatility)
         - Configurable factor precedence order
         - Ability to disable specific factors

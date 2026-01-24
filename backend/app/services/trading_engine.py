@@ -32,6 +32,7 @@ from .portfolio_risk import PortfolioRiskService
 from .strategy_capacity import StrategyCapacityService
 from .ledger_writer import LedgerWriterService
 from .accounting import TradeRecorderService, FIFOTaxEngine, CSVExportService
+from .ledger_invariants import LedgerInvariantService, ValidationError
 
 logger = logging.getLogger(__name__)
 
@@ -321,6 +322,22 @@ class TradingEngine:
 
                     # Take P&L snapshot periodically
                     await self._take_pnl_snapshot(bot_id, session)
+
+            except ValidationError as e:
+                # Accounting validation failure - MUST stop bot
+                logger.critical(
+                    f"Bot {bot_id}: Accounting validation failed. STOPPING BOT. Error: {e}",
+                    exc_info=True
+                )
+                async with async_session_maker() as session:
+                    result = await session.execute(select(Bot).where(Bot.id == bot_id))
+                    bot = result.scalar_one_or_none()
+                    if bot:
+                        bot.status = BotStatus.STOPPED
+                        await session.commit()
+                self._stop_flags[bot_id] = True
+                # TODO: Send alert to admins via email/alert system
+                break  # Exit loop immediately
 
             except Exception as e:
                 logger.error(f"Bot {bot_id}: Error in execution loop: {e}")
@@ -3827,6 +3844,21 @@ class TradingEngine:
                     f"from {len(realized_gains)} tax lot(s)"
                 )
 
+        # === ACCOUNTING INVARIANT VALIDATION ===
+        # CRITICAL: Validate all accounting invariants before updating cached state
+        # If validation fails, exception is raised and trading HALTS
+        invariant_validator = LedgerInvariantService(session)
+        try:
+            await invariant_validator.validate_trade(trade.id)
+        except ValidationError as e:
+            logger.critical(
+                f"Bot {bot.id}: ACCOUNTING VALIDATION FAILED for trade {trade.id}. "
+                f"Trading HALTED. Error: {e}"
+            )
+            # Rollback the transaction to prevent corrupt state
+            await session.rollback()
+            raise  # Re-raise to halt trading loop
+
         # Update wallet (LEGACY - kept for backward compatibility)
         # NOTE: Ledger entries are already created by trade_recorder
         wallet = VirtualWalletService(session)
@@ -3861,8 +3893,10 @@ class TradingEngine:
         # Export to CSV (async, best-effort - failures don't block trading)
         try:
             csv_exporter = CSVExportService(session)
-            log_path = Path(f"backend/logs/{bot.id}/trades.csv")
-            await csv_exporter.export_trades_csv(bot.id, log_path)
+            # Include is_simulated in filename to prevent mixing live/simulated data
+            suffix = "simulated" if bot.is_dry_run else "live"
+            log_path = Path(f"backend/logs/{bot.id}/trades_{suffix}.csv")
+            await csv_exporter.export_trades_csv(bot.id, log_path, bot.is_dry_run)
         except Exception as e:
             logger.warning(f"Bot {bot.id}: Failed to export trades CSV: {e}")
 

@@ -57,3 +57,68 @@ async def client(test_db):
         yield ac
 
     app.dependency_overrides.clear()
+
+
+@pytest.fixture
+async def sample_bot(test_db):
+    """Create a sample bot for testing."""
+    from app.models import Bot
+
+    bot = Bot(
+        name="Test Bot",
+        trading_pair="BTC/USDT",
+        strategy="test",
+        budget=1000.0,
+        current_balance=1000.0,
+        is_dry_run=True
+    )
+    test_db.add(bot)
+    await test_db.flush()
+    return bot
+
+
+@pytest.fixture
+async def sample_order(test_db, sample_bot):
+    """Create a sample order for testing."""
+    from app.models import Order, OrderType, OrderStatus
+
+    order = Order(
+        bot_id=sample_bot.id,
+        order_type=OrderType.MARKET_BUY,
+        trading_pair="BTC/USDT",
+        amount=0.01,
+        price=50000.0,
+        status=OrderStatus.FILLED,
+        strategy_used="test",
+        is_simulated=True
+    )
+    test_db.add(order)
+    await test_db.flush()
+    return order
+
+
+@pytest.fixture
+async def sample_trade(test_db, sample_bot, sample_order):
+    """Create a sample trade for testing."""
+    from app.services.accounting import TradeRecorderService
+    from app.models import TradeSide
+
+    trade_recorder = TradeRecorderService(test_db)
+    trade = await trade_recorder.record_trade(
+        order_id=sample_order.id,
+        owner_id="test_owner",
+        bot_id=sample_bot.id,
+        exchange="simulated",
+        trading_pair="BTC/USDT",
+        side=TradeSide.BUY,
+        base_asset="BTC",
+        quote_asset="USDT",
+        base_amount=0.01,
+        quote_amount=500.0,
+        price=50000.0,
+        fee_amount=0.5,
+        fee_asset="USDT",
+        modeled_cost=0.1,
+    )
+    await test_db.flush()
+    return trade

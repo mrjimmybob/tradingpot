@@ -307,6 +307,7 @@ class LedgerWriterService:
         owner_id: str,
         asset: str,
         bot_id: Optional[int] = None,
+        is_simulated: Optional[bool] = None,
     ) -> float:
         """Get current balance for an asset.
 
@@ -314,10 +315,14 @@ class LedgerWriterService:
             owner_id: Owner identifier
             asset: Asset symbol
             bot_id: Bot ID (optional)
+            is_simulated: Filter by simulated flag (optional)
 
         Returns:
             Current balance
         """
+        # Import here to avoid circular dependency
+        from ..models import Bot
+
         query = select(WalletLedger).where(
             and_(
                 WalletLedger.owner_id == owner_id,
@@ -327,6 +332,13 @@ class LedgerWriterService:
 
         if bot_id is not None:
             query = query.where(WalletLedger.bot_id == bot_id)
+
+        # Filter by is_simulated if specified
+        if is_simulated is not None:
+            # Join with Bot to filter by is_dry_run
+            query = query.join(Bot, WalletLedger.bot_id == Bot.id).where(
+                Bot.is_dry_run == is_simulated
+            )
 
         query = query.order_by(WalletLedger.id.desc()).limit(1)
 

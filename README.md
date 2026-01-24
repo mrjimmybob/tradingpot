@@ -8,7 +8,7 @@ A comprehensive crypto trading bot system with multiple trading strategies, serv
 
 ## Features
 
-- **10 Trading Strategies**: DCA Accumulator, Adaptive Grid, Mean Reversion, Breakdown Momentum, TWAP, VWAP, Scalping, Arbitrage, Event Filler, and Auto Mode
+- **9 Trading Strategies**: DCA Accumulator, Adaptive Grid, Mean Reversion, Trend Following, Cross-Sectional Momentum, Volatility Breakout, TWAP, VWAP, and Auto Mode
 - **Multi-Bot Management**: Run multiple bots simultaneously with different strategies and trading pairs
 - **Risk Management**: Virtual wallets, stop losses, drawdown limits, consecutive loss detection, and kill switches
 - **Real-time Monitoring**: WebSocket-based live updates for P&L, positions, and bot status
@@ -162,13 +162,12 @@ poll_frequency: 300  # 5 minutes
 | DCA Accumulator | Dollar-cost averaging with configurable intervals |
 | Adaptive Grid | Dynamic grid trading with auto-rebalancing |
 | Mean Reversion | Trade reversions to mean using Bollinger Bands |
-| Breakdown Momentum | Trend-following on breakouts with volume confirmation |
+| Trend Following | Conservative long-only momentum with EMA crossover and ATR-based stops |
+| Cross-Sectional Momentum | Relative strength strategy that ranks assets and holds top performers |
+| Volatility Breakout | Enters on price breakouts following low-volatility compression |
 | TWAP | Time-weighted average price execution |
 | VWAP | Volume-weighted average price targeting |
-| Scalping | High-frequency small profit captures |
-| Arbitrage | Cross-exchange price difference exploitation |
-| Event Filler | React to market events with rapid execution |
-| Auto Mode | Factor-based automatic strategy selection |
+| Auto Mode | Regime-based automatic strategy selection policy (detects market regimes and selects optimal strategy) |
 
 ## Safety Features
 

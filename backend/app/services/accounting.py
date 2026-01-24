@@ -338,15 +338,41 @@ class CSVExportService:
         self,
         bot_id: int,
         output_path: Path,
+        is_simulated: bool,
     ) -> None:
         """Export trades to CSV.
 
         Args:
             bot_id: Bot ID
             output_path: Output file path
+            is_simulated: Filter by simulated flag (required to prevent mixing data)
+
+        Raises:
+            ValueError: If bot.is_dry_run doesn't match is_simulated
         """
-        # Query trades
-        query = select(Trade).where(Trade.bot_id == bot_id).order_by(Trade.executed_at)
+        # Import here to avoid circular dependency
+        from ..models import Bot, Order
+
+        # Get bot to verify is_simulated matches
+        bot_query = select(Bot).where(Bot.id == bot_id)
+        bot_result = await self.session.execute(bot_query)
+        bot = bot_result.scalar_one_or_none()
+
+        if not bot:
+            raise ValueError(f"Bot {bot_id} not found")
+
+        if bot.is_dry_run != is_simulated:
+            raise ValueError(
+                f"Bot {bot_id} has is_dry_run={bot.is_dry_run}, "
+                f"but requested is_simulated={is_simulated}"
+            )
+
+        # Query trades with is_simulated filter via Order join
+        query = select(Trade).join(Order).where(
+            Trade.bot_id == bot_id
+        ).where(
+            Order.is_simulated == is_simulated
+        ).order_by(Trade.executed_at)
         result = await self.session.execute(query)
         trades = result.scalars().all()
 
