@@ -96,7 +96,7 @@ class RiskManagementService:
         if bot.stop_loss_percent and pnl_percent <= -bot.stop_loss_percent:
             return PositionRisk(
                 should_close=True,
-                reason=f"Stop loss triggered: {pnl_percent:.2f}% loss exceeds {bot.stop_loss_percent}% limit",
+                reason=f"Stop loss triggered (percent): {pnl_percent:.2f}% loss exceeds {bot.stop_loss_percent}% limit",
                 unrealized_pnl=unrealized_pnl,
                 pnl_percent=pnl_percent,
             )

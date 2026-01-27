@@ -446,7 +446,6 @@ async def test_dry_run_never_in_live_export(test_db):
 
     # Query trades with is_simulated filter
     from sqlalchemy import select
-    from app.models import Trade, Order
 
     # Query live trades only
     query = select(Trade).join(Order).where(

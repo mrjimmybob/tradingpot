@@ -36,6 +36,7 @@ class Order(Base):
     trading_pair = Column(String(50), nullable=False)
     amount = Column(Float, nullable=False)
     price = Column(Float, nullable=False)
+    limit_price = Column(Float, nullable=True)  # For limit orders
     fees = Column(Float, default=0.0)
 
     status = Column(SQLEnum(OrderStatus), default=OrderStatus.PENDING)

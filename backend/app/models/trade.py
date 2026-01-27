@@ -81,7 +81,7 @@ class Trade(Base):
     # Relationships
     order = relationship("Order", back_populates="trades")
     bot = relationship("Bot", back_populates="trades")
-    ledger_entries = relationship("WalletLedger", foreign_keys="WalletLedger.related_trade_id", viewonly=True)
+    ledger_entries = relationship("WalletLedger", back_populates="trade", foreign_keys="WalletLedger.related_trade_id")
 
     def __repr__(self):
         return (

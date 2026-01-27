@@ -71,7 +71,7 @@ class WalletLedger(Base):
 
     # Foreign keys for traceability
     related_order_id = Column(Integer, ForeignKey("orders.id"), nullable=True, index=True)
-    related_trade_id = Column(Integer, nullable=True, index=True)  # FK to trades table
+    related_trade_id = Column(Integer, ForeignKey("trades.id"), nullable=True, index=True)
 
     # Timestamp (append-only, immutable)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False, index=True)
@@ -79,6 +79,7 @@ class WalletLedger(Base):
     # Relationships
     bot = relationship("Bot", back_populates="ledger_entries")
     order = relationship("Order", back_populates="ledger_entries")
+    trade = relationship("Trade", back_populates="ledger_entries", foreign_keys=[related_trade_id])
 
     def __repr__(self):
         return (

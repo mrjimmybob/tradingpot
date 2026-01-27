@@ -179,11 +179,13 @@ class FIFOTaxEngine:
     async def process_buy(
         self,
         trade: Trade,
+        bot_id: Optional[int] = None,
     ) -> TaxLot:
         """Process a BUY trade - create a new tax lot.
 
         Args:
             trade: Buy trade
+            bot_id: Optional bot ID (for logging/tracking, not used in logic)
 
         Returns:
             Created tax lot
@@ -220,11 +222,13 @@ class FIFOTaxEngine:
     async def process_sell(
         self,
         trade: Trade,
+        bot_id: Optional[int] = None,
     ) -> List[RealizedGain]:
         """Process a SELL trade - consume tax lots in FIFO order.
 
         Args:
             trade: Sell trade
+            bot_id: Optional bot ID (for logging/tracking, not used in logic)
 
         Returns:
             List of realized gain records

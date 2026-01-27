@@ -17,7 +17,7 @@ Design principles:
 
 import logging
 from datetime import datetime, timedelta
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Tuple
 from dataclasses import dataclass
 from decimal import Decimal
 from sqlalchemy import select, func, and_, or_, case, desc
@@ -33,7 +33,10 @@ from ..models import (
     Position,
     TaxLot,
     Bot,
+    BotStatus,
     LedgerReason,
+    Alert,
+    StrategyRotation,
 )
 
 logger = logging.getLogger(__name__)
@@ -174,6 +177,112 @@ class CostBasisRecord:
     unrealized_gain: float
 
 
+@dataclass
+class TradeDetailRecord:
+    """Trade detail with full forensic trail."""
+    trade: Dict[str, Any]
+    order: Dict[str, Any]
+    ledger_entries: List[Dict[str, Any]]
+    tax_lots_consumed: List[Dict[str, Any]]
+    realized_gain_loss: Optional[float]
+    modeled_cost: float
+    realized_cost: float
+
+
+@dataclass
+class BalanceDrilldownEntry:
+    """Single ledger entry in balance drilldown."""
+    ledger_entry_id: int
+    timestamp: datetime
+    delta_amount: float
+    balance_after: float
+    reason: str
+    source_classification: str
+    related_trade_id: Optional[int]
+    related_order_id: Optional[int]
+
+
+@dataclass
+class BalanceDrilldownRecord:
+    """Balance drilldown report."""
+    current_balance: float
+    ledger_entries: List[BalanceDrilldownEntry]
+    cumulative_total: float
+
+
+@dataclass
+class BotRiskInfo:
+    """Risk information for a single bot."""
+    bot_id: int
+    bot_name: str
+    drawdown_pct: float
+    daily_loss_pct: float
+    strategy_capacity_pct: float
+    kill_switch_state: str
+    last_risk_event: Optional[Dict[str, Any]]
+
+
+@dataclass
+class RiskStatusRecord:
+    """Risk status report."""
+    bots: List[BotRiskInfo]
+    portfolio: Dict[str, Any]
+
+
+@dataclass
+class EquityEvent:
+    """Equity curve event overlay."""
+    timestamp: datetime
+    event_type: str
+    description: str
+    bot_id: Optional[int]
+
+
+@dataclass
+class EquityCurveRecord:
+    """Equity curve with events."""
+    timestamp: datetime
+    equity: float
+
+
+@dataclass
+class BlockedStrategyInfo:
+    """Information about a blocked strategy."""
+    strategy_name: str
+    blocked_reason: str
+
+
+@dataclass
+class StrategyReasonRecord:
+    """Strategy reasoning report."""
+    current_strategy: str
+    current_regime: Optional[str]
+    eligible_strategies: List[str]
+    blocked_strategies: List[BlockedStrategyInfo]
+
+
+@dataclass
+class TaxSummaryRecord:
+    """Tax summary report."""
+    total_realized_gain: float
+    short_term_gain: float
+    long_term_gain: float
+    lot_count: int
+    trade_count: int
+
+
+@dataclass
+class AuditLogRecord:
+    """Audit log entry."""
+    id: int
+    timestamp: datetime
+    severity: str
+    source: str
+    bot_id: Optional[int]
+    message: str
+    details: Optional[Dict[str, Any]]
+
+
 # ============================================================================
 # Reporting Service
 # ============================================================================
@@ -266,7 +375,7 @@ class ReportingService:
                 bot_id=trade.bot_id,
                 strategy=trade.strategy_used or '',
                 symbol=trade.trading_pair,
-                side=trade.side.value,
+                side=trade.side.value.upper(),
                 price=trade.price,
                 quantity=trade.base_amount,
                 total_cost=trade.get_total_cost(),
@@ -333,7 +442,7 @@ class ReportingService:
                 strategy=order.strategy_used,
                 symbol=order.trading_pair,
                 type=order.order_type.value,
-                status=order.status.value,
+                status=order.status.value.upper(),
                 amount=order.amount,
                 price=order.price,
                 reason=order.reason,
@@ -693,7 +802,7 @@ class ReportingService:
             List of strategy performance records
         """
         # Query all trades for strategies
-        query = select(Trade).join(Order).where(
+        query = select(Trade, Order).join(Order).where(
             Order.is_simulated == is_simulated
         )
 
@@ -707,13 +816,13 @@ class ReportingService:
             query = query.where(Trade.executed_at <= end_date)
 
         result = await self.session.execute(query)
-        trades = result.scalars().all()
+        rows = result.all()
 
         # Group by strategy
         strategy_stats: Dict[str, Dict[str, Any]] = {}
 
-        for trade in trades:
-            strat = trade.strategy_used or 'unknown'
+        for trade, order in rows:
+            strat = trade.strategy_used or order.strategy_used or 'unknown'
 
             if strat not in strategy_stats:
                 strategy_stats[strat] = {
@@ -1031,5 +1140,666 @@ class ReportingService:
                 'holding_period_days': gain.holding_period_days,
                 'is_long_term': gain.is_long_term,
             })
+
+        return records
+
+    # ========================================================================
+    # MONEY FORENSICS REPORTS
+    # ========================================================================
+
+    async def get_trade_detail(
+        self,
+        trade_id: int,
+        is_simulated: bool,
+    ) -> Optional[TradeDetailRecord]:
+        """Get full forensic detail for a trade.
+
+        Source: trades + orders + wallet_ledger + tax_lots + realized_gains
+
+        Args:
+            trade_id: Trade ID (required)
+            is_simulated: Filter by simulated flag (required)
+
+        Returns:
+            Trade detail record or None if not found
+        """
+        # Get trade with order
+        query = select(Trade, Order).join(Order).where(
+            and_(
+                Trade.id == trade_id,
+                Order.is_simulated == is_simulated
+            )
+        )
+        result = await self.session.execute(query)
+        row = result.one_or_none()
+
+        if not row:
+            return None
+
+        trade, order = row
+
+        # Get ledger entries for this trade
+        ledger_query = select(WalletLedger).where(
+            WalletLedger.related_trade_id == trade_id
+        ).order_by(WalletLedger.created_at)
+        ledger_result = await self.session.execute(ledger_query)
+        ledger_entries = ledger_result.scalars().all()
+
+        # Get tax lots consumed (for SELL trades)
+        tax_lots_consumed = []
+        realized_gain_loss = None
+        if trade.side == TradeSide.SELL:
+            # Get realized gains linked to this sell trade
+            gains_query = select(RealizedGain).where(
+                RealizedGain.sell_trade_id == trade_id
+            )
+            gains_result = await self.session.execute(gains_query)
+            gains = gains_result.scalars().all()
+
+            realized_gain_loss = sum(g.gain_loss for g in gains)
+
+            # Get tax lot details
+            for gain in gains:
+                if gain.tax_lot_id:
+                    lot_query = select(TaxLot).where(TaxLot.id == gain.tax_lot_id)
+                    lot_result = await self.session.execute(lot_query)
+                    lot = lot_result.scalar_one_or_none()
+                    if lot:
+                        tax_lots_consumed.append({
+                            'tax_lot_id': lot.id,
+                            'quantity_consumed': gain.quantity,
+                            'unit_cost': lot.unit_cost,
+                            'purchase_date': lot.purchase_date.isoformat(),
+                        })
+
+        return TradeDetailRecord(
+            trade=trade.to_dict(),
+            order={
+                'order_id': order.id,
+                'order_type': order.order_type.value,
+                'status': order.status.value,
+                'amount': order.amount,
+                'price': order.price,
+                'created_at': order.created_at.isoformat(),
+                'filled_at': order.filled_at.isoformat() if order.filled_at else None,
+            },
+            ledger_entries=[
+                {
+                    'ledger_entry_id': entry.id,
+                    'asset': entry.asset,
+                    'delta_amount': entry.delta_amount,
+                    'balance_after': entry.balance_after,
+                    'reason': entry.reason.value,
+                    'timestamp': entry.created_at.isoformat(),
+                }
+                for entry in ledger_entries
+            ],
+            tax_lots_consumed=tax_lots_consumed,
+            realized_gain_loss=realized_gain_loss,
+            modeled_cost=trade.modeled_cost,
+            realized_cost=trade.get_total_cost(),
+        )
+
+    async def get_balance_drilldown(
+        self,
+        is_simulated: bool,
+        asset: str,
+        owner_id: Optional[str] = None,
+        limit: int = 20,
+    ) -> BalanceDrilldownRecord:
+        """Get balance drilldown with last N ledger entries.
+
+        Source: wallet_ledger
+
+        Args:
+            is_simulated: Filter by simulated flag (required)
+            asset: Asset symbol (required)
+            owner_id: Filter by owner ID (optional)
+            limit: Number of recent entries (default: 20)
+
+        Returns:
+            Balance drilldown record
+        """
+        # Get last N ledger entries for this asset
+        query = select(WalletLedger).join(
+            Bot, WalletLedger.bot_id == Bot.id
+        ).where(
+            and_(
+                WalletLedger.asset == asset,
+                Bot.is_dry_run == is_simulated
+            )
+        )
+
+        if owner_id is not None:
+            query = query.where(WalletLedger.owner_id == owner_id)
+
+        query = query.order_by(WalletLedger.created_at.desc()).limit(limit)
+
+        result = await self.session.execute(query)
+        entries = result.scalars().all()
+
+        # Get current balance (most recent entry)
+        current_balance = entries[0].balance_after if entries else 0.0
+
+        # Classify entries by source
+        def classify_source(reason_value: str) -> str:
+            """Classify ledger entry source."""
+            if reason_value in ['buy', 'sell']:
+                return 'trade'
+            elif reason_value == 'fee':
+                return 'fee'
+            elif reason_value in ['allocation', 'deallocation', 'transfer']:
+                return 'funding'
+            elif reason_value == 'correction':
+                return 'correction'
+            else:
+                return 'other'
+
+        # Build drilldown entries (reverse to show chronological order)
+        drilldown_entries = []
+        for entry in reversed(entries):
+            drilldown_entries.append(BalanceDrilldownEntry(
+                ledger_entry_id=entry.id,
+                timestamp=entry.created_at,
+                delta_amount=entry.delta_amount,
+                balance_after=entry.balance_after or 0.0,
+                reason=entry.reason.value,
+                source_classification=classify_source(entry.reason.value),
+                related_trade_id=entry.related_trade_id,
+                related_order_id=entry.related_order_id,
+            ))
+
+        # Calculate cumulative total
+        cumulative_total = current_balance
+
+        return BalanceDrilldownRecord(
+            current_balance=current_balance,
+            ledger_entries=drilldown_entries,
+            cumulative_total=cumulative_total,
+        )
+
+    # ========================================================================
+    # RISK STATUS REPORTS
+    # ========================================================================
+
+    async def get_risk_status(
+        self,
+        is_simulated: bool,
+        owner_id: Optional[str] = None,
+    ) -> RiskStatusRecord:
+        """Get risk status report for all bots.
+
+        Source: bots + wallet_ledger + alerts_log + positions
+
+        Args:
+            is_simulated: Filter by simulated flag (required)
+            owner_id: Filter by owner ID (optional)
+
+        Returns:
+            Risk status record
+        """
+        # Get all active bots
+        query = select(Bot).where(Bot.is_dry_run == is_simulated)
+
+        # Note: owner_id filtering would require adding owner_id to Bot model
+        # For now, we'll skip this filter
+
+        result = await self.session.execute(query)
+        bots = result.scalars().all()
+
+        bot_risk_info = []
+        total_exposure_usd = 0.0
+        total_portfolio_value = 0.0
+
+        for bot in bots:
+            # Calculate drawdown
+            drawdown_pct = 0.0
+            if bot.budget > 0:
+                drawdown_pct = ((bot.budget - bot.current_balance) / bot.budget) * 100
+
+            # Calculate daily loss
+            daily_loss_pct = 0.0
+            if bot.started_at:
+                one_day_ago = datetime.utcnow() - timedelta(days=1)
+                if bot.started_at >= one_day_ago:
+                    # Get balance from 24h ago
+                    balance_query = select(WalletLedger).where(
+                        and_(
+                            WalletLedger.bot_id == bot.id,
+                            WalletLedger.created_at >= one_day_ago
+                        )
+                    ).order_by(WalletLedger.created_at).limit(1)
+                    balance_result = await self.session.execute(balance_query)
+                    first_entry = balance_result.scalar_one_or_none()
+
+                    if first_entry and first_entry.balance_after:
+                        daily_loss_pct = ((first_entry.balance_after - bot.current_balance) / first_entry.balance_after) * 100
+
+            # Get strategy capacity (simplified)
+            strategy_capacity_pct = 0.0
+            # In a real implementation, this would call StrategyCapacityService
+
+            # Determine kill switch state
+            kill_switch_state = "active"
+            if bot.status == BotStatus.STOPPED:
+                kill_switch_state = "stopped"
+            elif bot.status == BotStatus.PAUSED:
+                kill_switch_state = "paused"
+
+            # Get last risk event (last alert)
+            alert_query = select(Alert).where(
+                Alert.bot_id == bot.id
+            ).order_by(Alert.created_at.desc()).limit(1)
+            alert_result = await self.session.execute(alert_query)
+            last_alert = alert_result.scalar_one_or_none()
+
+            last_risk_event = None
+            if last_alert:
+                last_risk_event = {
+                    'timestamp': last_alert.created_at.isoformat(),
+                    'type': last_alert.alert_type,
+                    'message': last_alert.message,
+                }
+
+            bot_risk_info.append(BotRiskInfo(
+                bot_id=bot.id,
+                bot_name=bot.name,
+                drawdown_pct=drawdown_pct,
+                daily_loss_pct=daily_loss_pct,
+                strategy_capacity_pct=strategy_capacity_pct,
+                kill_switch_state=kill_switch_state,
+                last_risk_event=last_risk_event,
+            ))
+
+            # Calculate exposure
+            positions_query = select(Position).where(Position.bot_id == bot.id)
+            positions_result = await self.session.execute(positions_query)
+            positions = positions_result.scalars().all()
+
+            for position in positions:
+                exposure_value = position.amount * position.current_price
+                total_exposure_usd += exposure_value
+
+            total_portfolio_value += bot.current_balance
+
+        # Calculate portfolio-level metrics
+        total_exposure_pct = (total_exposure_usd / total_portfolio_value * 100) if total_portfolio_value > 0 else 0.0
+
+        portfolio_info = {
+            'total_exposure_pct': total_exposure_pct,
+            'total_exposure_usd': total_exposure_usd,
+            'total_portfolio_value': total_portfolio_value,
+            'loss_caps_remaining': {
+                # Placeholder for loss cap tracking
+                'daily': None,
+                'weekly': None,
+            },
+        }
+
+        return RiskStatusRecord(
+            bots=bot_risk_info,
+            portfolio=portfolio_info,
+        )
+
+    # ========================================================================
+    # EQUITY CURVE REPORTS
+    # ========================================================================
+
+    async def get_equity_curve(
+        self,
+        is_simulated: bool,
+        owner_id: Optional[str] = None,
+        asset: str = 'USDT',
+    ) -> Tuple[List[EquityCurveRecord], List[EquityEvent]]:
+        """Get equity curve with event overlays.
+
+        Source: wallet_ledger + strategy_rotations + alerts_log
+
+        Args:
+            is_simulated: Filter by simulated flag (required)
+            owner_id: Filter by owner ID (optional)
+            asset: Quote asset for equity calculation (default: USDT)
+
+        Returns:
+            Tuple of (equity curve records, event records)
+        """
+        # Get balance history for equity curve
+        query = select(WalletLedger).join(Bot).where(
+            and_(
+                WalletLedger.asset == asset,
+                Bot.is_dry_run == is_simulated
+            )
+        ).order_by(WalletLedger.created_at)
+
+        result = await self.session.execute(query)
+        entries = result.scalars().all()
+
+        equity_curve = [
+            EquityCurveRecord(
+                timestamp=entry.created_at,
+                equity=entry.balance_after or 0.0,
+            )
+            for entry in entries
+        ]
+
+        # Get events
+        events = []
+
+        # Strategy rotations
+        rotations_query = select(StrategyRotation).join(Bot).where(
+            Bot.is_dry_run == is_simulated
+        ).order_by(StrategyRotation.created_at)
+        rotations_result = await self.session.execute(rotations_query)
+        rotations = rotations_result.scalars().all()
+
+        for rotation in rotations:
+            events.append(EquityEvent(
+                timestamp=rotation.created_at,
+                event_type='strategy_switch',
+                description=f"Strategy switched from {rotation.from_strategy} to {rotation.to_strategy}",
+                bot_id=rotation.bot_id,
+            ))
+
+        # Alerts (kill switch, large loss, etc.)
+        alerts_query = select(Alert).join(Bot).where(
+            Bot.is_dry_run == is_simulated
+        ).order_by(Alert.created_at)
+        alerts_result = await self.session.execute(alerts_query)
+        alerts = alerts_result.scalars().all()
+
+        for alert in alerts:
+            # Classify alert type
+            event_type = 'alert'
+            if 'stop' in alert.alert_type.lower() or 'kill' in alert.alert_type.lower():
+                event_type = 'kill_switch'
+            elif 'loss' in alert.alert_type.lower():
+                event_type = 'large_loss'
+            elif 'drawdown' in alert.alert_type.lower():
+                event_type = 'drawdown'
+
+            events.append(EquityEvent(
+                timestamp=alert.created_at,
+                event_type=event_type,
+                description=alert.message,
+                bot_id=alert.bot_id,
+            ))
+
+        return equity_curve, events
+
+    # ========================================================================
+    # STRATEGY INTROSPECTION REPORTS
+    # ========================================================================
+
+    async def get_strategy_reason(
+        self,
+        bot_id: int,
+        is_simulated: bool,
+    ) -> Optional[StrategyReasonRecord]:
+        """Get strategy reasoning for a bot.
+
+        Source: bots + strategy_rotations + (strategy eligibility logic)
+
+        Args:
+            bot_id: Bot ID (required)
+            is_simulated: Filter by simulated flag (required)
+
+        Returns:
+            Strategy reason record or None if not found
+        """
+        # Get bot
+        query = select(Bot).where(
+            and_(
+                Bot.id == bot_id,
+                Bot.is_dry_run == is_simulated
+            )
+        )
+        result = await self.session.execute(query)
+        bot = result.scalar_one_or_none()
+
+        if not bot:
+            return None
+
+        current_strategy = bot.strategy
+        current_regime = None  # Placeholder - would need regime detection logic
+
+        # Get all available strategies (hardcoded for now)
+        all_strategies = [
+            'mean_reversion',
+            'trend_following',
+            'cross_sectional_momentum',
+            'volatility_breakout',
+            'adaptive_grid',
+            'dca_accumulator',
+        ]
+
+        # Determine eligible and blocked strategies
+        eligible_strategies = []
+        blocked_strategies = []
+
+        # Check strategy rotation limit
+        rotation_count_query = select(func.count(StrategyRotation.id)).where(
+            StrategyRotation.bot_id == bot_id
+        )
+        rotation_count_result = await self.session.execute(rotation_count_query)
+        rotation_count = rotation_count_result.scalar() or 0
+
+        for strategy in all_strategies:
+            if strategy == current_strategy:
+                eligible_strategies.append(strategy)
+                continue
+
+            # Check cooldown (last rotation within 1 hour)
+            recent_rotation_query = select(StrategyRotation).where(
+                and_(
+                    StrategyRotation.bot_id == bot_id,
+                    StrategyRotation.to_strategy == strategy,
+                    StrategyRotation.created_at >= datetime.utcnow() - timedelta(hours=1)
+                )
+            )
+            recent_rotation_result = await self.session.execute(recent_rotation_query)
+            recent_rotation = recent_rotation_result.scalar_one_or_none()
+
+            if recent_rotation:
+                blocked_strategies.append(BlockedStrategyInfo(
+                    strategy_name=strategy,
+                    blocked_reason='cooldown (1 hour since last rotation)',
+                ))
+                continue
+
+            # Check capacity
+            if bot.max_strategy_rotations and rotation_count >= bot.max_strategy_rotations:
+                blocked_strategies.append(BlockedStrategyInfo(
+                    strategy_name=strategy,
+                    blocked_reason=f'capacity (max {bot.max_strategy_rotations} rotations reached)',
+                ))
+                continue
+
+            # Check risk (simplified)
+            if bot.status == BotStatus.PAUSED or bot.status == BotStatus.STOPPED:
+                blocked_strategies.append(BlockedStrategyInfo(
+                    strategy_name=strategy,
+                    blocked_reason=f'risk (bot status: {bot.status.value})',
+                ))
+                continue
+
+            eligible_strategies.append(strategy)
+
+        return StrategyReasonRecord(
+            current_strategy=current_strategy,
+            current_regime=current_regime,
+            eligible_strategies=eligible_strategies,
+            blocked_strategies=blocked_strategies,
+        )
+
+    # ========================================================================
+    # TAX SUMMARY REPORTS
+    # ========================================================================
+
+    async def get_tax_summary(
+        self,
+        year: int,
+        is_simulated: bool,
+        owner_id: Optional[str] = None,
+    ) -> TaxSummaryRecord:
+        """Get tax summary for a fiscal year.
+
+        Source: realized_gains
+
+        Args:
+            year: Fiscal year (required)
+            is_simulated: Filter by simulated flag (required)
+            owner_id: Filter by owner ID (optional)
+
+        Returns:
+            Tax summary record
+        """
+        start_date = datetime(year, 1, 1)
+        end_date = datetime(year, 12, 31, 23, 59, 59)
+
+        # Get all realized gains for the year
+        query = select(RealizedGain).join(
+            Trade, RealizedGain.sell_trade_id == Trade.id
+        ).join(
+            Order, Trade.order_id == Order.id
+        ).where(
+            and_(
+                RealizedGain.sell_date >= start_date,
+                RealizedGain.sell_date <= end_date,
+                Order.is_simulated == is_simulated
+            )
+        )
+
+        if owner_id is not None:
+            query = query.where(RealizedGain.owner_id == owner_id)
+
+        result = await self.session.execute(query)
+        gains = result.scalars().all()
+
+        # Calculate summary
+        total_realized_gain = 0.0
+        short_term_gain = 0.0
+        long_term_gain = 0.0
+        lot_count = len(gains)
+
+        # Count unique trades
+        trade_ids = set()
+        for gain in gains:
+            total_realized_gain += gain.gain_loss
+            if gain.is_long_term:
+                long_term_gain += gain.gain_loss
+            else:
+                short_term_gain += gain.gain_loss
+            trade_ids.add(gain.sell_trade_id)
+
+        trade_count = len(trade_ids)
+
+        return TaxSummaryRecord(
+            total_realized_gain=total_realized_gain,
+            short_term_gain=short_term_gain,
+            long_term_gain=long_term_gain,
+            lot_count=lot_count,
+            trade_count=trade_count,
+        )
+
+    # ========================================================================
+    # AUDIT & COMPLIANCE REPORTS
+    # ========================================================================
+
+    async def get_audit_log(
+        self,
+        is_simulated: bool,
+        bot_id: Optional[int] = None,
+        severity: Optional[str] = None,
+        start_date: Optional[datetime] = None,
+        end_date: Optional[datetime] = None,
+    ) -> List[AuditLogRecord]:
+        """Get audit log combining alerts and strategy rotations.
+
+        Source: alerts_log + strategy_rotations + (ledger_invariant failures)
+
+        Args:
+            is_simulated: Filter by simulated flag (required)
+            bot_id: Filter by bot ID (optional)
+            severity: Filter by severity (optional)
+            start_date: Filter by start date (optional)
+            end_date: Filter by end date (optional)
+
+        Returns:
+            List of audit log records
+        """
+        records = []
+
+        # Get alerts
+        alerts_query = select(Alert).join(Bot).where(
+            Bot.is_dry_run == is_simulated
+        )
+
+        if bot_id is not None:
+            alerts_query = alerts_query.where(Alert.bot_id == bot_id)
+
+        if start_date is not None:
+            alerts_query = alerts_query.where(Alert.created_at >= start_date)
+
+        if end_date is not None:
+            alerts_query = alerts_query.where(Alert.created_at <= end_date)
+
+        alerts_query = alerts_query.order_by(Alert.created_at.desc())
+
+        alerts_result = await self.session.execute(alerts_query)
+        alerts = alerts_result.scalars().all()
+
+        for alert in alerts:
+            # Map alert_type to severity
+            alert_severity = 'info'
+            if 'error' in alert.alert_type.lower() or 'stop' in alert.alert_type.lower():
+                alert_severity = 'error'
+            elif 'warning' in alert.alert_type.lower() or 'loss' in alert.alert_type.lower():
+                alert_severity = 'warning'
+
+            if severity is None or alert_severity == severity:
+                records.append(AuditLogRecord(
+                    id=alert.id,
+                    timestamp=alert.created_at,
+                    severity=alert_severity,
+                    source='alerts_log',
+                    bot_id=alert.bot_id,
+                    message=alert.message,
+                    details={'alert_type': alert.alert_type, 'email_sent': alert.email_sent},
+                ))
+
+        # Get strategy rotations
+        rotations_query = select(StrategyRotation).join(Bot).where(
+            Bot.is_dry_run == is_simulated
+        )
+
+        if bot_id is not None:
+            rotations_query = rotations_query.where(StrategyRotation.bot_id == bot_id)
+
+        if start_date is not None:
+            rotations_query = rotations_query.where(StrategyRotation.created_at >= start_date)
+
+        if end_date is not None:
+            rotations_query = rotations_query.where(StrategyRotation.created_at <= end_date)
+
+        rotations_query = rotations_query.order_by(StrategyRotation.created_at.desc())
+
+        rotations_result = await self.session.execute(rotations_query)
+        rotations = rotations_result.scalars().all()
+
+        for rotation in rotations:
+            rotation_severity = 'info'
+            if severity is None or rotation_severity == severity:
+                records.append(AuditLogRecord(
+                    id=rotation.id,
+                    timestamp=rotation.created_at,
+                    severity=rotation_severity,
+                    source='strategy_rotations',
+                    bot_id=rotation.bot_id,
+                    message=f"Strategy rotated from {rotation.from_strategy} to {rotation.to_strategy}",
+                    details={'from_strategy': rotation.from_strategy, 'to_strategy': rotation.to_strategy, 'reason': rotation.reason},
+                ))
+
+        # Sort by timestamp descending
+        records.sort(key=lambda r: r.timestamp, reverse=True)
 
         return records

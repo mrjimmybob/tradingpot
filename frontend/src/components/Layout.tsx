@@ -9,6 +9,8 @@ import {
   Power,
   Menu,
   X,
+  FileText,
+  Shield,
 } from 'lucide-react'
 import { useToast } from './Toast'
 import { ConnectionStatus } from './ConnectionStatus'
@@ -36,6 +38,8 @@ const navigation = [
   { name: 'Dashboard', href: '/', icon: LayoutDashboard },
   { name: 'Bots', href: '/bots', icon: Bot },
   { name: 'Reports', href: '/reports', icon: FileBarChart },
+  { name: 'Tax', href: '/tax', icon: FileText },
+  { name: 'Audit', href: '/audit', icon: Shield },
   { name: 'Settings', href: '/settings', icon: Settings },
 ]
 

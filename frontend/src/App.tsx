@@ -5,6 +5,8 @@ import BotList from './pages/BotList'
 import BotDetail from './pages/BotDetail'
 import CreateBot from './pages/CreateBot'
 import Reports from './pages/Reports'
+import TaxReporting from './pages/TaxReporting'
+import AuditCompliance from './pages/AuditCompliance'
 import Settings from './pages/Settings'
 import NotFound from './pages/NotFound'
 
@@ -17,6 +19,8 @@ function App() {
         <Route path="bots/new" element={<CreateBot />} />
         <Route path="bots/:id" element={<BotDetail />} />
         <Route path="reports" element={<Reports />} />
+        <Route path="tax" element={<TaxReporting />} />
+        <Route path="audit" element={<AuditCompliance />} />
         <Route path="settings" element={<Settings />} />
         <Route path="*" element={<NotFound />} />
       </Route>
