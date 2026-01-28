@@ -1566,7 +1566,6 @@ class ReportingService:
         all_strategies = [
             'mean_reversion',
             'trend_following',
-            'cross_sectional_momentum',
             'volatility_breakout',
             'adaptive_grid',
             'dca_accumulator',

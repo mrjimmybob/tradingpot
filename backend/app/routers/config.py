@@ -89,23 +89,7 @@ STRATEGIES = [
             "cooldown_seconds": {"type": "number", "default": 300, "min": 0, "max": 3600, "description": "Seconds to wait after exit before re-entry (anti-churn)"},
         }
     ),
-    StrategyInfo(
-        name="cross_sectional_momentum",
-        display_name="Cross-Sectional Momentum (Institutional Grade)",
-        description="Sample-based relative strength with rank hysteresis - ranks assets by momentum and holds top performers with stability buffer",
-        parameters={
-            "universe": {"type": "array", "default": ["BTC/USDT", "ETH/USDT", "SOL/USDT", "XRP/USDT", "ADA/USDT", "DOGE/USDT", "DOT/USDT", "LINK/USDT", "AVAX/USDT", "MATIC/USDT"], "description": "List of symbols to compare"},
-            "lookback_samples": {"type": "number", "default": 3600, "min": 100, "max": 86400, "description": "Samples for momentum (1 sample ≈ 1s, 3600 ≈ 1 hour)"},
-            "lookback_days": {"type": "number", "default": 60, "min": 7, "max": 180, "description": "[DEPRECATED] Use lookback_samples instead"},
-            "top_n": {"type": "number", "default": 3, "min": 1, "max": 10, "description": "Number of top assets to hold"},
-            "rank_buffer": {"type": "number", "default": 1, "min": 0, "max": 5, "description": "Hysteresis buffer: exit at top_n + buffer (prevents churn)"},
-            "rebalance_hours": {"type": "number", "default": 168, "min": 24, "max": 720, "description": "Hours between rebalances (168 = weekly)"},
-            "allocation_percent": {"type": "number", "default": 100, "min": 10, "max": 100, "description": "Percent of capital to allocate"},
-            "trend_filter_enabled": {"type": "boolean", "default": False, "description": "Enable global trend filter"},
-            "trend_filter_symbol": {"type": "string", "default": "BTC/USDT", "description": "Symbol for trend filter"},
-            "trend_filter_ema": {"type": "number", "default": 200, "min": 50, "max": 500, "description": "EMA period for trend filter"},
-        }
-    ),
+    # Note: cross_sectional_momentum strategy removed (stub implementation, requires multi-asset framework)
     StrategyInfo(
         name="volatility_breakout",
         display_name="Volatility Breakout (Institutional Grade)",

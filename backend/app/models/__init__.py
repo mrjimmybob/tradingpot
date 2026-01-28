@@ -6,6 +6,7 @@ from .order import Order, OrderType, OrderStatus
 from .position import Position, PositionSide
 from .alert import Alert
 from .strategy_rotation import StrategyRotation
+from .strategy_performance import StrategyPerformanceMetrics
 from .market_data import MarketDataCache
 from .pnl_snapshot import PnLSnapshot
 from .portfolio_risk import PortfolioRisk
@@ -28,6 +29,7 @@ __all__ = [
     "PositionSide",
     "Alert",
     "StrategyRotation",
+    "StrategyPerformanceMetrics",
     "MarketDataCache",
     "PnLSnapshot",
     "PortfolioRisk",

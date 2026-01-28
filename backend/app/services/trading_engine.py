@@ -395,7 +395,6 @@ class TradingEngine:
             "adaptive_grid": self._strategy_grid,
             "mean_reversion": self._strategy_mean_reversion,
             "trend_following": self._strategy_trend_following,
-            "cross_sectional_momentum": self._strategy_cross_sectional_momentum,
             "volatility_breakout": self._strategy_volatility_breakout,
                     "auto_mode": self._strategy_auto,
         }
@@ -1792,391 +1791,6 @@ class TradingEngine:
                 reason=f"Trend Following: Holding position, stop at ${state['trailing_stop']:.2f if state['trailing_stop'] else 'N/A'}"
             )
 
-    async def _strategy_cross_sectional_momentum(
-        self,
-        bot: Bot,
-        current_price: float,
-        params: dict,
-        session: AsyncSession,
-    ) -> Optional[TradeSignal]:
-        """Cross-Sectional Momentum (relative strength) strategy - Institutional Grade.
-
-        Ranks assets by relative performance and only holds positions in top performers.
-        Each bot tracks its own trading_pair and enters/exits based on whether
-        that pair is in the top N ranked assets.
-
-        IMPORTANT: This strategy operates on SAMPLE-based data (1 sample ≈ 1 loop ≈ 1 second).
-        Momentum is calculated as simple return over the last N samples, NOT calendar days.
-
-        Rebalance behavior:
-        - New bots: May enter immediately if ranked in top_n
-        - Existing bots: Exit only at rebalance time
-        - Rank hysteresis: Enter at top_n, exit at top_n + rank_buffer (prevents churn)
-
-        Parameters:
-            universe: List of symbols to compare (default: common pairs)
-            lookback_samples: Samples for momentum calculation (default: 3600 ≈ 1 hour @ 1s polling)
-            lookback_days: [DEPRECATED] Use lookback_samples instead
-            top_n: Number of top assets to hold (default: 3)
-            rank_buffer: Hysteresis buffer for exits (default: 1, exit at top_n + buffer)
-            rebalance_hours: Hours between rebalances (default: 168 = weekly)
-            allocation_percent: Percent of capital to allocate (default: 100)
-            trend_filter_enabled: Enable global trend filter (default: False)
-            trend_filter_symbol: Symbol for trend filter (default: BTC/USDT)
-            trend_filter_ema: EMA period for trend filter (default: 200)
-        """
-        # Get parameters with backward compatibility
-        universe = params.get("universe", [
-            "BTC/USDT", "ETH/USDT", "SOL/USDT", "XRP/USDT", "ADA/USDT",
-            "DOGE/USDT", "DOT/USDT", "LINK/USDT", "AVAX/USDT", "MATIC/USDT"
-        ])
-
-        # Handle deprecated lookback_days parameter
-        if "lookback_days" in params and "lookback_samples" not in params:
-            logger.warning(
-                f"Bot {bot.id}: Cross-Sectional parameter 'lookback_days' is DEPRECATED. "
-                f"Use 'lookback_samples' instead. Note: 1 sample ≈ 1 second, not 1 day!"
-            )
-            lookback_samples = params.get("lookback_days", 3600)
-        else:
-            lookback_samples = params.get("lookback_samples", 3600)  # 1 hour @ 1s polling
-
-        top_n = params.get("top_n", 3)
-        rank_buffer = params.get("rank_buffer", 1)  # Hysteresis: exit at top_n + buffer
-        rebalance_hours = params.get("rebalance_hours", 168)  # Weekly
-        allocation_percent = params.get("allocation_percent", 100) / 100
-        trend_filter_enabled = params.get("trend_filter_enabled", False)
-        trend_filter_symbol = params.get("trend_filter_symbol", "BTC/USDT")
-        trend_filter_ema = params.get("trend_filter_ema", 200)
-
-        # Universe consistency guard: warn if bot's trading_pair was auto-added
-        original_universe_size = len(universe)
-        if bot.trading_pair not in universe:
-            logger.warning(
-                f"Bot {bot.id}: Cross-Sectional auto-added {bot.trading_pair} to universe "
-                f"(not in configured universe). This may indicate misconfiguration."
-            )
-            universe.append(bot.trading_pair)
-
-        # Initialize state tracking for cross-sectional data
-        if not hasattr(self, "_cross_sectional_states"):
-            self._cross_sectional_states = {}
-
-        state = self._cross_sectional_states.get(bot.id, {
-            "price_data": {},  # {symbol: [{"price": float, "timestamp": str}]}
-            "last_rebalance": None,
-            "current_rank": None,
-            "last_top_n": [],
-            "first_rebalance_logged": False,  # Log universe composition once
-        })
-
-        # Get exchange service for fetching multiple ticker prices
-        exchange = self._exchange_services.get(bot.id)
-        if not exchange:
-            return TradeSignal(
-                action="hold",
-                amount=0,
-                reason="Cross-Sectional: Exchange not available"
-            )
-
-        # Fetch current prices for all symbols in universe
-        try:
-            current_prices = {}
-            for symbol in universe:
-                ticker = await exchange.get_ticker(symbol)
-                if ticker:
-                    current_prices[symbol] = ticker.last
-
-                    # Store price in history
-                    if symbol not in state["price_data"]:
-                        state["price_data"][symbol] = []
-
-                    state["price_data"][symbol].append({
-                        "price": ticker.last,
-                        "timestamp": datetime.utcnow().isoformat()
-                    })
-
-                    # Data retention: Keep 2× lookback_samples as buffer (minimum 100 samples)
-                    # This ensures sufficient history while preventing unbounded growth
-                    max_samples = max(lookback_samples * 2, 100)
-                    state["price_data"][symbol] = state["price_data"][symbol][-max_samples:]
-
-        except Exception as e:
-            logger.error(f"Bot {bot.id}: Cross-Sectional failed to fetch prices: {e}")
-            return TradeSignal(
-                action="hold",
-                amount=0,
-                reason=f"Cross-Sectional: Error fetching prices"
-            )
-
-        # Check if we have enough historical data for momentum calculation
-        # Require at least lookback_samples data points (minimum 30 for stability)
-        min_data_points = max(min(lookback_samples, 30), 2)
-        symbols_with_data = [
-            sym for sym, prices in state["price_data"].items()
-            if len(prices) >= min_data_points
-        ]
-
-        if len(symbols_with_data) < 2:
-            # Not enough data yet - need at least 2 symbols for ranking
-            self._cross_sectional_states[bot.id] = state
-            return TradeSignal(
-                action="hold",
-                amount=0,
-                reason=f"Cross-Sectional: Collecting data ({len(symbols_with_data)}/{len(universe)} symbols ready)"
-            )
-
-        # Check if it's time to rebalance
-        now = datetime.utcnow()
-        should_rebalance = False
-
-        if state["last_rebalance"] is None:
-            should_rebalance = True
-        else:
-            last_rebalance_time = datetime.fromisoformat(state["last_rebalance"])
-            hours_since = (now - last_rebalance_time).total_seconds() / 3600
-            if hours_since >= rebalance_hours:
-                should_rebalance = True
-
-        # Calculate momentum for all symbols with sufficient data
-        def calculate_momentum(prices: list, lookback: int) -> float:
-            """Calculate simple total return over lookback samples.
-
-            Momentum = (current_price - start_price) / start_price
-            where start_price is from N samples ago (1 sample ≈ 1 second).
-
-            Returns 0.0 for invalid/insufficient data.
-            """
-            if len(prices) < 2:
-                return 0.0
-
-            # Use min of lookback and available data
-            n = min(lookback, len(prices))
-            if n < 2:
-                return 0.0
-
-            # Simple return: (current - start) / start
-            start_price = prices[-n]["price"]
-            end_price = prices[-1]["price"]
-
-            if start_price <= 0:
-                return 0.0
-
-            momentum = (end_price - start_price) / start_price
-
-            # Defensive: clamp NaN/inf results to 0
-            if not isinstance(momentum, (int, float)) or momentum != momentum:  # NaN check
-                return 0.0
-            if momentum == float('inf') or momentum == float('-inf'):
-                return 0.0
-
-            return momentum
-
-        # Rank all symbols by momentum
-        momentum_scores = {}
-        for symbol in symbols_with_data:
-            prices = state["price_data"][symbol]
-            momentum = calculate_momentum(prices, lookback_samples)
-            momentum_scores[symbol] = momentum
-
-        # Sort by momentum (descending)
-        ranked_symbols = sorted(
-            momentum_scores.items(),
-            key=lambda x: x[1],
-            reverse=True
-        )
-
-        # Get top N symbols
-        top_n_symbols = [sym for sym, score in ranked_symbols[:top_n]]
-
-        # Find rank of bot's trading pair
-        bot_rank = None
-        bot_momentum = momentum_scores.get(bot.trading_pair, 0.0)
-        for idx, (sym, score) in enumerate(ranked_symbols):
-            if sym == bot.trading_pair:
-                bot_rank = idx + 1
-                break
-
-        # Log universe composition at first rebalance (observability)
-        if not state.get("first_rebalance_logged", False):
-            logger.info(
-                f"Bot {bot.id}: Cross-Sectional universe initialized - "
-                f"{len(universe)} symbols: {', '.join(universe[:5])}{'...' if len(universe) > 5 else ''}"
-            )
-            state["first_rebalance_logged"] = True
-
-        # Check trend filter if enabled
-        trend_filter_passed = True
-        if trend_filter_enabled:
-            filter_symbol_data = state["price_data"].get(trend_filter_symbol, [])
-            if len(filter_symbol_data) >= trend_filter_ema:
-                # Calculate EMA for trend filter
-                prices = [p["price"] for p in filter_symbol_data]
-
-                def calculate_ema(prices: list, period: int) -> float:
-                    """Calculate EMA."""
-                    if len(prices) < period:
-                        return sum(prices) / len(prices)
-
-                    k = 2 / (period + 1)
-                    ema = sum(prices[:period]) / period
-                    for price in prices[period:]:
-                        ema = (price * k) + (ema * (1 - k))
-                    return ema
-
-                ema = calculate_ema(prices, trend_filter_ema)
-                current_filter_price = filter_symbol_data[-1]["price"]
-                trend_filter_passed = current_filter_price > ema
-
-                if not trend_filter_passed:
-                    logger.info(
-                        f"Bot {bot.id}: Cross-Sectional trend filter FAILED - "
-                        f"{trend_filter_symbol} ${current_filter_price:.2f} < EMA ${ema:.2f}"
-                    )
-
-        # Get current positions
-        positions = await self._get_bot_positions(bot.id, session)
-        has_position = len(positions) > 0
-
-        # Rank-based decision logic with hysteresis (stability)
-        # Entry rule: rank ≤ top_n
-        # Exit rule: rank > (top_n + rank_buffer)
-        # This prevents churn when a symbol oscillates around the top_n threshold
-        is_in_top_n = bot.trading_pair in top_n_symbols
-        is_outside_buffer = bot_rank is not None and bot_rank > (top_n + rank_buffer)
-
-        # Update state
-        state["current_rank"] = bot_rank
-        state["last_top_n"] = top_n_symbols
-
-        if should_rebalance:
-            state["last_rebalance"] = now.isoformat()
-            # Log rebalance with ranked list for explainability
-            ranked_str = ", ".join([f"{sym}(#{i+1}:{score:.2%})" for i, (sym, score) in enumerate(ranked_symbols[:min(top_n + 2, len(ranked_symbols))])])
-            logger.info(
-                f"Bot {bot.id}: Cross-Sectional REBALANCE - "
-                f"Top {top_n}: {', '.join(top_n_symbols)} | "
-                f"Rankings: {ranked_str}"
-            )
-
-        self._cross_sectional_states[bot.id] = state
-
-        # Exit if trend filter fails (regardless of rank)
-        if trend_filter_enabled and not trend_filter_passed:
-            if has_position:
-                for pos in positions:
-                    sell_amount = pos.amount * current_price
-
-                    logger.info(
-                        f"Bot {bot.id}: Cross-Sectional EXIT (trend filter) - "
-                        f"Selling {bot.trading_pair}"
-                    )
-
-                    return TradeSignal(
-                        action="sell",
-                        amount=sell_amount,
-                        order_type="market",
-                        reason="Cross-Sectional: Exit due to trend filter failure",
-                    )
-
-            return TradeSignal(
-                action="hold",
-                amount=0,
-                reason=f"Cross-Sectional: Trend filter failed, staying out"
-            )
-
-        # REBALANCE LOGIC (institutional-grade with hysteresis)
-        #
-        # Entry behavior:
-        #   - New bots (no position): May enter IMMEDIATELY if rank ≤ top_n
-        #   - Existing bots: Only evaluated at rebalance time
-        #
-        # Exit behavior (with rank hysteresis for stability):
-        #   - Exit ONLY at rebalance time
-        #   - Exit when rank > (top_n + rank_buffer)
-        #   - Hold when rank ∈ [top_n + 1, top_n + rank_buffer] (buffer zone)
-        #
-        # This prevents churn from minor rank fluctuations near the threshold.
-
-        if should_rebalance or not has_position:
-            # ENTRY: pair is in top_n AND no position
-            if is_in_top_n and not has_position:
-                # Calculate position size
-                buy_amount = bot.current_balance * allocation_percent
-
-                if buy_amount < 1:
-                    return TradeSignal(
-                        action="hold",
-                        amount=0,
-                        reason="Cross-Sectional: Insufficient balance for entry"
-                    )
-
-                logger.info(
-                    f"Bot {bot.id}: Cross-Sectional ENTRY - "
-                    f"{bot.trading_pair} ranked #{bot_rank}/{len(ranked_symbols)} (top {top_n}), "
-                    f"momentum: {bot_momentum:.2%} over {lookback_samples} samples"
-                )
-
-                return TradeSignal(
-                    action="buy",
-                    amount=buy_amount,
-                    order_type="market",
-                    reason=f"Cross-Sectional: Entry at rank #{bot_rank} (momentum: {bot_momentum:.2%})",
-                )
-
-            # EXIT: pair fell OUTSIDE buffer zone (rank > top_n + rank_buffer) AND has position
-            elif is_outside_buffer and has_position:
-                for pos in positions:
-                    sell_amount = pos.amount * current_price
-
-                    logger.info(
-                        f"Bot {bot.id}: Cross-Sectional EXIT - "
-                        f"{bot.trading_pair} rank #{bot_rank} > threshold (top_n={top_n} + buffer={rank_buffer}={top_n + rank_buffer}), "
-                        f"momentum: {bot_momentum:.2%}"
-                    )
-
-                    return TradeSignal(
-                        action="sell",
-                        amount=sell_amount,
-                        order_type="market",
-                        reason=f"Cross-Sectional: Exit, rank #{bot_rank} outside buffer (threshold: {top_n + rank_buffer})",
-                    )
-
-        # HOLD LOGIC (policy-based reasons)
-        if has_position:
-            # Holding position - explain why not exiting
-            if is_in_top_n:
-                # Still in top_n - no reason to exit
-                reason = f"Cross-Sectional: Holding rank #{bot_rank} (in top {top_n})"
-            elif not is_outside_buffer:
-                # In buffer zone [top_n+1, top_n+rank_buffer] - hysteresis prevents exit
-                reason = f"Cross-Sectional: Holding rank #{bot_rank} (in buffer, threshold={top_n + rank_buffer})"
-            else:
-                # Outside buffer but not rebalance time - wait for rebalance
-                hours_remaining = rebalance_hours - ((now - datetime.fromisoformat(state['last_rebalance'])).total_seconds() / 3600)
-                reason = f"Cross-Sectional: Holding rank #{bot_rank}, rebalance in {hours_remaining:.1f}h"
-
-            return TradeSignal(
-                action="hold",
-                amount=0,
-                reason=reason
-            )
-        else:
-            # No position - explain why not entering
-            if is_in_top_n:
-                # In top_n but not rebalance time - wait
-                hours_remaining = rebalance_hours - ((now - datetime.fromisoformat(state['last_rebalance'])).total_seconds() / 3600)
-                reason = f"Cross-Sectional: Rank #{bot_rank} (in top {top_n}), waiting for rebalance in {hours_remaining:.1f}h"
-            else:
-                # Not in top_n - no entry
-                reason = f"Cross-Sectional: Rank #{bot_rank}/{len(ranked_symbols)}, not in top {top_n}"
-
-            return TradeSignal(
-                action="hold",
-                amount=0,
-                reason=reason
-            )
-
     async def _strategy_volatility_breakout(
         self,
         bot: Bot,
@@ -2731,6 +2345,13 @@ class TradingEngine:
             auto_state["current_regime"] = None
             auto_state["regime_change_count"] = 0
             auto_state["strategy_metrics"] = {}  # Per-strategy performance tracking
+
+            # Load existing strategy metrics from database
+            db_metrics = await self._load_strategy_metrics_from_db(bot.id, session)
+            if db_metrics:
+                auto_state["strategy_metrics"] = db_metrics
+                logger.info(f"Bot {bot.id}: Loaded {len(db_metrics)} strategy metrics from database")
+
             self._save_auto_state(bot.id, auto_state)
 
         # === BAR AGGREGATION (60-second bars) ===
@@ -2895,7 +2516,15 @@ class TradingEngine:
             )
 
             # Record failure
-            self._record_strategy_failure(auto_state, current_strategy, force_exit_reason, now, cooldown_hours_default)
+            await self._record_strategy_failure(
+                bot_id=bot.id,
+                auto_state=auto_state,
+                strategy_name=current_strategy,
+                reason=force_exit_reason,
+                now=now,
+                cooldown_hours=cooldown_hours_default,
+                session=session
+            )
 
         # === STRATEGY SELECTION WITH INERTIA ===
         best_strategy, best_priority, best_caps, best_metrics = scored_strategies[0]
@@ -3328,22 +2957,33 @@ class TradingEngine:
 
         auto_state["strategy_metrics"] = strategy_metrics
 
-    def _record_strategy_failure(
+        # Persist all updated metrics to database
+        await self._save_all_strategy_metrics_to_db(
+            bot_id=bot_id,
+            all_metrics=strategy_metrics,
+            session=session
+        )
+
+    async def _record_strategy_failure(
         self,
+        bot_id: int,
         auto_state: dict,
         strategy_name: str,
         reason: str,
         now: datetime,
-        cooldown_hours: float
+        cooldown_hours: float,
+        session: AsyncSession
     ) -> None:
         """Record strategy failure and apply cooldown.
 
         Args:
+            bot_id: Bot ID
             auto_state: Auto mode state
             strategy_name: Name of failed strategy
             reason: Failure reason
             now: Current datetime
             cooldown_hours: Hours to apply cooldown
+            session: Database session
         """
         strategy_metrics = auto_state.get("strategy_metrics", {})
 
@@ -3367,6 +3007,124 @@ class TradingEngine:
         )
 
         auto_state["strategy_metrics"] = strategy_metrics
+
+        # Persist to database
+        await self._save_strategy_metrics_to_db(
+            bot_id=bot_id,
+            strategy_name=strategy_name,
+            metrics=metrics,
+            session=session
+        )
+
+    async def _load_strategy_metrics_from_db(
+        self,
+        bot_id: int,
+        session: AsyncSession
+    ) -> dict:
+        """Load strategy performance metrics from database.
+
+        Args:
+            bot_id: Bot ID
+            session: Database session
+
+        Returns:
+            Dictionary of strategy metrics in the format:
+            {strategy_name: {recent_pnl_pct, max_drawdown_pct, failure_count, ...}}
+        """
+        from app.models.strategy_performance import StrategyPerformanceMetrics
+
+        query = select(StrategyPerformanceMetrics).where(
+            StrategyPerformanceMetrics.bot_id == bot_id
+        )
+        result = await session.execute(query)
+        rows = result.scalars().all()
+
+        metrics = {}
+        for row in rows:
+            metrics[row.strategy_name] = row.to_dict()
+
+        logger.debug(f"Loaded {len(metrics)} strategy metrics from DB for bot {bot_id}")
+        return metrics
+
+    async def _save_strategy_metrics_to_db(
+        self,
+        bot_id: int,
+        strategy_name: str,
+        metrics: dict,
+        session: AsyncSession
+    ) -> None:
+        """Save or update strategy performance metrics to database (UPSERT).
+
+        Args:
+            bot_id: Bot ID
+            strategy_name: Name of strategy
+            metrics: Metrics dictionary
+            session: Database session
+        """
+        from app.models.strategy_performance import StrategyPerformanceMetrics
+
+        # Check if record exists
+        query = select(StrategyPerformanceMetrics).where(
+            StrategyPerformanceMetrics.bot_id == bot_id,
+            StrategyPerformanceMetrics.strategy_name == strategy_name
+        )
+        result = await session.execute(query)
+        existing = result.scalar_one_or_none()
+
+        if existing:
+            # Update existing record
+            existing.recent_pnl_pct = metrics.get("recent_pnl_pct", 0.0)
+            existing.max_drawdown_pct = metrics.get("max_drawdown_pct", 0.0)
+            existing.failure_count = metrics.get("failure_count", 0)
+
+            # Handle datetime conversion
+            last_exit = metrics.get("last_exit_time")
+            if last_exit:
+                if isinstance(last_exit, str):
+                    existing.last_exit_time = datetime.fromisoformat(last_exit)
+                else:
+                    existing.last_exit_time = last_exit
+
+            cooldown = metrics.get("cooldown_until")
+            if cooldown:
+                if isinstance(cooldown, str):
+                    existing.cooldown_until = datetime.fromisoformat(cooldown)
+                else:
+                    existing.cooldown_until = cooldown
+
+            existing.last_updated = datetime.utcnow()
+        else:
+            # Create new record
+            new_metrics = StrategyPerformanceMetrics.from_dict(
+                bot_id=bot_id,
+                strategy_name=strategy_name,
+                data=metrics
+            )
+            session.add(new_metrics)
+
+        await session.commit()
+        logger.debug(f"Saved strategy metrics for bot {bot_id}, strategy {strategy_name}")
+
+    async def _save_all_strategy_metrics_to_db(
+        self,
+        bot_id: int,
+        all_metrics: dict,
+        session: AsyncSession
+    ) -> None:
+        """Save all strategy metrics for a bot to database.
+
+        Args:
+            bot_id: Bot ID
+            all_metrics: Dictionary of {strategy_name: metrics}
+            session: Database session
+        """
+        for strategy_name, metrics in all_metrics.items():
+            await self._save_strategy_metrics_to_db(
+                bot_id=bot_id,
+                strategy_name=strategy_name,
+                metrics=metrics,
+                session=session
+            )
 
     def _log_auto_mode_decision(
         self,
@@ -3444,12 +3202,6 @@ class TradingEngine:
                 "priority": 4,
                 "typical_holding_time": "long",
                 "description": "Best for sustained uptrends with clear momentum"
-            },
-            "cross_sectional_momentum": {
-                "allowed_regimes": ["trend_up"],
-                "priority": 5,
-                "typical_holding_time": "long",
-                "description": "Top performer selector in bull markets"
             },
             "volatility_breakout": {
                 "allowed_regimes": ["volatility_high", "volatility_expanding"],

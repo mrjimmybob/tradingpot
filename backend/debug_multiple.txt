@@ -1,0 +1,21 @@
+============================= test session starts =============================
+platform win32 -- Python 3.14.2, pytest-9.0.2, pluggy-1.6.0 -- C:\Python314\python.exe
+cachedir: .pytest_cache
+rootdir: d:\MyDocuments\Development\tradingbot\backend
+configfile: pytest.ini
+plugins: anyio-4.12.0, asyncio-1.3.0
+asyncio: mode=Mode.AUTO, debug=False, asyncio_default_fixture_loop_scope=None, asyncio_default_test_loop_scope=function
+collecting ... collected 1 item
+
+tests/test_kill_switch_disaster.py::test_multiple_risk_triggers_simultaneously DEBUG QUERY: select bots.id, bots.name, bots.trading_pair, bots.strategy, bots.strategy_params, bots.budget, bots.compound_enabled, bots.current_balance, bots.running_time_hours, bots.stop_loss_percent, bots.stop_loss_absolute, bots.drawdown_limit_percent, bots.drawdown_limit_absolute, bots.daily_loss_limit, bots.weekly_loss_limit, bots.max_strategy_rotations, bots.is_dry_run, bots.status, bots.total_pnl, bots.created_at, bots.updated_at, bots.started_at, bots.paused_at 
+from bots 
+where bots.id = :id_1
+DEBUG QUERY: select orders.id, orders.bot_id, orders.exchange_order_id, orders.order_type, orders.trading_pair, orders.amount, orders.price, orders.limit_price, orders.fees, orders.status, orders.strategy_used, orders.running_balance_after, orders.reason, orders.modeled_exchange_fee, orders.modeled_spread_cost, orders.modeled_slippage_cost, orders.modeled_total_cost, orders.realized_total_cost, orders.is_simulated, orders.created_at, orders.filled_at 
+from orders 
+where orders.bot_id = :bot_id_1 and orders.status = :status_1 and orders.created_at >= :created_at_1
+DEBUG QUERY: select bots.id, bots.name, bots.trading_pair, bots.strategy, bots.strategy_params, bots.budget, bots.compound_enabled, bots.current_balance, bots.running_time_hours, bots.stop_loss_percent, bots.stop_loss_absolute, bots.drawdown_limit_percent, bots.drawdown_limit_absolute, bots.daily_loss_limit, bots.weekly_loss_limit, bots.max_strategy_rotations, bots.is_dry_run, bots.status, bots.total_pnl, bots.created_at, bots.updated_at, bots.started_at, bots.paused_at 
+from bots 
+where bots.id = :id_1
+PASSED
+
+============================== 1 passed in 0.05s ==============================

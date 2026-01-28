@@ -117,25 +117,28 @@ async def verify_migration():
 async def main():
     """Run database migrations."""
     logger.info("=" * 70)
-    logger.info("DATABASE MIGRATION: Accounting-Grade Ledger")
+    logger.info("DATABASE MIGRATIONS: All Migrations")
     logger.info("=" * 70)
 
     try:
-        # Method 1: Apply SQL migration
-        migration_file = Path(__file__).parent / "001_add_accounting_tables.sql"
-        if migration_file.exists():
-            await apply_sql_migration(migration_file)
+        # Find all migration files
+        migrations_dir = Path(__file__).parent
+        migration_files = sorted(migrations_dir.glob("*.sql"))
+        
+        if migration_files:
+            for migration_file in migration_files:
+                await apply_sql_migration(migration_file)
         else:
-            logger.warning(f"SQL migration file not found: {migration_file}")
+            logger.warning("No SQL migration files found")
             logger.info("Using ORM-based table creation instead...")
             await create_tables_from_models()
 
-        # Verify migration
+        # Verify migration (check accounting tables)
         success = await verify_migration()
 
         if success:
             logger.info("=" * 70)
-            logger.info("MIGRATION COMPLETED SUCCESSFULLY")
+            logger.info("ALL MIGRATIONS COMPLETED SUCCESSFULLY")
             logger.info("=" * 70)
             logger.info("\nNext steps:")
             logger.info("1. Restart any running trading bots")

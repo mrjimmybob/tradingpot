@@ -1,0 +1,79 @@
+============================= test session starts =============================
+platform win32 -- Python 3.14.2, pytest-9.0.2, pluggy-1.6.0 -- C:\Python314\python.exe
+cachedir: .pytest_cache
+rootdir: d:\MyDocuments\Development\tradingbot\backend
+configfile: pytest.ini
+plugins: anyio-4.12.0, asyncio-1.3.0
+asyncio: mode=Mode.AUTO, debug=False, asyncio_default_fixture_loop_scope=None, asyncio_default_test_loop_scope=function
+collecting ... collected 12 items
+
+tests/test_kill_switch_disaster.py::test_cascading_losses_trigger_kill_switch FAILED [  8%]
+tests/test_kill_switch_disaster.py::test_kill_switch_state_persists PASSED [ 16%]
+tests/test_kill_switch_disaster.py::test_bot_status_transitions_on_kill_switch PASSED [ 25%]
+tests/test_kill_switch_disaster.py::test_no_negative_balances_after_kill_switch FAILED [ 33%]
+tests/test_kill_switch_disaster.py::test_kill_switch_blocks_all_bot_operations PASSED [ 41%]
+tests/test_kill_switch_disaster.py::test_ledger_consistency_during_disaster FAILED [ 50%]
+tests/test_kill_switch_disaster.py::test_multiple_risk_triggers_simultaneously PASSED [ 58%]
+tests/test_kill_switch_disaster.py::test_rejection_reason_contains_kill_switch PASSED [ 66%]
+tests/test_kill_switch_disaster.py::test_no_retry_loops_after_kill_switch PASSED [ 75%]
+tests/test_kill_switch_disaster.py::test_cross_bot_isolation_during_disaster FAILED [ 83%]
+tests/test_kill_switch_disaster.py::test_system_state_remains_consistent_after_kill_switch PASSED [ 91%]
+tests/test_kill_switch_disaster.py::test_deterministic_kill_switch_activation PASSED [100%]
+
+================================== FAILURES ===================================
+__________________ test_cascading_losses_trigger_kill_switch __________________
+tests\test_kill_switch_disaster.py:262: in test_cascading_losses_trigger_kill_switch
+    success, reason, order1 = await execute_trade(
+tests\test_kill_switch_disaster.py:191: in execute_trade
+    daily_check = await risk_service.check_daily_loss_limit(bot.id)
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+app\services\risk_management.py:207: in check_daily_loss_limit
+    daily_loss = await self._calculate_period_loss(bot_id, today_start)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+app\services\risk_management.py:540: in _calculate_period_loss
+    for order in orders:
+                 ^^^^^^
+E   TypeError: 'Mock' object is not iterable
+_________________ test_no_negative_balances_after_kill_switch _________________
+tests\test_kill_switch_disaster.py:477: in test_no_negative_balances_after_kill_switch
+    success, reason, order = await execute_trade(
+tests\test_kill_switch_disaster.py:191: in execute_trade
+    daily_check = await risk_service.check_daily_loss_limit(bot.id)
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+app\services\risk_management.py:207: in check_daily_loss_limit
+    daily_loss = await self._calculate_period_loss(bot_id, today_start)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+app\services\risk_management.py:540: in _calculate_period_loss
+    for order in orders:
+                 ^^^^^^
+E   TypeError: 'Mock' object is not iterable
+___________________ test_ledger_consistency_during_disaster ___________________
+tests\test_kill_switch_disaster.py:578: in test_ledger_consistency_during_disaster
+    success, reason, order = await execute_trade(
+tests\test_kill_switch_disaster.py:191: in execute_trade
+    daily_check = await risk_service.check_daily_loss_limit(bot.id)
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+app\services\risk_management.py:207: in check_daily_loss_limit
+    daily_loss = await self._calculate_period_loss(bot_id, today_start)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+app\services\risk_management.py:540: in _calculate_period_loss
+    for order in orders:
+                 ^^^^^^
+E   TypeError: 'Mock' object is not iterable
+__________________ test_cross_bot_isolation_during_disaster ___________________
+tests\test_kill_switch_disaster.py:824: in test_cross_bot_isolation_during_disaster
+    disaster_check = await risk_service.check_daily_loss_limit(disaster_bot.id)
+                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+app\services\risk_management.py:207: in check_daily_loss_limit
+    daily_loss = await self._calculate_period_loss(bot_id, today_start)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+app\services\risk_management.py:540: in _calculate_period_loss
+    for order in orders:
+                 ^^^^^^
+E   TypeError: 'Mock' object is not iterable
+=========================== short test summary info ===========================
+FAILED tests/test_kill_switch_disaster.py::test_cascading_losses_trigger_kill_switch - TypeError: 'Mock' object is not iterable
+FAILED tests/test_kill_switch_disaster.py::test_no_negative_balances_after_kill_switch - TypeError: 'Mock' object is not iterable
+FAILED tests/test_kill_switch_disaster.py::test_ledger_consistency_during_disaster - TypeError: 'Mock' object is not iterable
+FAILED tests/test_kill_switch_disaster.py::test_cross_bot_isolation_during_disaster - TypeError: 'Mock' object is not iterable
+========================= 4 failed, 8 passed in 0.35s =========================

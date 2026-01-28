@@ -55,10 +55,6 @@ STRATEGY_CAPACITY_CONFIG = {
         "max_portfolio_allocation_pct": None,
         "max_concurrent_bots": None,
     },
-    "cross_sectional_momentum": {
-        "max_portfolio_allocation_pct": None,
-        "max_concurrent_bots": None,
-    },
     "volatility_breakout": {
         "max_portfolio_allocation_pct": None,
         "max_concurrent_bots": None,
