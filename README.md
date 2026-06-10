@@ -44,8 +44,8 @@ A comprehensive crypto trading bot system with multiple trading strategies, serv
 ### 1. Clone and Setup
 
 ```bash
-git clone <repository-url>
-cd tradingbot
+git clone https://github.com/mrjimmybob/tradingpot
+cd tradingpot
 chmod +x init.sh
 ./init.sh
 ```
