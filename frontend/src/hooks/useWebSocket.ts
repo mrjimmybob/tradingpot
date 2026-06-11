@@ -9,6 +9,7 @@
  * - Global stats updates
  */
 import { useEffect, useRef, useCallback, useState } from 'react'
+import { buildWsUrl } from '../lib/api'
 
 export type MessageType =
   | 'price_update'
@@ -110,8 +111,8 @@ export function useWebSocket(options: UseWebSocketOptions = {}): UseWebSocketRet
 
   const wsRef = useRef<WebSocket | null>(null)
   const reconnectCountRef = useRef(0)
-  const reconnectTimeoutRef = useRef<NodeJS.Timeout | null>(null)
-  const pingIntervalRef = useRef<NodeJS.Timeout | null>(null)
+  const reconnectTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const pingIntervalRef = useRef<ReturnType<typeof setTimeout> | null>(null)
 
   const [isConnected, setIsConnected] = useState(false)
   const [isConnecting, setIsConnecting] = useState(false)
@@ -135,7 +136,7 @@ export function useWebSocket(options: UseWebSocketOptions = {}): UseWebSocketRet
     setIsConnecting(true)
 
     try {
-      const ws = new WebSocket(url)
+      const ws = new WebSocket(buildWsUrl(url))
       wsRef.current = ws
 
       ws.onopen = () => {

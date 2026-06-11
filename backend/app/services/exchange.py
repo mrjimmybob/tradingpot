@@ -2,6 +2,8 @@
 
 import asyncio
 import logging
+import os
+import time
 from datetime import datetime
 from typing import Optional, Dict, Any, List
 from dataclasses import dataclass
@@ -11,6 +13,18 @@ import ccxt.async_support as ccxt
 import yaml
 
 logger = logging.getLogger(__name__)
+
+
+def _clean_credential(value: Optional[str]) -> str:
+    """Normalize a credential value, treating placeholders as unset.
+
+    Placeholder values like "YOUR_MEXC_API_KEY" must never be sent to the
+    exchange as if they were real credentials.
+    """
+    value = (value or "").strip()
+    if value.upper().startswith("YOUR_"):
+        return ""
+    return value
 
 
 class OrderSide(str, Enum):
@@ -151,17 +165,35 @@ class ExchangeService:
         return await self.connect()
 
     def _load_config(self) -> Dict[str, Any]:
-        """Load exchange configuration from YAML file."""
+        """Load exchange configuration from YAML file.
+
+        Credentials are resolved as: environment variable
+        (<EXCHANGE_ID>_API_KEY / <EXCHANGE_ID>_API_SECRET) -> YAML value -> unset.
+        Placeholder values (starting with "YOUR_") are treated as unset.
+        """
+        config: Dict[str, Any] = {}
         try:
             with open(self.config_path, "r") as f:
-                config = yaml.safe_load(f)
-                return config.get(self.exchange_id, {})
+                loaded = yaml.safe_load(f) or {}
+                config = loaded.get(self.exchange_id, {}) or {}
         except FileNotFoundError:
             logger.warning(f"Config file not found: {self.config_path}")
-            return {}
         except Exception as e:
             logger.error(f"Error loading config: {e}")
-            return {}
+
+        env_prefix = self.exchange_id.upper()
+        config["api_key"] = _clean_credential(
+            os.environ.get(f"{env_prefix}_API_KEY") or config.get("api_key")
+        )
+        config["api_secret"] = _clean_credential(
+            os.environ.get(f"{env_prefix}_API_SECRET") or config.get("api_secret")
+        )
+        return config
+
+    def has_credentials(self) -> bool:
+        """Whether usable (non-placeholder) API credentials are configured."""
+        config = self._config or self._load_config()
+        return bool(config.get("api_key")) and bool(config.get("api_secret"))
 
     async def _execute_with_retry(self, func, *args, **kwargs):
         """Execute a function with retry logic.
@@ -280,6 +312,69 @@ class ExchangeService:
             logger.error(f"Failed to get balances: {e}")
             return {}
 
+    def _preflight_order(
+        self,
+        symbol: str,
+        amount: float,
+        price: float,
+    ) -> Optional[float]:
+        """Validate and normalize a live order against exchange rules.
+
+        Rounds the amount to the market's precision and checks the market's
+        minimum amount and minimum cost limits, so invalid orders are
+        rejected locally instead of bouncing off the exchange.
+
+        Args:
+            symbol: Trading pair symbol
+            amount: Requested amount in base currency
+            price: Price used to estimate notional cost (limit or last)
+
+        Returns:
+            The precision-adjusted amount, or None if the order violates
+            exchange limits.
+        """
+        # Best-effort local validation: only enforce limits the exchange
+        # metadata actually provides (the exchange remains the final
+        # validator). Malformed/missing metadata never blocks an order.
+        markets = self.exchange.markets if isinstance(self.exchange.markets, dict) else {}
+        market = markets.get(symbol)
+
+        # Round to exchange precision (ccxt returns a string)
+        try:
+            amount = float(self.exchange.amount_to_precision(symbol, amount))
+        except Exception as e:
+            logger.warning(f"Could not apply amount precision for {symbol}: {e}")
+
+        if amount <= 0:
+            logger.error(f"Order rejected: amount rounds to zero for {symbol}")
+            return None
+
+        if isinstance(market, dict):
+            limits = market.get("limits") or {}
+            min_amount = (limits.get("amount") or {}).get("min")
+            min_cost = (limits.get("cost") or {}).get("min")
+
+            if isinstance(min_amount, (int, float)) and amount < min_amount:
+                logger.error(
+                    f"Order rejected: amount {amount} below exchange minimum "
+                    f"{min_amount} for {symbol}"
+                )
+                return None
+
+            if (
+                isinstance(min_cost, (int, float))
+                and isinstance(price, (int, float))
+                and price > 0
+                and amount * price < min_cost
+            ):
+                logger.error(
+                    f"Order rejected: notional {amount * price:.8f} below exchange "
+                    f"minimum cost {min_cost} for {symbol}"
+                )
+                return None
+
+        return amount
+
     async def place_market_order(
         self,
         symbol: str,
@@ -301,6 +396,13 @@ class ExchangeService:
             return None
 
         try:
+            # Pre-flight: precision + min limits (use last price for notional)
+            ticker = await self.get_ticker(symbol)
+            estimate_price = ticker.last if ticker else 0
+            amount = self._preflight_order(symbol, amount, estimate_price)
+            if amount is None:
+                return None
+
             order = await self._execute_with_retry(
                 self.exchange.create_order,
                 symbol,
@@ -308,6 +410,8 @@ class ExchangeService:
                 side.value,
                 amount,
             )
+            # Audit trail for live execution: keep the full raw response
+            logger.info(f"Raw exchange response for market {side.value} {symbol}: {order}")
             return self._parse_order(order)
         except Exception as e:
             logger.error(f"Failed to place market {side.value} order for {symbol}: {e}")
@@ -336,6 +440,15 @@ class ExchangeService:
             return None
 
         try:
+            # Pre-flight: precision + min limits at the limit price
+            try:
+                price = float(self.exchange.price_to_precision(symbol, price))
+            except Exception as e:
+                logger.warning(f"Could not apply price precision for {symbol}: {e}")
+            amount = self._preflight_order(symbol, amount, price)
+            if amount is None:
+                return None
+
             order = await self._execute_with_retry(
                 self.exchange.create_order,
                 symbol,
@@ -344,6 +457,8 @@ class ExchangeService:
                 amount,
                 price,
             )
+            # Audit trail for live execution: keep the full raw response
+            logger.info(f"Raw exchange response for limit {side.value} {symbol}: {order}")
             return self._parse_order(order)
         except Exception as e:
             logger.error(f"Failed to place limit {side.value} order for {symbol}: {e}")
@@ -456,53 +571,48 @@ class ExchangeService:
 
 
 class SimulatedExchangeService(ExchangeService):
-    """Simulated exchange service for dry run mode."""
+    """Simulated exchange service for dry run mode.
 
-    def __init__(self, initial_balance: float = 10000.0):
+    Market data is REAL (fetched from the exchange's public API, which
+    requires no credentials); balances, order fills, and order history are
+    simulated. Never fabricates prices: if real market data is unavailable,
+    get_ticker returns None and the caller must skip trading.
+    """
+
+    def __init__(self, initial_balance: float = 10000.0, ticker_cache_ttl: float = 2.0):
         """Initialize simulated exchange.
 
         Args:
             initial_balance: Initial USDT balance for simulation
+            ticker_cache_ttl: Seconds to cache tickers, limiting public API
+                load from per-second bot loops
         """
         super().__init__()
         self._simulated_balance = {"USDT": initial_balance}
         self._simulated_orders: Dict[str, ExchangeOrder] = {}
         self._order_counter = 0
-        self._connected = True
+        self._ticker_cache_ttl = ticker_cache_ttl
+        self._ticker_cache: Dict[str, tuple] = {}
 
     async def connect(self) -> bool:
-        """Simulated connection always succeeds."""
-        self._connected = True
-        logger.info("Connected to simulated exchange")
-        return True
-
-    async def disconnect(self) -> None:
-        """Simulated disconnect."""
-        self._connected = False
-        logger.info("Disconnected from simulated exchange")
+        """Connect to the exchange's public API for real market data."""
+        connected = await super().connect()
+        if connected:
+            logger.info("Simulated exchange connected (real market data, simulated fills)")
+        else:
+            logger.error("Simulated exchange: failed to connect to public market data API")
+        return connected
 
     async def get_ticker(self, symbol: str) -> Optional[Ticker]:
-        """Get simulated ticker (returns realistic mock data)."""
-        # Return mock ticker data based on symbol
-        mock_prices = {
-            "BTC/USDT": 45000.0,
-            "ETH/USDT": 2500.0,
-            "SOL/USDT": 100.0,
-            "XRP/USDT": 0.55,
-            "ADA/USDT": 0.45,
-            "DOGE/USDT": 0.08,
-        }
-        price = mock_prices.get(symbol, 100.0)
-        spread = price * 0.001  # 0.1% spread
+        """Get a real ticker from the public API, cached for a short TTL."""
+        cached = self._ticker_cache.get(symbol)
+        if cached and (time.monotonic() - cached[0]) < self._ticker_cache_ttl:
+            return cached[1]
 
-        return Ticker(
-            symbol=symbol,
-            bid=price - spread,
-            ask=price + spread,
-            last=price,
-            volume=1000000.0,
-            timestamp=datetime.utcnow(),
-        )
+        ticker = await super().get_ticker(symbol)
+        if ticker:
+            self._ticker_cache[symbol] = (time.monotonic(), ticker)
+        return ticker
 
     async def get_balance(self, currency: str = "USDT") -> Optional[Balance]:
         """Get simulated balance."""

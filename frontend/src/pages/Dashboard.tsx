@@ -1,3 +1,4 @@
+import { apiFetch } from '../lib/api'
 import { Link } from 'react-router-dom'
 import { useQuery } from '@tanstack/react-query'
 import { useMemo } from 'react'
@@ -56,19 +57,19 @@ interface BotSummary {
 }
 
 async function fetchStats(): Promise<Stats> {
-  const res = await fetch('/api/stats')
+  const res = await apiFetch('/api/stats')
   if (!res.ok) throw new Error('Failed to fetch stats')
   return res.json()
 }
 
 async function fetchPnLHistory(): Promise<PnLDataPoint[]> {
-  const res = await fetch('/api/pnl')
+  const res = await apiFetch('/api/pnl')
   if (!res.ok) throw new Error('Failed to fetch P&L history')
   return res.json()
 }
 
 async function fetchBots(): Promise<BotSummary[]> {
-  const res = await fetch('/api/bots?limit=5')
+  const res = await apiFetch('/api/bots?limit=5')
   if (!res.ok) throw new Error('Failed to fetch bots')
   return res.json()
 }

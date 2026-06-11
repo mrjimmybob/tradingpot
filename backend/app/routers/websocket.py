@@ -1,9 +1,12 @@
 """WebSocket router for real-time updates."""
 
+import secrets
+
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 import logging
 
 from ..services.websocket import ws_manager
+from ..services.config import get_api_token
 
 logger = logging.getLogger(__name__)
 
@@ -26,7 +29,17 @@ async def websocket_endpoint(websocket: WebSocket):
     - {"type": "bot_update", "bot_id": 1, "status": "running", "pnl": 100, ...}
     - {"type": "stats_update", "total_bots": 5, "running_bots": 3, ...}
     - {"type": "pong"}
+
+    When an API token is configured, clients must pass it as a `token`
+    query parameter or the connection is refused.
     """
+    token = get_api_token()
+    if token:
+        provided = websocket.query_params.get("token", "")
+        if not provided or not secrets.compare_digest(provided, token):
+            await websocket.close(code=1008, reason="Invalid or missing API token")
+            return
+
     await ws_manager.connect_client(websocket)
 
     try:

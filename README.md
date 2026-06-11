@@ -50,15 +50,30 @@ chmod +x init.sh
 ./init.sh
 ```
 
-### 2. Configure API Keys
+### 2. Configure API Keys (live trading only)
 
-Edit `config/exchanges.yaml` with your MEXC API credentials:
+Exchange credentials are **not needed for dry-run mode** — dry-run bots use the
+exchange's public market data API (internet access required) with simulated
+balances and fills.
+
+For live trading, set credentials via environment variables (preferred):
+
+```bash
+export MEXC_API_KEY="your-key"
+export MEXC_API_SECRET="your-secret"
+```
+
+or edit `config/exchanges.yaml`:
 
 ```yaml
 mexc:
   api_key: "YOUR_API_KEY"
   api_secret: "YOUR_API_SECRET"
 ```
+
+Environment variables override the YAML file. Placeholder values (anything
+starting with `YOUR_`) are treated as unset — live bots refuse to start
+without real credentials.
 
 ### 3. Start the Backend
 
@@ -80,6 +95,31 @@ npm run dev
 - **Frontend**: http://localhost:5173
 - **Backend API**: http://localhost:8000
 - **API Documentation**: http://localhost:8000/docs
+
+## Security
+
+- The backend binds to `127.0.0.1` (localhost-only) by default.
+- To expose the API beyond localhost you **must** set an API token, or the
+  server refuses to start:
+
+  ```bash
+  export TRADINGBOT_API_TOKEN="a-long-random-token"
+  ```
+
+  Clients must then send `Authorization: Bearer <token>` on every API request
+  and `?token=<token>` on the WebSocket. In the web UI, set the token on the
+  **Settings** page (stored in browser localStorage).
+- There is no TLS or multi-user support; for anything beyond a trusted LAN,
+  put the API behind a reverse proxy with HTTPS.
+
+## Testing Path (recommended)
+
+1. **Dry-run with real data**: create bots in dry-run mode. Prices come from
+   the live exchange public API; balances and fills are simulated. If market
+   data is unavailable, bots skip trading rather than using fake prices.
+2. **Small live test**: once dry-run behavior looks sane over a meaningful
+   period, configure real credentials and start a live bot with a small
+   budget to monitor real execution and performance.
 
 ## Project Structure
 

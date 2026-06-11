@@ -15,6 +15,7 @@
  * - Red: Blocked/Critical
  */
 
+import { apiFetch } from '../lib/api'
 import React from 'react';
 import { AlertTriangle, Shield, TrendingDown, Activity, AlertCircle, CheckCircle, XCircle, PauseCircle } from 'lucide-react';
 
@@ -67,7 +68,7 @@ export const RiskSafetyPanel: React.FC<RiskSafetyPanelProps> = ({
         url += `&owner_id=${ownerId}`;
       }
 
-      const response = await fetch(url);
+      const response = await apiFetch(url);
 
       if (!response.ok) {
         throw new Error('Failed to fetch risk status');

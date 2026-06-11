@@ -11,6 +11,7 @@
  * DO NOT mix with trading P&L UI
  */
 
+import { apiFetch } from '../lib/api'
 import React from 'react';
 import { Download, FileText, TrendingUp, TrendingDown, Calendar, DollarSign } from 'lucide-react';
 
@@ -43,7 +44,7 @@ export const TaxReporting: React.FC = () => {
       setLoading(true);
       setError(null);
 
-      const response = await fetch(
+      const response = await apiFetch(
         `/api/reports/tax-summary/${selectedYear}?is_simulated=${isSimulated}`
       );
 
@@ -65,7 +66,7 @@ export const TaxReporting: React.FC = () => {
     try {
       setExporting(true);
 
-      const response = await fetch(
+      const response = await apiFetch(
         `/api/reports/tax-export/${selectedYear}?is_simulated=${isSimulated}`,
         { method: 'POST' }
       );

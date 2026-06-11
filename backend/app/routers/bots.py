@@ -9,6 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..models import get_session, Bot, BotStatus, Order, Position
 from ..services import trading_engine
+from ..services.trading_engine import BotStartError
 from ..services.logging_service import ensure_bot_log_directory
 from .config import STRATEGIES
 
@@ -372,16 +373,22 @@ async def start_bot(
             detail="Bot is already running"
         )
 
-    # Start the trading engine for this bot
-    background_tasks.add_task(trading_engine.start_bot, bot_id)
+    # Start the trading engine for this bot. Awaited (not a background task)
+    # so credential/connectivity failures are reported to the caller.
+    try:
+        started = await trading_engine.start_bot(bot_id)
+    except BotStartError as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(e)
+        )
 
-    # Update status (will also be updated by trading engine)
-    bot.status = BotStatus.RUNNING
-    bot.started_at = datetime.utcnow()
-    bot.paused_at = None
-    bot.updated_at = datetime.utcnow()
+    if not started:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Bot could not be started"
+        )
 
-    await session.commit()
     await session.refresh(bot)
     return bot
 

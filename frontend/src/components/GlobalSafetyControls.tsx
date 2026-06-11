@@ -7,6 +7,7 @@
  * - "Export all data" (ledger + trades + tax)
  */
 
+import { apiFetch } from '../lib/api'
 import React from 'react';
 import { AlertTriangle, Snowflake, RefreshCw, Download, Shield } from 'lucide-react';
 
@@ -28,7 +29,7 @@ export const GlobalSafetyControls: React.FC<GlobalSafetyControlsProps> = ({ isSi
 
     try {
       setFreezing(true);
-      const response = await fetch('/api/kill-all', { method: 'POST' });
+      const response = await apiFetch('/api/kill-all', { method: 'POST' });
 
       if (!response.ok) {
         throw new Error('Failed to freeze all bots');
@@ -52,7 +53,7 @@ export const GlobalSafetyControls: React.FC<GlobalSafetyControlsProps> = ({ isSi
     try {
       setRebuilding(true);
       // This endpoint would need to be implemented in the backend
-      const response = await fetch('/api/admin/rebuild-state', { method: 'POST' });
+      const response = await apiFetch('/api/admin/rebuild-state', { method: 'POST' });
 
       if (!response.ok) {
         throw new Error('Failed to rebuild state');
@@ -76,7 +77,7 @@ export const GlobalSafetyControls: React.FC<GlobalSafetyControlsProps> = ({ isSi
       const mode = isSimulated ? 'simulated' : 'live';
 
       // Export ledger
-      const ledgerResponse = await fetch(`/api/reports/ledger-audit?is_simulated=${isSimulated}`);
+      const ledgerResponse = await apiFetch(`/api/reports/ledger-audit?is_simulated=${isSimulated}`);
       if (ledgerResponse.ok) {
         const ledgerData = await ledgerResponse.json();
         const ledgerBlob = new Blob([JSON.stringify(ledgerData, null, 2)], { type: 'application/json' });
@@ -91,7 +92,7 @@ export const GlobalSafetyControls: React.FC<GlobalSafetyControlsProps> = ({ isSi
       }
 
       // Export trades
-      const tradesResponse = await fetch(`/api/reports/trades?is_simulated=${isSimulated}`);
+      const tradesResponse = await apiFetch(`/api/reports/trades?is_simulated=${isSimulated}`);
       if (tradesResponse.ok) {
         const tradesData = await tradesResponse.json();
         const tradesBlob = new Blob([JSON.stringify(tradesData, null, 2)], { type: 'application/json' });
@@ -107,7 +108,7 @@ export const GlobalSafetyControls: React.FC<GlobalSafetyControlsProps> = ({ isSi
 
       // Export tax data for current year
       const currentYear = new Date().getFullYear();
-      const taxResponse = await fetch(`/api/reports/tax-export/${currentYear}?is_simulated=${isSimulated}`, {
+      const taxResponse = await apiFetch(`/api/reports/tax-export/${currentYear}?is_simulated=${isSimulated}`, {
         method: 'POST',
       });
       if (taxResponse.ok) {

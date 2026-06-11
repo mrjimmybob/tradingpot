@@ -1,3 +1,4 @@
+import { apiFetch } from '../lib/api'
 import { Outlet, Link, useLocation } from 'react-router-dom'
 import { useState } from 'react'
 import { useQueryClient, useQuery } from '@tanstack/react-query'
@@ -24,13 +25,13 @@ interface Stats {
 }
 
 async function fetchStats(): Promise<Stats> {
-  const res = await fetch('/api/stats')
+  const res = await apiFetch('/api/stats')
   if (!res.ok) throw new Error('Failed to fetch stats')
   return res.json()
 }
 
 async function killAllBots(): Promise<void> {
-  const res = await fetch('/api/kill-all', { method: 'POST' })
+  const res = await apiFetch('/api/kill-all', { method: 'POST' })
   if (!res.ok) throw new Error('Failed to kill all bots')
 }
 

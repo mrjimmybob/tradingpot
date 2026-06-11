@@ -1,3 +1,4 @@
+import { apiFetch } from '../lib/api'
 import { useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import { FileBarChart, Download, TrendingUp, DollarSign } from 'lucide-react'
@@ -48,19 +49,19 @@ interface FeeReportResponse {
 }
 
 async function fetchPnLReport(): Promise<PnLReportResponse> {
-  const res = await fetch('/api/reports/pnl')
+  const res = await apiFetch('/api/reports/pnl')
   if (!res.ok) throw new Error('Failed to fetch P&L report')
   return res.json()
 }
 
 async function fetchTaxReport(): Promise<TaxReportResponse> {
-  const res = await fetch('/api/reports/tax')
+  const res = await apiFetch('/api/reports/tax')
   if (!res.ok) throw new Error('Failed to fetch tax report')
   return res.json()
 }
 
 async function fetchFeeReport(): Promise<FeeReportResponse> {
-  const res = await fetch('/api/reports/fees')
+  const res = await apiFetch('/api/reports/fees')
   if (!res.ok) throw new Error('Failed to fetch fee report')
   return res.json()
 }

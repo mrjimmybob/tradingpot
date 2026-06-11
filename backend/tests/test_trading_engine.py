@@ -1648,3 +1648,144 @@ class TestEdgeCases:
 
         # Assert - Trade recorder called twice with different bot IDs
         assert mock_services["trade_recorder"].record_trade.call_count == 2
+
+
+# ============================================================================
+# Bot Start Safety (credentials + exchange connectivity)
+# ============================================================================
+
+
+class TestBotStartSafety:
+    """start_bot must not run a bot without a working exchange connection,
+    and live bots must not start without usable credentials."""
+
+    def _make_session_ctx(self, bot):
+        """Mock async_session_maker returning a session that yields `bot`."""
+        session = AsyncMock()
+        session.commit = AsyncMock()
+        result = Mock()
+        result.scalar_one_or_none = Mock(return_value=bot)
+        session.execute = AsyncMock(return_value=result)
+
+        ctx = AsyncMock()
+        ctx.__aenter__ = AsyncMock(return_value=session)
+        ctx.__aexit__ = AsyncMock(return_value=False)
+        maker = Mock(return_value=ctx)
+        return maker, session
+
+    def _make_bot(self, is_dry_run: bool):
+        bot = Mock(spec=Bot)
+        bot.id = 1
+        bot.name = "TestBot"
+        bot.is_dry_run = is_dry_run
+        bot.status = BotStatus.STOPPED
+        bot.budget = 1000.0
+        bot.strategy = "dca_accumulator"
+        bot.trading_pair = "BTC/USDT"
+        return bot
+
+    @pytest.mark.asyncio
+    async def test_live_bot_without_credentials_refused(self):
+        """Live bot start fails fast when no credentials are configured."""
+        from app.services.trading_engine import BotStartError
+
+        engine = TradingEngine()
+        bot = self._make_bot(is_dry_run=False)
+        maker, session = self._make_session_ctx(bot)
+
+        mock_exchange = Mock()
+        mock_exchange.has_credentials = Mock(return_value=False)
+        mock_exchange.connect = AsyncMock(return_value=True)
+
+        with patch("app.services.trading_engine.async_session_maker", maker), \
+             patch("app.services.trading_engine.ExchangeService", return_value=mock_exchange):
+            with pytest.raises(BotStartError, match="credentials"):
+                await engine.start_bot(1)
+
+        mock_exchange.connect.assert_not_awaited()
+        assert 1 not in engine._running_bots
+        assert bot.status != BotStatus.RUNNING
+
+    @pytest.mark.asyncio
+    async def test_connect_failure_aborts_start(self):
+        """A failed exchange connection must abort the start."""
+        from app.services.trading_engine import BotStartError
+
+        engine = TradingEngine()
+        bot = self._make_bot(is_dry_run=True)
+        maker, session = self._make_session_ctx(bot)
+
+        mock_exchange = Mock()
+        mock_exchange.connect = AsyncMock(return_value=False)
+        mock_exchange.disconnect = AsyncMock()
+
+        with patch("app.services.trading_engine.async_session_maker", maker), \
+             patch("app.services.trading_engine.SimulatedExchangeService", return_value=mock_exchange):
+            with pytest.raises(BotStartError, match="connect"):
+                await engine.start_bot(1)
+
+        mock_exchange.disconnect.assert_awaited_once()
+        assert 1 not in engine._running_bots
+        assert bot.status != BotStatus.RUNNING
+
+    @pytest.mark.asyncio
+    async def test_dry_run_without_credentials_starts(self):
+        """Dry-run bots need no credentials; successful connect starts the loop."""
+        engine = TradingEngine()
+        bot = self._make_bot(is_dry_run=True)
+        maker, session = self._make_session_ctx(bot)
+
+        mock_exchange = Mock()
+        mock_exchange.connect = AsyncMock(return_value=True)
+
+        with patch("app.services.trading_engine.async_session_maker", maker), \
+             patch("app.services.trading_engine.SimulatedExchangeService", return_value=mock_exchange), \
+             patch("app.services.trading_engine.ensure_bot_log_directory"), \
+             patch("app.services.trading_engine.BotLoggingService"), \
+             patch.object(engine, "_run_bot_loop", new=AsyncMock()):
+            started = await engine.start_bot(1)
+
+        assert started is True
+        assert bot.status == BotStatus.RUNNING
+        session.commit.assert_awaited()
+        assert 1 in engine._running_bots
+        # Cleanup the created task
+        engine._running_bots[1].cancel()
+
+
+class TestMarketRegimeDetection:
+    """_detect_market_regime: price-only regime detection used by the
+    regime filters in DCA, grid, mean-reversion, and volatility breakout."""
+
+    def test_insufficient_history_returns_neutral(self):
+        engine = TradingEngine()
+        regime = engine._detect_market_regime([100.0] * 5, None)
+        assert regime["trend_state"] == "flat"
+        assert regime["volatility_state"] == "medium"
+
+    def test_uptrend_detected(self):
+        engine = TradingEngine()
+        prices = [100.0 * (1.01 ** i) for i in range(60)]
+        regime = engine._detect_market_regime(prices, None)
+        assert regime["trend_state"] == "up"
+
+    def test_downtrend_detected(self):
+        engine = TradingEngine()
+        prices = [100.0 * (0.99 ** i) for i in range(60)]
+        regime = engine._detect_market_regime(prices, None)
+        assert regime["trend_state"] == "down"
+
+    def test_flat_market_detected(self):
+        engine = TradingEngine()
+        prices = [100.0 + (0.01 if i % 2 else -0.01) for i in range(60)]
+        regime = engine._detect_market_regime(prices, None)
+        assert regime["trend_state"] == "flat"
+
+    def test_accepts_dict_entries(self):
+        """Strategies pass mixed dict/float histories; both must work."""
+        engine = TradingEngine()
+        history = [{"timestamp": str(i), "price": 100.0 + i} for i in range(30)]
+        history.append(131.0)  # mean-reversion appends a bare float
+        regime = engine._detect_market_regime(history, None)
+        assert regime["trend_state"] in ("up", "down", "flat")
+        assert "volatility_state" in regime

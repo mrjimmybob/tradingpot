@@ -2,9 +2,13 @@
 # This file is validated on server startup
 
 server:
-  host: "0.0.0.0"
+  # Loopback by default. To expose beyond this machine you MUST set an API
+  # token (TRADINGBOT_API_TOKEN env var or api_token below) or the server
+  # refuses to start.
+  host: "127.0.0.1"
   port: 8000
   debug: false
+  # api_token: ""  # prefer the TRADINGBOT_API_TOKEN environment variable
 
 database:
   url: "sqlite+aiosqlite:///./tradingbot.db"

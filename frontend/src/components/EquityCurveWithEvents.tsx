@@ -11,6 +11,7 @@
  * Hover tooltip shows event type + reason
  */
 
+import { apiFetch } from '../lib/api'
 import React from 'react';
 import {
   LineChart,
@@ -21,7 +22,6 @@ import {
   Tooltip,
   ResponsiveContainer,
   ReferenceDot,
-  Legend,
 } from 'recharts';
 import { Activity, AlertTriangle, TrendingDown, Zap, RotateCcw, Shuffle } from 'lucide-react';
 
@@ -92,7 +92,7 @@ export const EquityCurveWithEvents: React.FC<EquityCurveWithEventsProps> = ({
           url += `&owner_id=${ownerId}`;
         }
 
-        const response = await fetch(url);
+        const response = await apiFetch(url);
 
         if (!response.ok) {
           throw new Error('Failed to fetch equity curve');

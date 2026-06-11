@@ -1,6 +1,7 @@
+import { apiFetch } from '../lib/api'
 import { Link, useSearchParams } from 'react-router-dom'
 import { useQuery } from '@tanstack/react-query'
-import { useState, useEffect, useMemo, useCallback, useRef } from 'react'
+import { useState, useEffect, useMemo, useCallback } from 'react'
 import {
   Plus,
   Search,
@@ -131,7 +132,7 @@ function isValidStatus(value: string | null): boolean {
 
 async function fetchBots(status?: string): Promise<BotListItem[]> {
   const url = status ? `/api/bots?status_filter=${status}` : '/api/bots'
-  const res = await fetch(url)
+  const res = await apiFetch(url)
   if (!res.ok) {
     if (!navigator.onLine) {
       throw new Error('No internet connection. Please check your network and try again.')
@@ -327,7 +328,7 @@ export default function BotList() {
   const handleDelete = async (id: number, name: string) => {
     if (confirm(`Are you sure you want to delete "${name}"?`)) {
       try {
-        const res = await fetch(`/api/bots/${id}`, { method: 'DELETE' })
+        const res = await apiFetch(`/api/bots/${id}`, { method: 'DELETE' })
         if (!res.ok) {
           const data = await res.json()
           throw new Error(data.detail || 'Failed to delete bot')

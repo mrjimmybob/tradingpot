@@ -1,3 +1,4 @@
+import { apiFetch } from '../lib/api'
 import { useParams, Link, useNavigate } from 'react-router-dom'
 import { useState } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
@@ -20,7 +21,6 @@ import {
 import { useToast } from '../components/Toast'
 import { useRealtimeBot, useRealtimePrice } from '../contexts/WebSocketContext'
 import { RealtimePrice } from '../components/RealtimePrice'
-import ProgressIndicator from '../components/ProgressIndicator'
 
 interface Bot {
   id: number
@@ -70,7 +70,7 @@ interface Order {
 }
 
 async function fetchBot(id: string): Promise<Bot> {
-  const res = await fetch(`/api/bots/${id}`)
+  const res = await apiFetch(`/api/bots/${id}`)
   if (!res.ok) {
     if (res.status === 404) throw new Error('Bot not found')
     throw new Error('Failed to fetch bot')
@@ -79,13 +79,13 @@ async function fetchBot(id: string): Promise<Bot> {
 }
 
 async function fetchPositions(id: string): Promise<Position[]> {
-  const res = await fetch(`/api/bots/${id}/positions`)
+  const res = await apiFetch(`/api/bots/${id}/positions`)
   if (!res.ok) throw new Error('Failed to fetch positions')
   return res.json()
 }
 
 async function fetchOrders(id: string): Promise<Order[]> {
-  const res = await fetch(`/api/bots/${id}/orders?limit=10`)
+  const res = await apiFetch(`/api/bots/${id}/orders?limit=10`)
   if (!res.ok) throw new Error('Failed to fetch orders')
   return res.json()
 }
@@ -141,7 +141,7 @@ export default function BotDetail() {
   const realtimeBotData = useRealtimeBot(parseInt(id || '0'))
 
   // Get real-time price for the trading pair
-  const realtimePrice = useRealtimePrice(bot?.trading_pair || '')
+  useRealtimePrice(bot?.trading_pair || '')  // subscribe for side effects
 
   // Merge real-time data with query data
   const displayPnl = realtimeBotData?.pnl ?? bot?.total_pnl ?? 0
@@ -150,7 +150,7 @@ export default function BotDetail() {
 
   const startMutation = useMutation({
     mutationFn: async () => {
-      const res = await fetch(`/api/bots/${id}/start`, { method: 'POST' })
+      const res = await apiFetch(`/api/bots/${id}/start`, { method: 'POST' })
       if (!res.ok) {
         const data = await res.json().catch(() => ({}))
         throw new Error(data.detail || 'Failed to start bot')
@@ -166,7 +166,7 @@ export default function BotDetail() {
 
   const pauseMutation = useMutation({
     mutationFn: async () => {
-      const res = await fetch(`/api/bots/${id}/pause`, { method: 'POST' })
+      const res = await apiFetch(`/api/bots/${id}/pause`, { method: 'POST' })
       if (!res.ok) {
         const data = await res.json().catch(() => ({}))
         throw new Error(data.detail || 'Failed to pause bot')
@@ -182,7 +182,7 @@ export default function BotDetail() {
 
   const stopMutation = useMutation({
     mutationFn: async () => {
-      const res = await fetch(`/api/bots/${id}/stop`, { method: 'POST' })
+      const res = await apiFetch(`/api/bots/${id}/stop`, { method: 'POST' })
       if (!res.ok) {
         const data = await res.json().catch(() => ({}))
         throw new Error(data.detail || 'Failed to stop bot')
@@ -198,7 +198,7 @@ export default function BotDetail() {
 
   const killMutation = useMutation({
     mutationFn: async () => {
-      const res = await fetch(`/api/bots/${id}/kill`, { method: 'POST' })
+      const res = await apiFetch(`/api/bots/${id}/kill`, { method: 'POST' })
       if (!res.ok) {
         const data = await res.json().catch(() => ({}))
         throw new Error(data.detail || 'Failed to activate kill switch')
@@ -214,7 +214,7 @@ export default function BotDetail() {
 
   const goLiveMutation = useMutation({
     mutationFn: async () => {
-      const res = await fetch(`/api/bots/${id}/go-live`, { method: 'POST' })
+      const res = await apiFetch(`/api/bots/${id}/go-live`, { method: 'POST' })
       if (!res.ok) {
         const data = await res.json().catch(() => ({}))
         throw new Error(data.detail || 'Failed to promote bot to live')
@@ -230,7 +230,7 @@ export default function BotDetail() {
 
   const copyMutation = useMutation({
     mutationFn: async () => {
-      const res = await fetch(`/api/bots/${id}/copy`, { method: 'POST' })
+      const res = await apiFetch(`/api/bots/${id}/copy`, { method: 'POST' })
       if (!res.ok) {
         const data = await res.json().catch(() => ({}))
         throw new Error(data.detail || 'Failed to copy bot')
@@ -259,7 +259,7 @@ export default function BotDetail() {
 
   const updateMutation = useMutation({
     mutationFn: async (data: typeof editForm) => {
-      const res = await fetch(`/api/bots/${id}`, {
+      const res = await apiFetch(`/api/bots/${id}`, {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(data),

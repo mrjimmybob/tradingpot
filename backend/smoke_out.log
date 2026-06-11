@@ -1,0 +1,11 @@
+Configuration validated successfully
+API authentication: enabled (bearer token)
+Database initialized
+WebSocket manager started
+WARNING: Failed to resume bots: 'TradingEngine' object has no attribute 'trading_engine'
+INFO:     127.0.0.1:6568 - "GET /api/bots HTTP/1.1" 200 OK
+INFO:     127.0.0.1:6569 - "POST /api/bots/1/start HTTP/1.1" 200 OK
+INFO:     127.0.0.1:6580 - "GET /api/bots/1/orders?limit=5 HTTP/1.1" 200 OK
+INFO:     127.0.0.1:6581 - "GET /api/bots/1 HTTP/1.1" 200 OK
+INFO:     127.0.0.1:6592 - "POST /api/bots/1/stop HTTP/1.1" 200 OK
+INFO:     127.0.0.1:6593 - "DELETE /api/bots/1 HTTP/1.1" 204 No Content

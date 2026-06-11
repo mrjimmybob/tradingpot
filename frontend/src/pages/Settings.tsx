@@ -1,3 +1,4 @@
+import { apiFetch, getApiToken, setApiToken } from '../lib/api'
 import { useState } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import {
@@ -11,7 +12,6 @@ import {
   CheckCircle,
   XCircle,
   AlertCircle,
-  RefreshCw,
   Power,
   PowerOff,
   Loader2,
@@ -45,13 +45,13 @@ interface AggregatedSignals {
 
 // API functions
 async function fetchDataSources(): Promise<Record<string, DataSourceConfig>> {
-  const res = await fetch('/api/data-sources/sources')
+  const res = await apiFetch('/api/data-sources/sources')
   if (!res.ok) throw new Error('Failed to fetch data sources')
   return res.json()
 }
 
 async function fetchSignals(): Promise<AggregatedSignals> {
-  const res = await fetch('/api/data-sources/signals')
+  const res = await apiFetch('/api/data-sources/signals')
   if (!res.ok) throw new Error('Failed to fetch signals')
   return res.json()
 }
@@ -60,7 +60,7 @@ async function updateSource(
   sourceType: string,
   data: { enabled?: boolean; api_key?: string }
 ): Promise<DataSourceConfig> {
-  const res = await fetch(`/api/data-sources/sources/${sourceType}`, {
+  const res = await apiFetch(`/api/data-sources/sources/${sourceType}`, {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(data),
@@ -70,7 +70,7 @@ async function updateSource(
 }
 
 async function bulkUpdateSources(enabled: boolean): Promise<Record<string, DataSourceConfig>> {
-  const res = await fetch('/api/data-sources/sources/bulk', {
+  const res = await apiFetch('/api/data-sources/sources/bulk', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ enabled }),
@@ -162,14 +162,16 @@ function Toggle({
 // Status indicator component
 function StatusIndicator({ healthy, lastError }: { healthy: boolean; lastError: string | null }) {
   if (healthy) {
-    return <CheckCircle size={16} className="text-profit" title="Healthy" />
+    return (
+      <span title="Healthy">
+        <CheckCircle size={16} className="text-profit" />
+      </span>
+    )
   }
   return (
-    <XCircle
-      size={16}
-      className="text-loss"
-      title={lastError || 'Error'}
-    />
+    <span title={lastError || 'Error'}>
+      <XCircle size={16} className="text-loss" />
+    </span>
   )
 }
 
@@ -291,6 +293,49 @@ function DataSourceCard({
             )}
           </div>
         )}
+      </div>
+    </div>
+  )
+}
+
+// API token card - stores the bearer token used for backend authentication
+function ApiTokenCard() {
+  const toast = useToast()
+  const [token, setToken] = useState(getApiToken())
+
+  const handleSave = () => {
+    setApiToken(token.trim())
+    toast.success(
+      'API Token Saved',
+      token.trim()
+        ? 'Requests will now include the token. Reload if the connection was failing.'
+        : 'Token cleared. Requests will be sent without authentication.'
+    )
+  }
+
+  return (
+    <div className="bg-gray-800 rounded-lg p-6">
+      <h3 className="text-lg font-semibold mb-2">API Access</h3>
+      <p className="text-gray-400 text-sm mb-4">
+        Required only when the backend has an API token configured
+        (<code className="text-accent">TRADINGBOT_API_TOKEN</code>). Leave empty for
+        local, token-less setups.
+      </p>
+      <div className="flex gap-2">
+        <input
+          type="password"
+          value={token}
+          onChange={(e) => setToken(e.target.value)}
+          placeholder="API token"
+          aria-label="API token"
+          className="flex-1 px-3 py-2 bg-gray-900 border border-gray-700 rounded-lg text-sm focus:outline-none focus:border-accent"
+        />
+        <button
+          onClick={handleSave}
+          className="px-4 py-2 bg-accent/20 text-accent hover:bg-accent/30 rounded-lg text-sm"
+        >
+          Save
+        </button>
       </div>
     </div>
   )
@@ -526,6 +571,9 @@ export default function Settings() {
           </div>
         </>
       )}
+
+      {/* API access token */}
+      <ApiTokenCard />
 
       {/* Server Info */}
       <div className="bg-gray-800 rounded-lg p-6">

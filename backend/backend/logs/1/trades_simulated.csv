@@ -1,0 +1,2 @@
+trade_id,executed_at,side,trading_pair,base_amount,quote_amount,price,fee_amount,modeled_cost,total_cost,strategy_used
+1,2026-06-11T00:43:37.701271,buy,BTC/USDT,0.0008081727601815221,49.99828667374842,61865.84,0.04999828667374842,0.0,50.048284960422166,dca_accumulator

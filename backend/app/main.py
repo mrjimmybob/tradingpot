@@ -4,18 +4,34 @@ Includes alerts router for alert management.
 WebSocket support for real-time market data and UI updates.
 """
 
+import secrets
 import sys
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 
 from .models import init_db
 from .routers import bots, health, stats, reports, config as config_router, alerts
 from .routers import websocket as ws_router
 from .routers import data_sources, portfolio, ledger
 from .services.websocket import ws_manager
-from .services.config import config_service, ConfigValidationException
+from .services.config import config_service, get_api_token, ConfigValidationException
 from .services import trading_engine
+
+LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
+
+
+def binding_failsafe_error(host: str, token: str) -> str:
+    """Return an error message when the configuration would expose an
+    unauthenticated API beyond loopback, else an empty string."""
+    if host not in LOOPBACK_HOSTS and not token:
+        return (
+            f"server.host is '{host}' (non-loopback) but no API token is set. "
+            "Set TRADINGBOT_API_TOKEN (or server.api_token in config.yaml) "
+            "before exposing the API beyond localhost."
+        )
+    return ""
 
 
 @asynccontextmanager
@@ -32,6 +48,17 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         print(f"WARNING: Could not load config file: {e}")
         print("Using default configuration")
+
+    # Fail-safe: never expose an unauthenticated API beyond loopback
+    host = config_service.get("server.host") or "127.0.0.1"
+    failsafe_error = binding_failsafe_error(host, get_api_token())
+    if failsafe_error:
+        print(f"FATAL: {failsafe_error}")
+        sys.exit(1)
+    if get_api_token():
+        print("API authentication: enabled (bearer token)")
+    else:
+        print("API authentication: disabled (loopback-only mode)")
 
     # Initialize database
     await init_db()
@@ -84,6 +111,35 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Paths reachable without a token (liveness checks and docs UI; API calls
+# made from the docs UI still require the token)
+AUTH_EXEMPT_PATHS = {"/", "/api/health", "/docs", "/openapi.json", "/redoc"}
+
+
+@app.middleware("http")
+async def auth_middleware(request, call_next):
+    """Require a bearer token on /api routes when a token is configured."""
+    token = get_api_token()
+    path = request.url.path
+    if (
+        token
+        and request.method != "OPTIONS"  # CORS preflight carries no auth header
+        and path.startswith("/api")
+        and path not in AUTH_EXEMPT_PATHS
+    ):
+        auth_header = request.headers.get("authorization", "")
+        provided = (
+            auth_header[7:].strip()
+            if auth_header.lower().startswith("bearer ")
+            else ""
+        )
+        if not provided or not secrets.compare_digest(provided, token):
+            return JSONResponse(
+                status_code=401,
+                content={"detail": "Invalid or missing API token"},
+            )
+    return await call_next(request)
 
 # Include routers
 app.include_router(health.router, prefix="/api", tags=["Health"])

@@ -7,8 +7,9 @@
  * - Source tags (trade, fee, funding, correction)
  */
 
+import { apiFetch } from '../lib/api'
 import React from 'react';
-import { X, TrendingUp, TrendingDown, DollarSign, AlertTriangle, Link as LinkIcon } from 'lucide-react';
+import { X, TrendingUp, DollarSign, AlertTriangle, Link as LinkIcon } from 'lucide-react';
 
 interface BalanceDrilldownModalProps {
   asset: string;
@@ -72,7 +73,7 @@ export const BalanceDrilldownModal: React.FC<BalanceDrilldownModalProps> = ({
           url += `&owner_id=${ownerId}`;
         }
 
-        const response = await fetch(url);
+        const response = await apiFetch(url);
 
         if (!response.ok) {
           throw new Error('Failed to fetch balance drilldown');

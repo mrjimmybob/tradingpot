@@ -24,7 +24,7 @@ async function main() {
     if (result) {
       console.log(`Using ${py}`);
       // Now start uvicorn
-      spawn(py, ['-m', 'uvicorn', 'app.main:app', '--reload', '--host', '0.0.0.0', '--port', '8000'], {
+      spawn(py, ['-m', 'uvicorn', 'app.main:app', '--reload', '--host', '127.0.0.1', '--port', '8000'], {
         cwd: backendDir,
         stdio: 'inherit',
         shell: true

@@ -409,12 +409,14 @@ class WebSocketManager:
                     running_bots = result.scalars().all()
 
                     # Broadcast updates for each running bot
+                    active_trades = 0
                     for bot in running_bots:
                         # Get positions
                         pos_result = await session.execute(
                             select(Position).where(Position.bot_id == bot.id)
                         )
                         positions = pos_result.scalars().all()
+                        active_trades += len(positions)
 
                         update = BotUpdate(
                             bot_id=bot.id,
@@ -444,12 +446,7 @@ class WebSocketManager:
                         total_bots=total_bots,
                         running_bots=total_bots,
                         total_pnl=total_pnl,
-                        active_trades=sum(
-                            len([p for p in await session.execute(
-                                select(Position).where(Position.bot_id == b.id)
-                            ).scalars().all() for p in [p]])
-                            for b in running_bots
-                        ) if running_bots else 0,
+                        active_trades=active_trades,
                     )
 
                     await self.broadcast_stats_update(stats)

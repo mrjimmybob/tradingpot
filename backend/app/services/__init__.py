@@ -23,6 +23,7 @@ from .risk_management import (
 from .trading_engine import (
     TradingEngine,
     TradeSignal,
+    BotStartError,
     trading_engine,
 )
 from .email import (
@@ -76,6 +77,7 @@ __all__ = [
     # Trading Engine
     "TradingEngine",
     "TradeSignal",
+    "BotStartError",
     "trading_engine",
     # Email
     "EmailService",

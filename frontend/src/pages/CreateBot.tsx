@@ -1,9 +1,9 @@
+import { apiFetch } from '../lib/api'
 import { useState, useCallback } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { useMutation, useQuery } from '@tanstack/react-query'
 import { Bot, ArrowLeft, ArrowRight, Check, AlertCircle, Loader2 } from 'lucide-react'
 import { useToast } from '../components/Toast'
-import ProgressIndicator from '../components/ProgressIndicator'
 
 interface FormErrors {
   name?: string
@@ -53,19 +53,19 @@ interface BotFormData {
 }
 
 async function fetchStrategies(): Promise<Strategy[]> {
-  const res = await fetch('/api/config/strategies')
+  const res = await apiFetch('/api/config/strategies')
   if (!res.ok) throw new Error('Failed to fetch strategies')
   return res.json()
 }
 
 async function fetchPairs(): Promise<TradingPair[]> {
-  const res = await fetch('/api/config/pairs')
+  const res = await apiFetch('/api/config/pairs')
   if (!res.ok) throw new Error('Failed to fetch trading pairs')
   return res.json()
 }
 
 async function createBot(data: BotFormData) {
-  const res = await fetch('/api/bots', {
+  const res = await apiFetch('/api/bots', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(data),
@@ -436,7 +436,7 @@ export default function CreateBot() {
                         </label>
                         <input
                           type={param.type === 'number' ? 'number' : 'text'}
-                          value={formData.strategy_params[key] ?? param.default}
+                          value={String(formData.strategy_params[key] ?? param.default ?? '')}
                           onChange={(e) =>
                             updateFormData({
                               strategy_params: {

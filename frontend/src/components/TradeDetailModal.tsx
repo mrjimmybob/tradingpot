@@ -10,6 +10,7 @@
  * - Fees and modeled costs
  */
 
+import { apiFetch } from '../lib/api'
 import React from 'react';
 import { X, ExternalLink, TrendingUp, TrendingDown } from 'lucide-react';
 
@@ -73,7 +74,7 @@ export const TradeDetailModal: React.FC<TradeDetailModalProps> = ({
     const fetchTradeDetail = async () => {
       try {
         setLoading(true);
-        const response = await fetch(
+        const response = await apiFetch(
           `/api/reports/trade-detail/${tradeId}?is_simulated=${isSimulated}`
         );
 

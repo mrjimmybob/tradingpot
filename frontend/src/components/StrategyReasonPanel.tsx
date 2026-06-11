@@ -12,6 +12,7 @@
  *   - Risk
  */
 
+import { apiFetch } from '../lib/api'
 import React from 'react';
 import { CheckCircle, XCircle, Clock, TrendingUp, AlertTriangle, Activity } from 'lucide-react';
 
@@ -47,7 +48,7 @@ export const StrategyReasonPanel: React.FC<StrategyReasonPanelProps> = ({
     const fetchStrategyReason = async () => {
       try {
         setLoading(true);
-        const response = await fetch(
+        const response = await apiFetch(
           `/api/reports/strategy-reason/${botId}?is_simulated=${isSimulated}`
         );
 

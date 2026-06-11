@@ -9,6 +9,7 @@
  * Filters: bot, date, severity
  */
 
+import { apiFetch } from '../lib/api'
 import React from 'react';
 import { AlertTriangle, Info, XCircle, Filter, Download, Calendar } from 'lucide-react';
 
@@ -50,7 +51,7 @@ export const AuditCompliance: React.FC = () => {
       if (startDate) url += `&start_date=${new Date(startDate).toISOString()}`;
       if (endDate) url += `&end_date=${new Date(endDate).toISOString()}`;
 
-      const response = await fetch(url);
+      const response = await apiFetch(url);
 
       if (!response.ok) {
         throw new Error('Failed to fetch audit log');

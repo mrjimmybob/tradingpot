@@ -14,7 +14,7 @@ from sqlalchemy import select, update
 from ..models import (
     Bot, BotStatus, Order, OrderType, OrderStatus,
     Position, PositionSide, PnLSnapshot,
-    Trade, TradeSide,
+    Trade, TradeSide, Alert,
     async_session_maker,
 )
 from .exchange import ExchangeService, SimulatedExchangeService, OrderSide
@@ -35,6 +35,10 @@ from .accounting import TradeRecorderService, FIFOTaxEngine, CSVExportService
 from .ledger_invariants import LedgerInvariantService, ValidationError
 
 logger = logging.getLogger(__name__)
+
+
+class BotStartError(Exception):
+    """Raised when a bot cannot be started safely (credentials, connectivity)."""
 
 
 @dataclass
@@ -74,6 +78,7 @@ class TradingEngine:
         self._exchange_services: Dict[int, ExchangeService] = {}
         self._stop_flags: Dict[int, bool] = {}
         self._bot_loggers: Dict[int, BotLoggingService] = {}
+        self._last_reconciliation: Optional[datetime] = None
 
     async def start_bot(self, bot_id: int) -> bool:
         """Start a trading bot.
@@ -100,20 +105,34 @@ class TradingEngine:
                 logger.warning(f"Bot {bot_id} is already in RUNNING status")
                 return False
 
-            # Update bot status
+            # Create exchange service
+            if bot.is_dry_run:
+                exchange = SimulatedExchangeService(initial_balance=bot.budget)
+            else:
+                exchange = ExchangeService()
+                if not exchange.has_credentials():
+                    raise BotStartError(
+                        "Exchange API credentials are required for live trading. "
+                        "Set MEXC_API_KEY/MEXC_API_SECRET or config/exchanges.yaml."
+                    )
+
+            # The bot must not run if the exchange (or, for dry-run, the
+            # public market data API) is unreachable.
+            if not await exchange.connect():
+                await exchange.disconnect()
+                raise BotStartError(
+                    "Could not connect to the exchange"
+                    + (" public market data API" if bot.is_dry_run else "")
+                    + ". Bot not started."
+                )
+
+            # Update bot status only after the exchange connection succeeded
             bot.status = BotStatus.RUNNING
             bot.started_at = datetime.utcnow()
             bot.paused_at = None
             bot.updated_at = datetime.utcnow()
             await session.commit()
 
-            # Create exchange service
-            if bot.is_dry_run:
-                exchange = SimulatedExchangeService(initial_balance=bot.budget)
-            else:
-                exchange = ExchangeService()
-
-            await exchange.connect()
             self._exchange_services[bot_id] = exchange
 
             # Initialize per-bot file logger
@@ -323,6 +342,11 @@ class TradingEngine:
 
                     # Take P&L snapshot periodically
                     await self._take_pnl_snapshot(bot_id, session)
+
+                    # Reconcile exchange balances for live trading (throttled,
+                    # alert-only). Dry-run bots have nothing to reconcile.
+                    if not bot.is_dry_run:
+                        await self._reconcile_live_account(exchange, session)
 
             except ValidationError as e:
                 # Accounting validation failure - MUST stop bot
@@ -1454,6 +1478,87 @@ class TradingEngine:
             amount=0,
             reason=f"Mean Reversion: Waiting for lower band (current: ${last_bar_close:.2f}, target: ${lower_band:.2f})"
         )
+
+    async def _reconcile_live_account(
+        self,
+        exchange: ExchangeService,
+        session: AsyncSession,
+    ) -> None:
+        """Compare exchange balances against running live bots' expectations.
+
+        Sufficiency check, alert-only (never stops bots): the exchange account
+        must hold at least the aggregate virtual cash (quote currency) and the
+        aggregate open position amounts (base assets) of all running live
+        bots. Shortfalls beyond the tolerance produce a warning log and an
+        Alert record (alert_type "balance_reconciliation").
+
+        Throttled internally; safe to call from every bot loop iteration.
+        """
+        from .config import config_service
+
+        interval = config_service.get("trading.reconciliation_interval_seconds") or 300
+        now = datetime.utcnow()
+        if self._last_reconciliation and (now - self._last_reconciliation).total_seconds() < interval:
+            return
+        self._last_reconciliation = now
+
+        # Aggregate expectations across ALL running live bots
+        result = await session.execute(
+            select(Bot).where(
+                Bot.status == BotStatus.RUNNING,
+                Bot.is_dry_run == False,  # noqa: E712
+            )
+        )
+        live_bots = result.scalars().all()
+        if not live_bots:
+            return
+
+        tolerance = 0.01  # 1%
+        expected: Dict[str, float] = {}
+
+        for live_bot in live_bots:
+            quote_asset = live_bot.trading_pair.split("/")[1]
+            expected[quote_asset] = expected.get(quote_asset, 0.0) + (live_bot.current_balance or 0.0)
+
+        live_bot_ids = [b.id for b in live_bots]
+        pos_result = await session.execute(
+            select(Position).where(Position.bot_id.in_(live_bot_ids))
+        )
+        for position in pos_result.scalars().all():
+            base_asset = position.trading_pair.split("/")[0]
+            expected[base_asset] = expected.get(base_asset, 0.0) + (position.amount or 0.0)
+
+        shortfalls = []
+        for asset, expected_amount in expected.items():
+            if expected_amount <= 0:
+                continue
+            balance = await exchange.get_balance(asset)
+            if balance is None:
+                logger.warning(f"Reconciliation: could not fetch {asset} balance, skipping")
+                continue
+            if balance.total < expected_amount * (1 - tolerance):
+                shortfalls.append((asset, expected_amount, balance.total))
+
+        if not shortfalls:
+            logger.info(
+                f"Reconciliation OK: exchange covers {len(live_bots)} live bot(s) "
+                f"across {len(expected)} asset(s)"
+            )
+            return
+
+        for asset, expected_amount, actual in shortfalls:
+            message = (
+                f"Balance reconciliation shortfall: exchange holds {actual:.8f} {asset} "
+                f"but running live bots expect {expected_amount:.8f} {asset}. "
+                f"Check for withdrawals, fee drift, or accounting errors."
+            )
+            logger.warning(message)
+            session.add(Alert(
+                bot_id=None,
+                alert_type="balance_reconciliation",
+                message=message,
+            ))
+        await session.commit()
 
     def _get_price_history(self, bot_id: int) -> list:
         """Get price history for a bot."""
@@ -2613,6 +2718,74 @@ class TradingEngine:
 
         return signal
 
+    def _detect_market_regime(self, price_history: list, current_regime: Optional[dict]) -> dict:
+        """Detect market regime from a plain price series (tick/close prices).
+
+        Price-only variant of _detect_market_regime_bar_based for strategies
+        that track tick price history instead of OHLC bars. Entries may be
+        floats or dicts carrying a "price" (or "close") key; other entries
+        are ignored.
+
+        Returns the same shape: trend_state ("up"/"down"/"flat"),
+        volatility_state ("low"/"medium"/"high"), liquidity_state (always
+        "normal" - not measurable from prices alone), persistence_bars.
+        """
+        prices = []
+        for entry in price_history:
+            if isinstance(entry, dict):
+                value = entry.get("price", entry.get("close"))
+            else:
+                value = entry
+            if isinstance(value, (int, float)) and value > 0:
+                prices.append(float(value))
+
+        neutral = {
+            "trend_state": "flat",
+            "volatility_state": "medium",
+            "liquidity_state": "normal",
+            "persistence_bars": 0,
+        }
+        n = len(prices)
+        if n < 20:
+            return neutral
+
+        # === TREND STATE (EMA slope, same thresholds as bar-based variant) ===
+        ema_20 = self._calculate_ema(prices, 20)
+        ema_50 = self._calculate_ema(prices, 50) if n >= 50 else ema_20
+
+        ema_20_current = ema_20[-1]
+        ema_20_prev = ema_20[-5] if len(ema_20) >= 5 else ema_20[0]
+        ema_slope_pct = ((ema_20_current - ema_20_prev) / ema_20_prev) * 100 if ema_20_prev > 0 else 0
+
+        if ema_slope_pct > 0.5 and ema_20_current > ema_50[-1]:
+            trend_state = "up"
+        elif ema_slope_pct < -0.5 and ema_20_current < ema_50[-1]:
+            trend_state = "down"
+        else:
+            trend_state = "flat"
+
+        # === VOLATILITY STATE (absolute price change as true-range proxy) ===
+        changes = [abs(prices[i] - prices[i - 1]) for i in range(max(1, n - 30), n)]
+        if changes:
+            current_atr = sum(changes[-14:]) / min(14, len(changes[-14:]))
+            avg_atr = sum(changes) / len(changes)
+            atr_percentile = current_atr / avg_atr if avg_atr > 0 else 1.0
+            if atr_percentile < 0.7:
+                volatility_state = "low"
+            elif atr_percentile > 1.3:
+                volatility_state = "high"
+            else:
+                volatility_state = "medium"
+        else:
+            volatility_state = "medium"
+
+        return {
+            "trend_state": trend_state,
+            "volatility_state": volatility_state,
+            "liquidity_state": "normal",
+            "persistence_bars": 0,
+        }
+
     def _detect_market_regime_bar_based(self, bar_history: list, current_regime: dict) -> dict:
         """Detect current market regime from completed bar closes only.
 
@@ -3602,7 +3775,22 @@ class TradingEngine:
             # Record trade execution (creates Trade record + ledger entries)
             trade_recorder = TradeRecorderService(session)
             # For partial fills, use the actual filled amount, not the requested amount
-            filled_amount = getattr(exchange_order, 'filled', exchange_order.amount)
+            filled_amount = getattr(exchange_order, 'filled', exchange_order.amount) or exchange_order.amount
+            # Prefer the exchange-reported notional cost; fall back to filled * price
+            reported_cost = getattr(exchange_order, 'cost', None)
+            executed_cost = (
+                reported_cost
+                if isinstance(reported_cost, (int, float)) and reported_cost > 0
+                else filled_amount * exchange_order.price
+            )
+            # Record the fee in the currency the exchange actually charged it
+            # (only trust a real string; fall back to the quote asset)
+            reported_fee_currency = getattr(exchange_order, 'fee_currency', None)
+            fee_asset = (
+                reported_fee_currency
+                if isinstance(reported_fee_currency, str) and reported_fee_currency
+                else quote_asset
+            )
             trade = await trade_recorder.record_trade(
                 order_id=order.id,
                 owner_id=owner_id,
@@ -3613,10 +3801,10 @@ class TradingEngine:
                 base_asset=base_asset,
                 quote_asset=quote_asset,
                 base_amount=filled_amount,  # Use actual filled amount
-                quote_amount=filled_amount * exchange_order.price,  # Calculate quote from filled amount
+                quote_amount=executed_cost,
                 price=exchange_order.price,
                 fee_amount=exchange_order.fee,
-                fee_asset=quote_asset,
+                fee_asset=fee_asset,
                 modeled_cost=cost_estimate.total_cost,
                 exchange_trade_id=exchange_order.id,
                 executed_at=datetime.utcnow(),
@@ -3692,14 +3880,16 @@ class TradingEngine:
                 order.running_balance_after = updated_bot.current_balance
 
             # Update/create position (derived state cache)
+            # Use the actual filled amount so partial fills cannot
+            # desynchronize positions from the ledger
             if signal.action == "buy":
                 await self._open_or_add_position(
-                    bot.id, bot.trading_pair, exchange_order.amount,
+                    bot.id, bot.trading_pair, filled_amount,
                     exchange_order.price, session
                 )
             else:
                 await self._close_or_reduce_position(
-                    bot.id, bot.trading_pair, exchange_order.amount,
+                    bot.id, bot.trading_pair, filled_amount,
                     exchange_order.price, session, wallet
                 )
 
@@ -3914,17 +4104,19 @@ class TradingEngine:
         session.add(order)
 
         # Update wallet and positions (same as standard execution)
+        # Use the actual filled amount so partial fills cannot desync positions
+        filled_amount = getattr(exchange_order, 'filled', exchange_order.amount) or exchange_order.amount
         wallet = VirtualWalletService(session)
         if signal.action == "buy":
             await wallet.record_trade_result(bot.id, -exchange_order.fee, 0)
             await self._open_or_add_position(
-                bot.id, bot.trading_pair, exchange_order.amount,
+                bot.id, bot.trading_pair, filled_amount,
                 exchange_order.price, session
             )
         else:
             await wallet.record_trade_result(bot.id, -exchange_order.fee, 0)
             await self._close_or_reduce_position(
-                bot.id, bot.trading_pair, exchange_order.amount,
+                bot.id, bot.trading_pair, filled_amount,
                 exchange_order.price, session, wallet
             )
 
@@ -4071,17 +4263,19 @@ class TradingEngine:
         session.add(order)
 
         # Update wallet and positions (same as standard execution)
+        # Use the actual filled amount so partial fills cannot desync positions
+        filled_amount = getattr(exchange_order, 'filled', exchange_order.amount) or exchange_order.amount
         wallet = VirtualWalletService(session)
         if signal.action == "buy":
             await wallet.record_trade_result(bot.id, -exchange_order.fee, 0)
             await self._open_or_add_position(
-                bot.id, bot.trading_pair, exchange_order.amount,
+                bot.id, bot.trading_pair, filled_amount,
                 exchange_order.price, session
             )
         else:
             await wallet.record_trade_result(bot.id, -exchange_order.fee, 0)
             await self._close_or_reduce_position(
-                bot.id, bot.trading_pair, exchange_order.amount,
+                bot.id, bot.trading_pair, filled_amount,
                 exchange_order.price, session, wallet
             )
 
@@ -4422,8 +4616,25 @@ class TradingEngine:
                         exchange = SimulatedExchangeService(initial_balance=bot.budget)
                     else:
                         exchange = ExchangeService()
+                        if not exchange.has_credentials():
+                            logger.error(
+                                f"Bot {bot.id}: cannot resume live bot without "
+                                "exchange credentials; marking STOPPED"
+                            )
+                            bot.status = BotStatus.STOPPED
+                            await session.commit()
+                            continue
 
-                    await exchange.connect()
+                    if not await exchange.connect():
+                        await exchange.disconnect()
+                        logger.error(
+                            f"Bot {bot.id}: exchange connection failed on resume; "
+                            "marking STOPPED"
+                        )
+                        bot.status = BotStatus.STOPPED
+                        await session.commit()
+                        continue
+
                     self._exchange_services[bot.id] = exchange
 
                     # Initialize per-bot file logger

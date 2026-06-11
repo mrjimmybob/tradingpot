@@ -36,6 +36,7 @@ CONFIG_SCHEMA = {
             "host": {"type": "str", "required": False},
             "port": {"type": "int", "required": False, "min": 1, "max": 65535},
             "debug": {"type": "bool", "required": False},
+            "api_token": {"type": "str", "required": False},
         }
     },
     "database": {
@@ -51,6 +52,7 @@ CONFIG_SCHEMA = {
         "properties": {
             "execution_interval_seconds": {"type": "int", "required": False, "min": 1},
             "pnl_snapshot_interval_seconds": {"type": "int", "required": False, "min": 1},
+            "reconciliation_interval_seconds": {"type": "int", "required": False, "min": 1},
             "default_stop_loss_percent": {"type": "float", "required": False, "min": 0, "max": 100},
             "default_daily_loss_limit": {"type": "float", "required": False, "min": 0},
         }
@@ -293,3 +295,15 @@ class ConfigService:
 
 # Global config service instance
 config_service = ConfigService()
+
+
+def get_api_token() -> str:
+    """Resolve the API auth token: TRADINGBOT_API_TOKEN env var first, then
+    server.api_token in config.yaml. Empty string means auth is disabled
+    (only permitted on loopback binding, enforced at startup)."""
+    import os
+
+    return (
+        os.environ.get("TRADINGBOT_API_TOKEN", "")
+        or (config_service.get("server.api_token") or "")
+    )

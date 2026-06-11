@@ -1,0 +1,2 @@
+timestamp,bot_id,bot_name,order_id,order_type,trading_pair,amount,price,fees,status,strategy,running_balance,is_simulated,pnl
+2026-06-11T00:43:37.740224,1,SmokeTest DCA,1,market_buy,BTC/USDT,0.00080817,61865.84000000,0.04999829,filled,dca_accumulator,999.95,True,

@@ -162,3 +162,13 @@ Group 8: Performance & Export (4 features)
 
   Would you like me to implement any specific group of features?
   
+  
+  [f] dca_accumulator
+  [f] adaptive_grid
+  [f] mean_reversion
+  [f] trend_following
+  [f] cross_sectional_momentum
+  [f] volatility_breakout
+  - twap
+  - vwap
+  - auto_mode
