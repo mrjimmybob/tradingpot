@@ -8,7 +8,7 @@ A comprehensive crypto trading bot system with multiple trading strategies, serv
 
 ## Features
 
-- **9 Trading Strategies**: DCA Accumulator, Adaptive Grid, Mean Reversion, Trend Following, Cross-Sectional Momentum, Volatility Breakout, TWAP, VWAP, and Auto Mode
+- **7 Trading Strategies**: DCA Accumulator, Adaptive Grid, Mean Reversion, Trend Following, Volatility Breakout, Funding Carry, and Auto Mode (plus TWAP/VWAP execution algorithms)
 - **Multi-Bot Management**: Run multiple bots simultaneously with different strategies and trading pairs
 - **Risk Management**: Virtual wallets, stop losses, drawdown limits, consecutive loss detection, and kill switches
 - **Real-time Monitoring**: WebSocket-based live updates for P&L, positions, and bot status
@@ -197,17 +197,37 @@ poll_frequency: 300  # 5 minutes
 
 ## Trading Strategies
 
+Alpha strategies (single-symbol, long-biased spot):
+
 | Strategy | Description |
 |----------|-------------|
 | DCA Accumulator | Dollar-cost averaging with configurable intervals |
 | Adaptive Grid | Dynamic grid trading with auto-rebalancing |
 | Mean Reversion | Trade reversions to mean using Bollinger Bands |
 | Trend Following | Conservative long-only momentum with EMA crossover and ATR-based stops |
-| Cross-Sectional Momentum | Relative strength strategy that ranks assets and holds top performers |
 | Volatility Breakout | Enters on price breakouts following low-volatility compression |
-| TWAP | Time-weighted average price execution |
-| VWAP | Volume-weighted average price targeting |
+| Funding Carry | Funding-aware trend: uses perpetual funding rates as a positioning/crowdedness filter on top of a trend filter; enters spot only when **both** funding and market regime are favourable. Does not short, hedge, or harvest funding directly |
 | Auto Mode | Regime-based automatic strategy selection policy (detects market regimes and selects optimal strategy) |
+
+Execution algorithms (how to fill an order, not when to trade): **TWAP** (time-weighted) and **VWAP** (volume-weighted). These are not selectable as alpha strategies.
+
+### Funding-Rate Diagnostic (read-only)
+
+Before running the Funding Carry strategy, validate whether funding actually has
+an edge on the target exchange. The diagnostic fetches historical perpetual
+funding rates via the public API (no credentials) and reports the average rate,
+distribution, net funding after realistic round-trip costs, the share of
+profitable funding windows, and best/worst periods. **It places no trades.**
+
+```bash
+cd backend
+python -m scripts.run_funding_diagnostic --symbols BTC/USDT ETH/USDT --limit 500
+```
+
+> Note on MEXC: spot pairs have no funding; the diagnostic automatically queries
+> the matching linear perpetual (e.g. `BTC/USDT` → `BTC/USDT:USDT`). Observed
+> MEXC funding on majors is very small (well under round-trip fees), so Funding
+> Carry uses funding as a *filter* on spot entries rather than a yield source.
 
 ## Safety Features
 

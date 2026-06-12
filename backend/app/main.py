@@ -18,6 +18,7 @@ from .routers import data_sources, portfolio, ledger
 from .services.websocket import ws_manager
 from .services.config import config_service, get_api_token, ConfigValidationException
 from .services import trading_engine
+from .services.db_backup import db_backup_service
 
 LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
 
@@ -64,6 +65,13 @@ async def lifespan(app: FastAPI):
     await init_db()
     print("Database initialized")
 
+    # M-2: take a startup backup and start periodic backups.
+    try:
+        await db_backup_service.backup_once()
+        db_backup_service.start()
+    except Exception as e:
+        print(f"WARNING: database backup could not be started: {e}")
+
     # Start WebSocket manager
     await ws_manager.start()
     print("WebSocket manager started")
@@ -89,6 +97,12 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         print(f"WARNING: Error during trading engine shutdown: {e}")
 
+    # Stop the periodic DB backup task
+    try:
+        await db_backup_service.stop()
+    except Exception as e:
+        print(f"WARNING: error stopping DB backup task: {e}")
+
     # Stop WebSocket manager
     await ws_manager.stop()
     print("WebSocket manager stopped")
@@ -103,10 +117,21 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# CORS middleware
+# CORS middleware. Origins are configurable (server.cors_origins) so a live
+# deployment can scope them; default to the local dev frontends. (M-5)
+# Best-effort load so config is available at import time; the lifespan handler
+# performs the authoritative load + validation (and exits on a bad config).
+try:
+    config_service.load_and_validate()
+except Exception:
+    pass
+_cors_origins = config_service.get("server.cors_origins") or [
+    "http://localhost:5173",
+    "http://localhost:3000",
+]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://localhost:3000"],
+    allow_origins=_cors_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -154,7 +179,47 @@ app.include_router(portfolio.router, prefix="/api", tags=["Portfolio"])
 app.include_router(ledger.router, prefix="/api", tags=["Ledger"])
 
 
-@app.get("/")
-async def root():
-    """Root endpoint redirect to docs."""
-    return {"message": "TradingBot API", "docs": "/docs"}
+def _mount_frontend() -> bool:
+    """Optionally serve a built frontend (SPA) so the UI and API share one origin.
+
+    Enabled only when server.frontend_dist points at an existing build directory
+    (e.g. frontend/dist). Off by default, so the backend-only behaviour and the
+    test suite are unaffected. API/docs/ws routes are registered earlier and take
+    precedence; unmatched GET paths fall back to index.html for client routing.
+    """
+    from pathlib import Path
+    from fastapi.staticfiles import StaticFiles
+    from fastapi.responses import FileResponse
+
+    dist_setting = config_service.get("server.frontend_dist")
+    if not dist_setting:
+        return False
+    dist = Path(dist_setting)
+    if not dist.is_absolute():
+        dist = (Path(__file__).resolve().parent.parent / dist_setting).resolve()
+    index = dist / "index.html"
+    if not index.is_file():
+        print(f"WARNING: server.frontend_dist set but no build at {dist}; serving API only")
+        return False
+
+    assets = dist / "assets"
+    if assets.is_dir():
+        app.mount("/assets", StaticFiles(directory=str(assets)), name="assets")
+
+    @app.get("/{full_path:path}", include_in_schema=False)
+    async def spa(full_path: str):
+        # API/ws/docs are matched by earlier routes; everything else is the SPA.
+        candidate = (dist / full_path).resolve()
+        if full_path and candidate.is_file() and dist in candidate.parents:
+            return FileResponse(str(candidate))
+        return FileResponse(str(index))
+
+    print(f"Serving frontend from {dist}")
+    return True
+
+
+if not _mount_frontend():
+    @app.get("/")
+    async def root():
+        """Root endpoint redirect to docs."""
+        return {"message": "TradingBot API", "docs": "/docs"}

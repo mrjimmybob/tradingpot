@@ -31,6 +31,13 @@ def create_mock_bot(
     return bot
 
 
+def _empty_positions():
+    """A mock execute() result modelling an empty positions query."""
+    result = AsyncMock()
+    result.scalars = Mock(return_value=Mock(all=Mock(return_value=[])))
+    return result
+
+
 @pytest.fixture
 def mock_session():
     """Create a mock database session."""
@@ -54,6 +61,7 @@ class TestBalanceCalculation:
         bot = create_mock_bot(budget=10000.0, current_balance=10000.0, total_pnl=0.0)
         
         mock_result = AsyncMock()
+        mock_result.scalars = Mock(return_value=Mock(all=Mock(return_value=[])))
         mock_result.scalar_one_or_none = Mock(return_value=bot)
         mock_session.execute.return_value = mock_result
         
@@ -72,6 +80,7 @@ class TestBalanceCalculation:
         bot = create_mock_bot(budget=10000.0, current_balance=10500.0, total_pnl=500.0, compound_enabled=True)
         
         mock_result = AsyncMock()
+        mock_result.scalars = Mock(return_value=Mock(all=Mock(return_value=[])))
         mock_result.scalar_one_or_none = Mock(return_value=bot)
         mock_session.execute.return_value = mock_result
         
@@ -87,6 +96,7 @@ class TestBalanceCalculation:
         bot = create_mock_bot(budget=10000.0, current_balance=9500.0, total_pnl=-500.0)
         
         mock_result = AsyncMock()
+        mock_result.scalars = Mock(return_value=Mock(all=Mock(return_value=[])))
         mock_result.scalar_one_or_none = Mock(return_value=bot)
         mock_session.execute.return_value = mock_result
         
@@ -102,6 +112,7 @@ class TestBalanceCalculation:
         bot = create_mock_bot(budget=10000.0, current_balance=10000.0, total_pnl=0.0)
         
         mock_result = AsyncMock()
+        mock_result.scalars = Mock(return_value=Mock(all=Mock(return_value=[])))
         mock_result.scalar_one_or_none = Mock(return_value=bot)
         mock_session.execute.return_value = mock_result
         
@@ -116,6 +127,7 @@ class TestBalanceCalculation:
         bot = create_mock_bot(budget=10000.12345678, current_balance=10000.12345678)
         
         mock_result = AsyncMock()
+        mock_result.scalars = Mock(return_value=Mock(all=Mock(return_value=[])))
         mock_result.scalar_one_or_none = Mock(return_value=bot)
         mock_session.execute.return_value = mock_result
         
@@ -134,6 +146,7 @@ class TestDebitCreditOperations:
         bot = create_mock_bot(budget=10000.0, current_balance=10000.0, compound_enabled=True)
         
         mock_result = AsyncMock()
+        mock_result.scalars = Mock(return_value=Mock(all=Mock(return_value=[])))
         mock_result.scalar_one_or_none = Mock(return_value=bot)
         mock_session.execute.return_value = mock_result
         
@@ -149,6 +162,7 @@ class TestDebitCreditOperations:
         bot = create_mock_bot(budget=10000.0, current_balance=10000.0)
         
         mock_result = AsyncMock()
+        mock_result.scalars = Mock(return_value=Mock(all=Mock(return_value=[])))
         mock_result.scalar_one_or_none = Mock(return_value=bot)
         mock_session.execute.return_value = mock_result
         
@@ -164,6 +178,7 @@ class TestDebitCreditOperations:
         bot = create_mock_bot(budget=10000.0, current_balance=10000.0)
         
         mock_result = AsyncMock()
+        mock_result.scalars = Mock(return_value=Mock(all=Mock(return_value=[])))
         mock_result.scalar_one_or_none = Mock(return_value=bot)
         mock_session.execute.return_value = mock_result
         
@@ -177,6 +192,7 @@ class TestDebitCreditOperations:
         bot = create_mock_bot(budget=10000.0, current_balance=10000.0)
         
         mock_result = AsyncMock()
+        mock_result.scalars = Mock(return_value=Mock(all=Mock(return_value=[])))
         mock_result.scalar_one_or_none = Mock(return_value=bot)
         mock_session.execute.return_value = mock_result
         
@@ -192,6 +208,7 @@ class TestDebitCreditOperations:
         bot = create_mock_bot(budget=10000.0, current_balance=10000.0)
         
         mock_result = AsyncMock()
+        mock_result.scalars = Mock(return_value=Mock(all=Mock(return_value=[])))
         mock_result.scalar_one_or_none = Mock(return_value=bot)
         mock_session.execute.return_value = mock_result
         
@@ -206,6 +223,7 @@ class TestDebitCreditOperations:
         bot = create_mock_bot(budget=10000.0, current_balance=10000.0)
         
         mock_result = AsyncMock()
+        mock_result.scalars = Mock(return_value=Mock(all=Mock(return_value=[])))
         mock_result.scalar_one_or_none = Mock(return_value=bot)
         mock_session.execute.return_value = mock_result
         
@@ -226,15 +244,19 @@ class TestBudgetIsolation:
         
         mock_result1 = AsyncMock()
         mock_result1.scalar_one_or_none = Mock(return_value=bot1)
-        
+
         mock_result2 = AsyncMock()
         mock_result2.scalar_one_or_none = Mock(return_value=bot2)
-        
-        mock_session.execute = AsyncMock(side_effect=[mock_result1, mock_result2])
-        
+
+        # get_wallet_status now also queries open positions (CR-1), so each call
+        # issues two executes: bot lookup, then positions.
+        mock_session.execute = AsyncMock(
+            side_effect=[mock_result1, _empty_positions(), mock_result2, _empty_positions()]
+        )
+
         wallet1 = await wallet_service.get_wallet_status(bot_id=1)
         wallet2 = await wallet_service.get_wallet_status(bot_id=2)
-        
+
         assert wallet1.budget == 10000.0
         assert wallet2.budget == 5000.0
     
@@ -248,6 +270,7 @@ class TestBudgetIsolation:
         bot2_initial_balance = bot2.current_balance
         
         mock_result = AsyncMock()
+        mock_result.scalars = Mock(return_value=Mock(all=Mock(return_value=[])))
         mock_result.scalar_one_or_none = Mock(return_value=bot1)
         mock_session.execute.return_value = mock_result
         
@@ -264,12 +287,15 @@ class TestBudgetIsolation:
         
         mock_result1 = AsyncMock()
         mock_result1.scalar_one_or_none = Mock(return_value=bot1)
-        
+
         mock_result2 = AsyncMock()
         mock_result2.scalar_one_or_none = Mock(return_value=bot2)
-        
-        mock_session.execute = AsyncMock(side_effect=[mock_result1, mock_result2])
-        
+
+        # Each validate_trade -> get_wallet_status issues bot + positions queries.
+        mock_session.execute = AsyncMock(
+            side_effect=[mock_result1, _empty_positions(), mock_result2, _empty_positions()]
+        )
+
         validation1 = await wallet_service.validate_trade(bot_id=1, trade_amount=5000.0)
         validation2 = await wallet_service.validate_trade(bot_id=2, trade_amount=5000.0)
         
@@ -287,6 +313,7 @@ class TestInsufficientFundsRejection:
         bot = create_mock_bot(budget=10000.0, current_balance=5000.0, total_pnl=-5000.0, compound_enabled=False)
         
         mock_result = AsyncMock()
+        mock_result.scalars = Mock(return_value=Mock(all=Mock(return_value=[])))
         mock_result.scalar_one_or_none = Mock(return_value=bot)
         mock_session.execute.return_value = mock_result
         
@@ -301,6 +328,7 @@ class TestInsufficientFundsRejection:
         bot = create_mock_bot(budget=10000.0, current_balance=10000.0)
         
         mock_result = AsyncMock()
+        mock_result.scalars = Mock(return_value=Mock(all=Mock(return_value=[])))
         mock_result.scalar_one_or_none = Mock(return_value=bot)
         mock_session.execute.return_value = mock_result
         
@@ -320,6 +348,7 @@ class TestInsufficientFundsRejection:
         bot = create_mock_bot(budget=10000.0, current_balance=0.0)
         
         mock_result = AsyncMock()
+        mock_result.scalars = Mock(return_value=Mock(all=Mock(return_value=[])))
         mock_result.scalar_one_or_none = Mock(return_value=bot)
         mock_session.execute.return_value = mock_result
         
@@ -334,6 +363,7 @@ class TestInsufficientFundsRejection:
         bot = create_mock_bot(budget=10000.0, current_balance=1000.0, total_pnl=-9000.0, compound_enabled=False)
         
         mock_result = AsyncMock()
+        mock_result.scalars = Mock(return_value=Mock(all=Mock(return_value=[])))
         mock_result.scalar_one_or_none = Mock(return_value=bot)
         mock_session.execute.return_value = mock_result
         
@@ -354,6 +384,7 @@ class TestNegativeBalancePrevention:
         bot = create_mock_bot(budget=10000.0, current_balance=100.0)
         
         mock_result = AsyncMock()
+        mock_result.scalars = Mock(return_value=Mock(all=Mock(return_value=[])))
         mock_result.scalar_one_or_none = Mock(return_value=bot)
         mock_session.execute.return_value = mock_result
         
@@ -367,6 +398,7 @@ class TestNegativeBalancePrevention:
         bot = create_mock_bot(budget=10000.0, current_balance=10000.0)
         
         mock_result = AsyncMock()
+        mock_result.scalars = Mock(return_value=Mock(all=Mock(return_value=[])))
         mock_result.scalar_one_or_none = Mock(return_value=bot)
         mock_session.execute.return_value = mock_result
         
@@ -384,6 +416,7 @@ class TestNegativeBalancePrevention:
         bot = create_mock_bot(budget=10000.0, current_balance=0.0000001, total_pnl=-9999.9999999, compound_enabled=False)
         
         mock_result = AsyncMock()
+        mock_result.scalars = Mock(return_value=Mock(all=Mock(return_value=[])))
         mock_result.scalar_one_or_none = Mock(return_value=bot)
         mock_session.execute.return_value = mock_result
         
@@ -402,6 +435,7 @@ class TestEdgeCases:
         bot = create_mock_bot(budget=10000.0, current_balance=10000.0)
         
         mock_result = AsyncMock()
+        mock_result.scalars = Mock(return_value=Mock(all=Mock(return_value=[])))
         mock_result.scalar_one_or_none = Mock(return_value=bot)
         mock_session.execute.return_value = mock_result
         
@@ -415,6 +449,7 @@ class TestEdgeCases:
         bot = create_mock_bot(budget=1000000.0, current_balance=1000000.0)
         
         mock_result = AsyncMock()
+        mock_result.scalars = Mock(return_value=Mock(all=Mock(return_value=[])))
         mock_result.scalar_one_or_none = Mock(return_value=bot)
         mock_session.execute.return_value = mock_result
         
@@ -429,6 +464,7 @@ class TestEdgeCases:
         bot_non_compound = create_mock_bot(budget=10000.0, current_balance=10000.0, compound_enabled=False)
         
         mock_result = AsyncMock()
+        mock_result.scalars = Mock(return_value=Mock(all=Mock(return_value=[])))
         mock_result.scalar_one_or_none = Mock(return_value=bot_compound)
         mock_session.execute.return_value = mock_result
         
@@ -448,6 +484,7 @@ class TestEdgeCases:
         bot = create_mock_bot(budget=10000.0, current_balance=10000.0)
         
         mock_result = AsyncMock()
+        mock_result.scalars = Mock(return_value=Mock(all=Mock(return_value=[])))
         mock_result.scalar_one_or_none = Mock(return_value=bot)
         mock_session.execute.return_value = mock_result
         
@@ -464,6 +501,7 @@ class TestEdgeCases:
         bot = create_mock_bot(budget=10000.0, current_balance=8000.0, total_pnl=-2000.0)
         
         mock_result = AsyncMock()
+        mock_result.scalars = Mock(return_value=Mock(all=Mock(return_value=[])))
         mock_result.scalar_one_or_none = Mock(return_value=bot)
         mock_session.execute.return_value = mock_result
         
@@ -479,6 +517,7 @@ class TestEdgeCases:
         bot = create_mock_bot(budget=10000.0, current_balance=8000.0)
         
         mock_result = AsyncMock()
+        mock_result.scalars = Mock(return_value=Mock(all=Mock(return_value=[])))
         mock_result.scalar_one_or_none = Mock(return_value=bot)
         mock_session.execute.return_value = mock_result
         
@@ -492,6 +531,7 @@ class TestEdgeCases:
     async def test_bot_not_found(self, wallet_service, mock_session):
         """Bot not found."""
         mock_result = AsyncMock()
+        mock_result.scalars = Mock(return_value=Mock(all=Mock(return_value=[])))
         mock_result.scalar_one_or_none = Mock(return_value=None)
         mock_session.execute.return_value = mock_result
         
@@ -509,6 +549,7 @@ class TestCompoundModeLogic:
         bot = create_mock_bot(budget=10000.0, current_balance=10000.0, total_pnl=0.0, compound_enabled=True)
         
         mock_result = AsyncMock()
+        mock_result.scalars = Mock(return_value=Mock(all=Mock(return_value=[])))
         mock_result.scalar_one_or_none = Mock(return_value=bot)
         mock_session.execute.return_value = mock_result
         
@@ -524,6 +565,7 @@ class TestCompoundModeLogic:
         bot = create_mock_bot(budget=10000.0, current_balance=10000.0, total_pnl=0.0, compound_enabled=False)
         
         mock_result = AsyncMock()
+        mock_result.scalars = Mock(return_value=Mock(all=Mock(return_value=[])))
         mock_result.scalar_one_or_none = Mock(return_value=bot)
         mock_session.execute.return_value = mock_result
         
@@ -539,6 +581,7 @@ class TestCompoundModeLogic:
         bot = create_mock_bot(budget=10000.0, current_balance=10000.0, total_pnl=0.0, compound_enabled=False)
         
         mock_result = AsyncMock()
+        mock_result.scalars = Mock(return_value=Mock(all=Mock(return_value=[])))
         mock_result.scalar_one_or_none = Mock(return_value=bot)
         mock_session.execute.return_value = mock_result
         
@@ -554,6 +597,7 @@ class TestCompoundModeLogic:
         bot = create_mock_bot(budget=10000.0, current_balance=10000.0, compound_enabled=False)
         
         mock_result = AsyncMock()
+        mock_result.scalars = Mock(return_value=Mock(all=Mock(return_value=[])))
         mock_result.scalar_one_or_none = Mock(return_value=bot)
         mock_session.execute.return_value = mock_result
         
@@ -572,6 +616,7 @@ class TestPnLSummary:
         bot = create_mock_bot(budget=10000.0, current_balance=10500.0, total_pnl=500.0, compound_enabled=True)
         
         mock_result = AsyncMock()
+        mock_result.scalars = Mock(return_value=Mock(all=Mock(return_value=[])))
         mock_result.scalar_one_or_none = Mock(return_value=bot)
         mock_session.execute.return_value = mock_result
         
@@ -589,6 +634,7 @@ class TestPnLSummary:
         bot = create_mock_bot(budget=10000.0, current_balance=9000.0, total_pnl=-1000.0)
         
         mock_result = AsyncMock()
+        mock_result.scalars = Mock(return_value=Mock(all=Mock(return_value=[])))
         mock_result.scalar_one_or_none = Mock(return_value=bot)
         mock_session.execute.return_value = mock_result
         
@@ -607,6 +653,7 @@ class TestBudgetUpdateLogic:
         bot = create_mock_bot(budget=10000.0, current_balance=10000.0)
         
         mock_result = AsyncMock()
+        mock_result.scalars = Mock(return_value=Mock(all=Mock(return_value=[])))
         mock_result.scalar_one_or_none = Mock(return_value=bot)
         mock_session.execute.return_value = mock_result
         
@@ -621,6 +668,7 @@ class TestBudgetUpdateLogic:
         bot = create_mock_bot(budget=10000.0, current_balance=10000.0)
         
         mock_result = AsyncMock()
+        mock_result.scalars = Mock(return_value=Mock(all=Mock(return_value=[])))
         mock_result.scalar_one_or_none = Mock(return_value=bot)
         mock_session.execute.return_value = mock_result
         
@@ -635,6 +683,7 @@ class TestBudgetUpdateLogic:
         bot = create_mock_bot(budget=10000.0, current_balance=5000.0)
         
         mock_result = AsyncMock()
+        mock_result.scalars = Mock(return_value=Mock(all=Mock(return_value=[])))
         mock_result.scalar_one_or_none = Mock(return_value=bot)
         mock_session.execute.return_value = mock_result
         

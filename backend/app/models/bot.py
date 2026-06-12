@@ -26,6 +26,10 @@ class Bot(Base):
     trading_pair = Column(String(50), nullable=False)
     strategy = Column(String(50), nullable=False)
     strategy_params = Column(JSON, default=dict)
+    # Per-strategy runtime state (trailing stops, cooldowns, price history, ...),
+    # kept SEPARATE from the user-facing strategy_params config. Persisted on
+    # shutdown and restored on resume so restarts are deterministic.
+    strategy_state = Column(JSON, nullable=True)
 
     # Virtual wallet
     budget = Column(Float, nullable=False)

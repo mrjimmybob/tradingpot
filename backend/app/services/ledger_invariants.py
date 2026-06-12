@@ -84,8 +84,18 @@ class LedgerInvariantService:
     - Scoped: Validate one trade_id at a time
     """
 
-    # Floating point tolerance for all comparisons
-    TOLERANCE = 1e-8
+    # Floating point tolerance for all comparisons.
+    # H-2: 1e-8 is too tight for float money summed over thousands of trades -
+    # accumulated rounding can exceed it and raise a *false* inconsistency that
+    # halts the bot. Use a money-safe absolute floor plus a relative tolerance
+    # that scales with the balance magnitude.
+    TOLERANCE = 1e-6
+    REL_TOLERANCE = 1e-9
+
+    def _consistency_tolerance(self, *magnitudes: float) -> float:
+        """Tolerance scaled to the largest balance involved in a comparison."""
+        scale = max((abs(m) for m in magnitudes), default=0.0)
+        return max(self.TOLERANCE, scale * self.REL_TOLERANCE)
 
     def __init__(self, session: AsyncSession):
         """Initialize the validator.
@@ -301,7 +311,8 @@ class LedgerInvariantService:
                 bot_id=trade.bot_id
             )
 
-            if abs(reconstructed - ledger_balance) > self.TOLERANCE:
+            tolerance = self._consistency_tolerance(reconstructed, ledger_balance)
+            if abs(reconstructed - ledger_balance) > tolerance:
                 # If balance is also negative, raise NegativeBalanceError for clearer error message
                 if ledger_balance < -self.TOLERANCE:
                     raise NegativeBalanceError(

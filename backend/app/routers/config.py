@@ -111,6 +111,20 @@ STRATEGIES = [
             "allowed_regimes": {"type": "array", "default": ["volatility_expanding"], "description": "Allowed volatility regimes (contracting, normal, expanding)"},
         }
     ),
+    StrategyInfo(
+        name="funding_carry",
+        display_name="Funding Carry (Funding-Aware Trend)",
+        description="Long-only SPOT strategy that uses perpetual funding rates as a positioning/crowdedness filter on top of a trend filter - enters only when BOTH funding and market regime are favourable. Does not short, hedge, or harvest funding directly.",
+        parameters={
+            "min_funding_rate": {"type": "number", "default": -0.0005, "min": -0.01, "max": 0.01, "description": "Lower bound of favourable funding band (fraction per interval, e.g. -0.0005 = -0.05%)"},
+            "max_funding_rate": {"type": "number", "default": 0.0005, "min": -0.01, "max": 0.01, "description": "Upper bound of favourable funding band (fraction per interval, e.g. 0.0005 = 0.05%)"},
+            "funding_lookback_periods": {"type": "number", "default": 3, "min": 1, "max": 100, "description": "Funding windows to average for the signal (3 ~= 1 day at 8h)"},
+            "allowed_regimes": {"type": "array", "default": ["trend_up"], "description": "Favourable trend regimes for entry (trend_up, trend_down, trend_flat)"},
+            "max_allocation_percent": {"type": "number", "default": 20, "min": 1, "max": 100, "description": "Maximum % of balance allocated to a position"},
+            "cooldown_seconds": {"type": "number", "default": 300, "min": 0, "max": 3600, "description": "Seconds to wait after exit before re-entry (anti-churn)"},
+            "funding_refresh_seconds": {"type": "number", "default": 300, "min": 30, "max": 3600, "description": "Funding-rate cache TTL in seconds (limits API calls)"},
+        }
+    ),
     # Note: TWAP and VWAP are execution algorithms, not alpha strategies.
     # They are intentionally excluded from strategy selection.
     # TWAP/VWAP exist only in the execution layer for order execution methods.

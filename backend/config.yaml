@@ -1,5 +1,7 @@
 # TradingBot Configuration
-# This file is validated on server startup
+# This file is validated on server startup. Unknown keys are rejected, so keep
+# options you are not using COMMENTED OUT. Values shown commented are the
+# built-in defaults; uncomment only to override.
 
 server:
   # Loopback by default. To expose beyond this machine you MUST set an API
@@ -9,8 +11,13 @@ server:
   port: 8000
   debug: false
   # api_token: ""  # prefer the TRADINGBOT_API_TOKEN environment variable
+  # cors_origins:  # browser origins allowed to call the API (defaults to local dev)
+  #   - "http://localhost:5173"
+  # frontend_dist: "../frontend/dist"  # serve the built web UI from the API origin
 
 database:
+  # Relative SQLite paths are anchored to the backend directory automatically,
+  # so the DB location is stable regardless of the process working directory.
   url: "sqlite+aiosqlite:///./tradingbot.db"
 
 trading:
@@ -22,8 +29,17 @@ trading:
   default_stop_loss_percent: 10.0
   default_daily_loss_limit: 500.0
 
+  # --- Reliability / operability (defaults shown; uncomment to override) ---
+  # reconciliation_interval_seconds: 300   # live balance reconciliation cadence
+  # max_consecutive_failures: 10           # loop errors before a bot is paused + alerted
+  # failure_backoff_max_seconds: 60        # cap on exponential backoff between failures
+  # state_checkpoint_seconds: 60           # how often strategy/sim state is persisted in-loop
+  # backup_interval_seconds: 3600          # periodic SQLite backup cadence
+  # ticker_cache_ttl_seconds: 2.0          # shared dry-run ticker cache TTL (raise for many bots)
+
 exchange:
-  # Exchange API configuration (for live trading)
+  # Exchange API configuration (LIVE trading only; not needed for dry run).
+  # Prefer MEXC_API_KEY / MEXC_API_SECRET environment variables.
   api_key: ""
   api_secret: ""
   sandbox_mode: true

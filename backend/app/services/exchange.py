@@ -12,6 +12,8 @@ from enum import Enum
 import ccxt.async_support as ccxt
 import yaml
 
+from ..utils import utcnow, ms_to_utc
+
 logger = logging.getLogger(__name__)
 
 
@@ -75,6 +77,20 @@ class Ticker:
     last: float
     volume: float
     timestamp: datetime
+
+
+@dataclass
+class FundingRate:
+    """Perpetual-swap funding rate observation.
+
+    Funding rates exist only on perpetual swap markets (not spot). The rate is
+    a per-interval fraction (e.g. 0.0001 = 0.01% paid every interval_hours).
+    Positive = longs pay shorts; negative = shorts pay longs.
+    """
+    symbol: str
+    funding_rate: float
+    timestamp: datetime
+    interval_hours: float = 8.0
 
 
 class ExchangeService:
@@ -254,11 +270,137 @@ class ExchangeService:
                 ask=ticker.get("ask", 0) or 0,
                 last=ticker.get("last", 0) or 0,
                 volume=ticker.get("baseVolume", 0) or 0,
-                timestamp=datetime.fromtimestamp(ticker["timestamp"] / 1000) if ticker.get("timestamp") else datetime.utcnow(),
+                timestamp=ms_to_utc(ticker["timestamp"]) if ticker.get("timestamp") else utcnow(),
             )
         except Exception as e:
             logger.error(f"Failed to get ticker for {symbol}: {e}")
             return None
+
+    @staticmethod
+    def to_swap_symbol(symbol: str) -> str:
+        """Map a spot pair to its linear perpetual (swap) symbol.
+
+        Funding rates only exist on perpetual swaps, so funding lookups for a
+        spot pair must target the swap market. In ccxt unified notation the
+        linear perpetual for ``BASE/QUOTE`` is ``BASE/QUOTE:QUOTE`` (e.g.
+        ``BTC/USDT`` -> ``BTC/USDT:USDT``). A symbol that already names a
+        contract (contains ``:``) is returned unchanged.
+        """
+        if ":" in symbol or "/" not in symbol:
+            return symbol
+        _, quote = symbol.split("/", 1)
+        return f"{symbol}:{quote}"
+
+    def _supports(self, capability: str) -> bool:
+        """Whether the connected ccxt exchange advertises a capability."""
+        if not self.exchange:
+            return False
+        has = getattr(self.exchange, "has", {}) or {}
+        return bool(has.get(capability))
+
+    def supports_funding_rates(self) -> bool:
+        """Whether the exchange exposes funding-rate history (perp markets)."""
+        return self._supports("fetchFundingRateHistory")
+
+    @staticmethod
+    def _parse_interval_hours(interval: Any) -> float:
+        """Parse a ccxt funding interval (e.g. '8h', '4h') to hours.
+
+        Defaults to 8.0 (the most common perpetual funding interval) when the
+        exchange does not report one.
+        """
+        if isinstance(interval, str) and interval.endswith("h"):
+            try:
+                return float(interval[:-1])
+            except ValueError:
+                pass
+        return 8.0
+
+    def _parse_funding_rate(
+        self, data: Dict[str, Any], fallback_symbol: str
+    ) -> Optional[FundingRate]:
+        """Parse a ccxt funding-rate structure into a FundingRate."""
+        if not isinstance(data, dict):
+            return None
+        rate = data.get("fundingRate")
+        if rate is None:
+            return None
+        ts = data.get("timestamp")
+        when = ms_to_utc(ts) if isinstance(ts, (int, float)) else utcnow()
+        return FundingRate(
+            symbol=data.get("symbol") or fallback_symbol,
+            funding_rate=float(rate),
+            timestamp=when,
+            interval_hours=self._parse_interval_hours(data.get("interval")),
+        )
+
+    async def get_funding_rate(self, symbol: str) -> Optional[FundingRate]:
+        """Get the current funding rate for a perpetual symbol.
+
+        Args:
+            symbol: Swap symbol (e.g. 'BTC/USDT:USDT'). Use to_swap_symbol() to
+                derive it from a spot pair.
+
+        Returns:
+            FundingRate or None if unavailable/unsupported.
+        """
+        if not self.is_connected():
+            logger.error("Not connected to exchange")
+            return None
+        if not self._supports("fetchFundingRate"):
+            logger.warning(
+                f"Exchange '{self.exchange_id}' does not expose current funding rates"
+            )
+            return None
+
+        try:
+            data = await self._execute_with_retry(
+                self.exchange.fetch_funding_rate, symbol
+            )
+            return self._parse_funding_rate(data, symbol)
+        except Exception as e:
+            logger.error(f"Failed to get funding rate for {symbol}: {e}")
+            return None
+
+    async def get_funding_rate_history(
+        self,
+        symbol: str,
+        limit: int = 200,
+        since: Optional[int] = None,
+    ) -> List[FundingRate]:
+        """Get historical funding rates for a perpetual symbol.
+
+        Args:
+            symbol: Swap symbol (e.g. 'BTC/USDT:USDT').
+            limit: Maximum number of records to fetch.
+            since: Optional start timestamp in milliseconds.
+
+        Returns:
+            A list of FundingRate ordered oldest-first, or an empty list if the
+            data is unavailable or the exchange does not support funding history.
+        """
+        if not self.is_connected():
+            logger.error("Not connected to exchange")
+            return []
+        if not self.supports_funding_rates():
+            logger.warning(
+                f"Exchange '{self.exchange_id}' does not expose funding-rate history"
+            )
+            return []
+
+        try:
+            rows = await self._execute_with_retry(
+                self.exchange.fetch_funding_rate_history, symbol, since, limit
+            )
+            history = []
+            for row in rows or []:
+                parsed = self._parse_funding_rate(row, symbol)
+                if parsed:
+                    history.append(parsed)
+            return history
+        except Exception as e:
+            logger.error(f"Failed to get funding rate history for {symbol}: {e}")
+            return []
 
     async def get_balance(self, currency: str = "USDT") -> Optional[Balance]:
         """Get account balance for a currency.
@@ -410,8 +552,9 @@ class ExchangeService:
                 side.value,
                 amount,
             )
-            # Audit trail for live execution: keep the full raw response
-            logger.info(f"Raw exchange response for market {side.value} {symbol}: {order}")
+            # Audit trail for live execution: keep the full raw response at DEBUG
+            # so verbose/potentially sensitive payloads do not flood INFO logs.
+            logger.debug(f"Raw exchange response for market {side.value} {symbol}: {order}")
             return self._parse_order(order)
         except Exception as e:
             logger.error(f"Failed to place market {side.value} order for {symbol}: {e}")
@@ -457,8 +600,9 @@ class ExchangeService:
                 amount,
                 price,
             )
-            # Audit trail for live execution: keep the full raw response
-            logger.info(f"Raw exchange response for limit {side.value} {symbol}: {order}")
+            # Audit trail for live execution: keep the full raw response at DEBUG
+            # so verbose/potentially sensitive payloads do not flood INFO logs.
+            logger.debug(f"Raw exchange response for limit {side.value} {symbol}: {order}")
             return self._parse_order(order)
         except Exception as e:
             logger.error(f"Failed to place limit {side.value} order for {symbol}: {e}")
@@ -511,6 +655,42 @@ class ExchangeService:
             logger.error(f"Failed to get order {order_id}: {e}")
             return None
 
+    async def get_recent_orders(
+        self, symbol: str, limit: int = 50
+    ) -> List[ExchangeOrder]:
+        """Get recent (closed/finalized) orders for a symbol.
+
+        Read-only. Used by startup recovery to reconcile the local database
+        against the exchange's record of truth, so a fill that never reached the
+        database (e.g. a crash between fill and commit) can be re-imported.
+
+        Returns an empty list if the exchange exposes neither fetchClosedOrders
+        nor fetchOrders, or on any error.
+        """
+        if not self.is_connected():
+            logger.error("Not connected to exchange")
+            return []
+
+        try:
+            if self._supports("fetchClosedOrders"):
+                rows = await self._execute_with_retry(
+                    self.exchange.fetch_closed_orders, symbol, None, limit
+                )
+            elif self._supports("fetchOrders"):
+                rows = await self._execute_with_retry(
+                    self.exchange.fetch_orders, symbol, None, limit
+                )
+            else:
+                logger.warning(
+                    f"Exchange '{self.exchange_id}' exposes no closed/recent order "
+                    "history; cannot reconcile orders against the exchange."
+                )
+                return []
+            return [self._parse_order(o) for o in rows or []]
+        except Exception as e:
+            logger.error(f"Failed to get recent orders for {symbol}: {e}")
+            return []
+
     async def get_open_orders(self, symbol: Optional[str] = None) -> List[ExchangeOrder]:
         """Get all open orders.
 
@@ -547,7 +727,7 @@ class ExchangeService:
             fee=fee.get("cost", 0) or 0,
             fee_currency=fee.get("currency", "USDT"),
             status=order.get("status", "unknown"),
-            timestamp=datetime.fromtimestamp(order["timestamp"] / 1000) if order.get("timestamp") else datetime.utcnow(),
+            timestamp=ms_to_utc(order["timestamp"]) if order.get("timestamp") else utcnow(),
             filled=order.get("filled", 0) or 0,
             remaining=order.get("remaining", 0) or 0,
         )
@@ -579,20 +759,31 @@ class SimulatedExchangeService(ExchangeService):
     get_ticker returns None and the caller must skip trading.
     """
 
-    def __init__(self, initial_balance: float = 10000.0, ticker_cache_ttl: float = 2.0):
+    # Cap on retained simulated orders to bound memory over long runs (L-A).
+    MAX_SIMULATED_ORDERS = 2000
+
+    def __init__(
+        self,
+        initial_balance: float = 10000.0,
+        ticker_cache_ttl: float = 2.0,
+        ticker_cache: Optional[Dict[str, tuple]] = None,
+    ):
         """Initialize simulated exchange.
 
         Args:
             initial_balance: Initial USDT balance for simulation
             ticker_cache_ttl: Seconds to cache tickers, limiting public API
                 load from per-second bot loops
+            ticker_cache: Optional shared ticker cache. When several dry-run bots
+                pass the same dict, identical-symbol ticker polls are deduplicated
+                across bots, reducing public-API load (L-C).
         """
         super().__init__()
         self._simulated_balance = {"USDT": initial_balance}
         self._simulated_orders: Dict[str, ExchangeOrder] = {}
         self._order_counter = 0
         self._ticker_cache_ttl = ticker_cache_ttl
-        self._ticker_cache: Dict[str, tuple] = {}
+        self._ticker_cache: Dict[str, tuple] = ticker_cache if ticker_cache is not None else {}
 
     async def connect(self) -> bool:
         """Connect to the exchange's public API for real market data."""
@@ -666,11 +857,16 @@ class SimulatedExchangeService(ExchangeService):
             fee=fee,
             fee_currency=quote,
             status="closed",
-            timestamp=datetime.utcnow(),
+            timestamp=utcnow(),
             filled=amount,
             remaining=0,
         )
         self._simulated_orders[order.id] = order
+        # L-A: bound memory - evict the oldest order once over the cap. The dict
+        # is insertion-ordered, so the first key is the oldest. Recovery and
+        # get_recent_orders only ever look at the most recent orders.
+        if len(self._simulated_orders) > self.MAX_SIMULATED_ORDERS:
+            del self._simulated_orders[next(iter(self._simulated_orders))]
         return order
 
     async def place_limit_order(
@@ -695,6 +891,37 @@ class SimulatedExchangeService(ExchangeService):
         """Get simulated order."""
         return self._simulated_orders.get(order_id)
 
+    async def get_recent_orders(
+        self, symbol: str, limit: int = 50
+    ) -> List[ExchangeOrder]:
+        """Return simulated orders for a symbol (most recent last)."""
+        orders = [o for o in self._simulated_orders.values() if o.symbol == symbol]
+        return orders[-limit:]
+
     def set_balance(self, currency: str, amount: float) -> None:
         """Set simulated balance for testing."""
         self._simulated_balance[currency] = amount
+
+    def export_state(self) -> Dict[str, Any]:
+        """Snapshot simulated balances + counter for persistence (CR-2).
+
+        Dry-run balances live only in memory; without persisting them a restart
+        resets holdings to the initial budget, desyncing the DB (positions/orders)
+        from the simulator (sells then fail, buys reset). Persisting this snapshot
+        lets a dry run resume deterministically across restarts.
+        """
+        return {
+            "balances": dict(self._simulated_balance),
+            "order_counter": self._order_counter,
+        }
+
+    def import_state(self, state: Dict[str, Any]) -> None:
+        """Restore simulated balances + counter from a saved snapshot (CR-2)."""
+        if not isinstance(state, dict):
+            return
+        balances = state.get("balances")
+        if isinstance(balances, dict) and balances:
+            self._simulated_balance = {k: float(v) for k, v in balances.items()}
+        counter = state.get("order_counter")
+        if isinstance(counter, int):
+            self._order_counter = counter

@@ -9,11 +9,18 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..models import get_session, Bot, BotStatus, Order, Position
 from ..services import trading_engine
-from ..services.trading_engine import BotStartError
+from ..services.trading_engine import BotStartError, validate_funding_carry_params
 from ..services.logging_service import ensure_bot_log_directory
 from .config import STRATEGIES
 
 router = APIRouter()
+
+
+# Per-strategy cross-field validators (beyond the per-field schema checks).
+# Keyed by strategy name; each returns a list of error strings.
+_STRATEGY_PARAM_VALIDATORS = {
+    "funding_carry": validate_funding_carry_params,
+}
 
 
 def validate_strategy_params(strategy: str, params: dict) -> list[str]:
@@ -72,6 +79,12 @@ def validate_strategy_params(strategy: str, params: dict) -> list[str]:
         elif param_type == "array":
             if not isinstance(param_value, list):
                 errors.append(f"Parameter '{param_name}' must be an array, got {type(param_value).__name__}")
+
+    # Cross-field / per-strategy validation (e.g. funding_carry band ordering),
+    # which the per-field schema checks above cannot express. (M3)
+    extra_validator = _STRATEGY_PARAM_VALIDATORS.get(strategy)
+    if extra_validator:
+        errors.extend(extra_validator(params))
 
     return errors
 
@@ -349,6 +362,9 @@ async def delete_bot(
 
     await session.delete(bot)
     await session.commit()
+
+    # L4: release any in-memory strategy state held for this bot.
+    trading_engine.cleanup_bot_state(bot_id)
 
 
 @router.post("/{bot_id}/start", response_model=BotResponse)

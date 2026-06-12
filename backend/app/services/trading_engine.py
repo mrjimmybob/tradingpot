@@ -28,6 +28,7 @@ from .logging_service import (
     ensure_bot_log_directory,
 )
 from .execution_cost_model import ExecutionCostModel, get_cost_model
+from .funding_diagnostic import compute_funding_stats
 from .portfolio_risk import PortfolioRiskService
 from .strategy_capacity import StrategyCapacityService
 from .ledger_writer import LedgerWriterService
@@ -35,6 +36,82 @@ from .accounting import TradeRecorderService, FIFOTaxEngine, CSVExportService
 from .ledger_invariants import LedgerInvariantService, ValidationError
 
 logger = logging.getLogger(__name__)
+
+
+# === STRATEGY STATE PERSISTENCE (C3/H1, M5) ===
+# Per-bot, in-memory strategy state attributes that must survive a restart so
+# resumed bots keep their risk state (trailing stops, locked entry ATR,
+# cooldowns) and price history. Stored in Bot.strategy_state (a dedicated JSON
+# column), NEVER in strategy_params (which is user config). Transient caches
+# (e.g. _funding_cache) are intentionally excluded - they are safe to rebuild.
+_PERSISTED_STATE_ATTRS = (
+    "_grid_states",
+    "_mean_reversion_states",
+    "_trend_states",
+    "_funding_states",
+    "_volatility_breakout_states",
+    "_twap_states",
+    "_vwap_states",
+    "_auto_states",
+)
+
+# Largest price-history window any strategy needs (trend_following long EMA).
+# Persisting at least this many points means a resumed bot does not sit in a
+# "collecting data" warmup while holding an unmanaged open position (H1).
+_PERSISTED_PRICE_HISTORY_LEN = 250
+
+# Legacy singular keys older builds stored inside strategy_params. Mapped to the
+# current state attributes for backward-compatible restore.
+_LEGACY_STATE_KEYS = {
+    "_grid_state": "_grid_states",
+    "_twap_state": "_twap_states",
+    "_vwap_state": "_vwap_states",
+    "_auto_state": "_auto_states",
+}
+
+# Valid alpha strategies for rotation. Execution algorithms (twap/vwap) and the
+# auto_mode meta-policy are intentionally excluded: rotating into twap/vwap would
+# silently disable the bot (no executor), and auto_mode would nest selectors.
+_ALPHA_STRATEGIES = (
+    "dca_accumulator",
+    "adaptive_grid",
+    "mean_reversion",
+    "trend_following",
+    "volatility_breakout",
+    "funding_carry",
+)
+
+_DT_TAG = "__dt__"
+
+
+def _to_jsonable(obj):
+    """Convert strategy state to JSON-safe primitives, tagging datetimes.
+
+    Strategy state holds datetime objects (entry/exit times) that a plain JSON
+    column cannot serialize. Datetimes become {"__dt__": isoformat}; dicts and
+    lists are converted recursively.
+    """
+    if isinstance(obj, datetime):
+        return {_DT_TAG: obj.isoformat()}
+    if isinstance(obj, dict):
+        return {k: _to_jsonable(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_to_jsonable(v) for v in obj]
+    return obj
+
+
+def _from_jsonable(obj):
+    """Inverse of _to_jsonable: restore tagged datetimes to datetime objects."""
+    if isinstance(obj, dict):
+        if set(obj.keys()) == {_DT_TAG}:
+            try:
+                return datetime.fromisoformat(obj[_DT_TAG])
+            except (ValueError, TypeError):
+                return None
+        return {k: _from_jsonable(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_from_jsonable(v) for v in obj]
+    return obj
 
 
 class BotStartError(Exception):
@@ -69,6 +146,52 @@ class TradeSignal:
     execution_params: Optional[dict] = None  # Execution-specific parameters
 
 
+def validate_funding_carry_params(params: dict) -> list:
+    """Validate funding_carry strategy parameters.
+
+    Returns a list of human-readable error strings (empty when valid). Kept as a
+    pure function so it can be reused by configuration checks and tests without
+    constructing an engine. Missing keys are valid (defaults apply).
+
+    Args:
+        params: The bot's strategy_params dict.
+    """
+    errors = []
+    min_funding = params.get("min_funding_rate")
+    max_funding = params.get("max_funding_rate")
+    lookback = params.get("funding_lookback_periods")
+    max_alloc = params.get("max_allocation_percent")
+    cooldown = params.get("cooldown_seconds")
+    refresh = params.get("funding_refresh_seconds")
+    allowed = params.get("allowed_regimes")
+
+    if (
+        isinstance(min_funding, (int, float))
+        and isinstance(max_funding, (int, float))
+        and min_funding > max_funding
+    ):
+        errors.append(
+            f"min_funding_rate ({min_funding}) must not exceed "
+            f"max_funding_rate ({max_funding})"
+        )
+    if lookback is not None and (not isinstance(lookback, int) or lookback < 1):
+        errors.append("funding_lookback_periods must be an integer >= 1")
+    if max_alloc is not None and (
+        not isinstance(max_alloc, (int, float)) or not 0 < max_alloc <= 100
+    ):
+        errors.append("max_allocation_percent must be in (0, 100]")
+    if cooldown is not None and (not isinstance(cooldown, (int, float)) or cooldown < 0):
+        errors.append("cooldown_seconds must be >= 0")
+    if refresh is not None and (not isinstance(refresh, (int, float)) or refresh <= 0):
+        errors.append("funding_refresh_seconds must be > 0")
+    if allowed is not None and (
+        not isinstance(allowed, list) or not all(isinstance(r, str) for r in allowed)
+    ):
+        errors.append("allowed_regimes must be a list of regime strings")
+
+    return errors
+
+
 class TradingEngine:
     """Engine for executing trading bots."""
 
@@ -79,6 +202,23 @@ class TradingEngine:
         self._stop_flags: Dict[int, bool] = {}
         self._bot_loggers: Dict[int, BotLoggingService] = {}
         self._last_reconciliation: Optional[datetime] = None
+        # Throttle for in-loop pending-order resolution (per bot).
+        self._last_pending_resolve: Dict[int, datetime] = {}
+        # Throttle for in-loop strategy/simulator state checkpointing (per bot).
+        self._last_checkpoint: Dict[int, datetime] = {}
+        # Shared ticker cache for dry-run bots: dedupes identical-symbol public
+        # API polls across bots in this process (L-C).
+        self._shared_ticker_cache: Dict[str, tuple] = {}
+
+    def _make_simulated_exchange(self, budget: float) -> SimulatedExchangeService:
+        """Construct a dry-run exchange wired to the shared ticker cache (L-C)."""
+        from .config import config_service
+        ttl = float(config_service.get("trading.ticker_cache_ttl_seconds") or 2.0)
+        return SimulatedExchangeService(
+            initial_balance=budget,
+            ticker_cache_ttl=ttl,
+            ticker_cache=self._shared_ticker_cache,
+        )
 
     async def start_bot(self, bot_id: int) -> bool:
         """Start a trading bot.
@@ -107,7 +247,7 @@ class TradingEngine:
 
             # Create exchange service
             if bot.is_dry_run:
-                exchange = SimulatedExchangeService(initial_balance=bot.budget)
+                exchange = self._make_simulated_exchange(bot.budget)
             else:
                 exchange = ExchangeService()
                 if not exchange.has_credentials():
@@ -223,6 +363,9 @@ class TradingEngine:
             await self._exchange_services[bot_id].disconnect()
             del self._exchange_services[bot_id]
 
+        # L4: a stopped bot does not auto-resume; release its in-memory state.
+        self._cleanup_bot_state(bot_id)
+
         logger.info(f"Stopped bot {bot_id}")
         return True
 
@@ -258,6 +401,19 @@ class TradingEngine:
             bot_id: The bot ID to run
         """
         logger.info(f"Bot {bot_id}: Starting execution loop")
+
+        # M1/M2: consecutive-failure circuit breaker with exponential backoff.
+        # Reset on every successful iteration; on the threshold, pause + alert
+        # instead of spinning at 1 Hz forever.
+        from .config import config_service
+        max_failures = int(config_service.get("trading.max_consecutive_failures") or 10)
+        max_backoff = float(config_service.get("trading.failure_backoff_max_seconds") or 60)
+        checkpoint_interval = float(config_service.get("trading.state_checkpoint_seconds") or 60)
+        consecutive_failures = 0
+        last_error = ""
+
+        def _backoff(n: int) -> float:
+            return min(1.0 * (2 ** max(0, n - 1)), max_backoff)
 
         while not self._stop_flags.get(bot_id, True):
             try:
@@ -315,38 +471,84 @@ class TradingEngine:
                     # Get current market data
                     ticker = await exchange.get_ticker(bot.trading_pair)
                     if not ticker:
-                        logger.warning(f"Bot {bot_id}: Could not get ticker for {bot.trading_pair}")
-                        await asyncio.sleep(5)
+                        # M2: a persistent missing ticker (often an exchange
+                        # disconnect) feeds the failure breaker so a sustained
+                        # outage pauses + alerts instead of looping silently.
+                        consecutive_failures += 1
+                        last_error = f"market data unavailable for {bot.trading_pair}"
+                        logger.warning(
+                            f"Bot {bot_id}: {last_error} "
+                            f"(failure {consecutive_failures}/{max_failures})"
+                        )
+                        if consecutive_failures >= max_failures:
+                            await self._pause_bot_for_failures(
+                                bot_id, consecutive_failures, last_error
+                            )
+                            break
+                        await asyncio.sleep(_backoff(consecutive_failures))
                         continue
 
                     # Generate trading signal from strategy
                     signal = await self._execute_strategy(bot, ticker.last, session)
 
                     if signal and signal.action != "hold":
-                        # Validate trade with virtual wallet
-                        validation = await wallet.validate_trade(bot_id, signal.amount)
+                        # CR-1: budget validation gates BUYS only (capital
+                        # deployment). Sells reduce exposure and must never be
+                        # blocked by the budget; they are validated against the
+                        # open position inside _execute_trade.
+                        proceed = True
+                        if signal.action == "buy":
+                            validation = await wallet.validate_trade(bot_id, signal.amount)
+                            proceed = validation.is_valid
+                            if not proceed:
+                                logger.warning(
+                                    f"Bot {bot_id}: Trade rejected - {validation.reason}"
+                                )
 
-                        if validation.is_valid:
+                        if proceed:
                             # Execute trade
-                            order = await self._execute_trade(
+                            await self._execute_trade(
                                 bot, exchange, signal, ticker.last, session
                             )
 
-                            if order:
-                                # Check stop loss for any open positions
-                                await self._check_positions_stop_loss(
-                                    bot_id, exchange, risk_mgr, session
-                                )
-                        else:
-                            logger.warning(f"Bot {bot_id}: Trade rejected - {validation.reason}")
+                    # C1: Enforce per-position stop-loss on EVERY iteration, not
+                    # only after a trade. While the strategy holds, the price-based
+                    # stop-loss is the only safety net that catches an open
+                    # position's unrealized loss (drawdown/daily-loss checks are
+                    # realized-only). Running it unconditionally makes stop-loss
+                    # enforcement deterministic.
+                    await self._check_positions_stop_loss(
+                        bot_id, exchange, risk_mgr, session
+                    )
 
                     # Take P&L snapshot periodically
                     await self._take_pnl_snapshot(bot_id, session)
+
+                    # H2: resolve any orders left pending (orphaned resting limit
+                    # orders, or market orders the exchange confirms late) against
+                    # the exchange. Throttled so we do not poll every second.
+                    now = datetime.utcnow()
+                    last_resolve = self._last_pending_resolve.get(bot_id)
+                    if last_resolve is None or (now - last_resolve).total_seconds() >= 30:
+                        self._last_pending_resolve[bot_id] = now
+                        await self._resolve_pending_orders(bot_id, exchange, session)
+
+                    # H-1: periodically checkpoint strategy + simulator state so a
+                    # crash (not just a graceful shutdown) loses minimal state on
+                    # resume - trailing stops, cooldowns, and dry-run balances.
+                    last_ckpt = self._last_checkpoint.get(bot_id)
+                    if last_ckpt is None or (now - last_ckpt).total_seconds() >= checkpoint_interval:
+                        self._last_checkpoint[bot_id] = now
+                        await self._save_bot_state(bot_id, session)
+                        await session.commit()
 
                     # Reconcile exchange balances for live trading (throttled,
                     # alert-only). Dry-run bots have nothing to reconcile.
                     if not bot.is_dry_run:
                         await self._reconcile_live_account(exchange, session)
+
+                # Iteration completed successfully - reset the failure breaker.
+                consecutive_failures = 0
 
             except ValidationError as e:
                 # Accounting validation failure - MUST stop bot
@@ -360,12 +562,29 @@ class TradingEngine:
                     if bot:
                         bot.status = BotStatus.STOPPED
                         await session.commit()
+                        # M2: alerting - this halts trading and needs attention.
+                        await self._emit_alert(
+                            session, bot_id, "accounting_validation_failure",
+                            f"Bot {bot_id} STOPPED: accounting validation failed: {e}",
+                            email_subject=f"TradingBot: accounting failure on bot {bot_id}",
+                        )
                 self._stop_flags[bot_id] = True
-                # TODO: Send alert to admins via email/alert system
                 break  # Exit loop immediately
 
             except Exception as e:
-                logger.error(f"Bot {bot_id}: Error in execution loop: {e}")
+                # M1: count consecutive failures, back off exponentially, and trip
+                # the circuit breaker (pause + alert) rather than spinning forever.
+                consecutive_failures += 1
+                last_error = str(e)
+                logger.error(
+                    f"Bot {bot_id}: Error in execution loop "
+                    f"(failure {consecutive_failures}/{max_failures}): {e}"
+                )
+                if consecutive_failures >= max_failures:
+                    await self._pause_bot_for_failures(bot_id, consecutive_failures, last_error)
+                    break
+                await asyncio.sleep(_backoff(consecutive_failures))
+                continue
 
             # Sleep before next iteration
             await asyncio.sleep(1)  # 1 second between iterations
@@ -420,6 +639,7 @@ class TradingEngine:
             "mean_reversion": self._strategy_mean_reversion,
             "trend_following": self._strategy_trend_following,
             "volatility_breakout": self._strategy_volatility_breakout,
+            "funding_carry": self._strategy_funding_carry,
                     "auto_mode": self._strategy_auto,
         }
 
@@ -1493,6 +1713,12 @@ class TradingEngine:
         Alert record (alert_type "balance_reconciliation").
 
         Throttled internally; safe to call from every bot loop iteration.
+
+        ARCHITECTURAL ASSUMPTION (M-4): all live bots share a SINGLE exchange
+        account. Expectations are aggregated across every live bot and compared
+        against the one ``exchange`` passed in, and the reconciliation clock
+        (``_last_reconciliation``) is global on purpose. If multi-account or
+        multi-exchange support is ever added, this must become per-account.
         """
         from .config import config_service
 
@@ -1502,7 +1728,7 @@ class TradingEngine:
             return
         self._last_reconciliation = now
 
-        # Aggregate expectations across ALL running live bots
+        # Aggregate expectations across ALL running live bots (single account)
         result = await session.execute(
             select(Bot).where(
                 Bot.status == BotStatus.RUNNING,
@@ -1895,6 +2121,229 @@ class TradingEngine:
                 amount=0,
                 reason=f"Trend Following: Holding position, stop at ${state['trailing_stop']:.2f if state['trailing_stop'] else 'N/A'}"
             )
+
+    async def _get_funding_signal(
+        self,
+        bot: Bot,
+        lookback_periods: int,
+        refresh_seconds: float,
+    ) -> Optional[float]:
+        """Return the mean funding rate over the lookback, cached per bot.
+
+        Fetches perpetual funding-rate history via the bot's exchange service
+        (reusing ExchangeService.get_funding_rate_history) and averages the most
+        recent `lookback_periods` windows using the shared compute_funding_stats
+        helper. Cached for `refresh_seconds` to avoid hitting the API every loop.
+
+        Returns None when no exchange service or funding data is available, so
+        the strategy never trades on missing data.
+        """
+        if not hasattr(self, "_funding_cache"):
+            self._funding_cache = {}
+
+        now = datetime.utcnow()
+        cached = self._funding_cache.get(bot.id)
+        if cached and (now - cached["time"]).total_seconds() < refresh_seconds:
+            return cached["mean_rate"]
+
+        exchange = self._exchange_services.get(bot.id)
+        if exchange is None:
+            return None
+
+        swap_symbol = exchange.to_swap_symbol(bot.trading_pair)
+        history = await exchange.get_funding_rate_history(
+            swap_symbol, limit=max(lookback_periods, 1)
+        )
+        if not history:
+            return None
+
+        recent = history[-lookback_periods:]
+        rates = [h.funding_rate for h in recent]
+        interval_hours = recent[-1].interval_hours
+        mean_rate = compute_funding_stats(rates, interval_hours).mean_rate
+
+        self._funding_cache[bot.id] = {"time": now, "mean_rate": mean_rate}
+        return mean_rate
+
+    async def _strategy_funding_carry(
+        self,
+        bot: Bot,
+        current_price: float,
+        params: dict,
+        session: AsyncSession,
+    ) -> Optional[TradeSignal]:
+        """Funding Carry (funding-aware trend) strategy.
+
+        Long-only SPOT strategy that uses perpetual funding rates as a
+        positioning/crowdedness signal, gated by a directional trend filter.
+
+        IMPORTANT: This does NOT short, hedge, or directly harvest funding (a
+        market-neutral basis trade needs a perpetual leg, intentionally out of
+        scope). Funding is used purely as a FILTER on spot entries. True funding
+        harvesting would require the perp leg; this strategy instead aims to
+        improve risk-adjusted entries, not trade frequency.
+
+        Entry (ALL required):
+            - mean funding over `funding_lookback_periods` lies within the
+              favourable band [min_funding_rate, max_funding_rate] (avoids
+              both falling-knife and over-crowded/euphoric regimes)
+            - market regime trend_state is in `allowed_regimes`
+            - no open position, not in cooldown, sufficient balance
+        Exit (ANY):
+            - funding leaves the favourable band
+            - market regime no longer favourable
+
+        Parameters:
+            min_funding_rate: Lower bound of favourable funding band (default -0.0005)
+            max_funding_rate: Upper bound of favourable funding band (default 0.0005)
+            funding_lookback_periods: Funding windows to average (default 3)
+            allowed_regimes: Favourable trend regimes (default ["trend_up"])
+            max_allocation_percent: Max % of balance per position (default 20)
+            cooldown_seconds: Seconds to wait after exit before re-entry (default 300)
+            funding_refresh_seconds: Funding-rate cache TTL in seconds (default 300)
+        """
+        min_funding = params.get("min_funding_rate", -0.0005)
+        max_funding = params.get("max_funding_rate", 0.0005)
+        lookback = int(params.get("funding_lookback_periods", 3))
+        allowed_regimes = params.get("allowed_regimes", ["trend_up"])
+        max_alloc = params.get("max_allocation_percent", 20.0) / 100.0
+        cooldown_seconds = params.get("cooldown_seconds", 300)
+        refresh_seconds = params.get("funding_refresh_seconds", 300)
+
+        # Defensive: a misconfigured band would silently block all trades.
+        if min_funding > max_funding:
+            return TradeSignal(
+                action="hold",
+                amount=0,
+                reason="Funding Carry: invalid config (min_funding_rate > max_funding_rate)",
+            )
+
+        # === DIRECTIONAL FILTER (reuses tick-based regime detection) ===
+        price_history = self._get_price_history(bot.id)
+        price_history.append(current_price)
+        self._save_price_history(bot.id, price_history, max_len=250)
+
+        regime = self._detect_market_regime(price_history, None)
+        trend_regime_name = f"trend_{regime.get('trend_state', 'flat')}"
+        market_favorable = trend_regime_name in allowed_regimes
+
+        # === FUNDING FILTER ===
+        mean_funding = await self._get_funding_signal(bot, lookback, refresh_seconds)
+        if not hasattr(self, "_funding_unavailable_warned"):
+            self._funding_unavailable_warned = set()
+        if mean_funding is None:
+            # L1: a pair with no perpetual market yields a permanent silent hold.
+            # Warn once per outage so the operator can see why nothing trades.
+            if bot.id not in self._funding_unavailable_warned:
+                self._funding_unavailable_warned.add(bot.id)
+                msg = (
+                    f"Funding Carry: no funding-rate data for {bot.trading_pair} "
+                    "(no perpetual market or unsupported); holding until data is available."
+                )
+                logger.warning(f"Bot {bot.id}: {msg}")
+                if bot.id in self._bot_loggers:
+                    self._bot_loggers[bot.id].log_activity(msg)
+            return TradeSignal(
+                action="hold",
+                amount=0,
+                reason="Funding Carry: funding-rate data unavailable (holding)",
+            )
+        # Data available again: clear the one-time warning latch.
+        self._funding_unavailable_warned.discard(bot.id)
+        funding_favorable = min_funding <= mean_funding <= max_funding
+
+        # Per-bot state (cooldown tracking), mirroring other strategies.
+        if not hasattr(self, "_funding_states"):
+            self._funding_states = {}
+        state = self._funding_states.get(bot.id, {"last_exit_time": None})
+
+        positions = await self._get_bot_positions(bot.id, session)
+        has_position = len(positions) > 0
+
+        funding_pct = mean_funding * 100.0
+
+        if not has_position:
+            # --- Entry path ---
+            if state.get("last_exit_time") is not None:
+                elapsed = (datetime.utcnow() - state["last_exit_time"]).total_seconds()
+                if elapsed < cooldown_seconds:
+                    remaining = int(cooldown_seconds - elapsed)
+                    return TradeSignal(
+                        action="hold",
+                        amount=0,
+                        reason=f"Funding Carry: re-entry cooldown ({remaining}s remaining)",
+                    )
+
+            if not funding_favorable:
+                return TradeSignal(
+                    action="hold",
+                    amount=0,
+                    reason=(
+                        f"Funding Carry: funding {funding_pct:.5f}% outside favourable "
+                        f"band [{min_funding * 100:.5f}%, {max_funding * 100:.5f}%]"
+                    ),
+                )
+
+            if not market_favorable:
+                return TradeSignal(
+                    action="hold",
+                    amount=0,
+                    reason=(
+                        f"Funding Carry: regime {trend_regime_name} not in {allowed_regimes}"
+                    ),
+                )
+
+            buy_amount = min(bot.current_balance * max_alloc, bot.current_balance)
+            if buy_amount < 1:
+                return TradeSignal(
+                    action="hold",
+                    amount=0,
+                    reason="Funding Carry: insufficient balance for entry",
+                )
+
+            logger.info(
+                f"Bot {bot.id}: Funding Carry ENTRY - funding {funding_pct:.5f}% in band, "
+                f"regime {trend_regime_name}, position ${buy_amount:.2f}"
+            )
+            self._funding_states[bot.id] = {"last_exit_time": None}
+            return TradeSignal(
+                action="buy",
+                amount=buy_amount,
+                order_type="market",
+                reason=(
+                    f"Funding Carry: favourable funding ({funding_pct:.5f}%) "
+                    f"and regime ({trend_regime_name})"
+                ),
+            )
+
+        # --- Exit path: leave when either condition stops being favourable ---
+        if funding_favorable and market_favorable:
+            return TradeSignal(
+                action="hold",
+                amount=0,
+                reason=(
+                    f"Funding Carry: holding (funding {funding_pct:.5f}%, {trend_regime_name})"
+                ),
+            )
+
+        pos = positions[0]
+        sell_amount = pos.amount * current_price
+        exit_reason = (
+            "funding left favourable band"
+            if not funding_favorable
+            else f"regime {trend_regime_name} unfavourable"
+        )
+        logger.info(
+            f"Bot {bot.id}: Funding Carry EXIT - {exit_reason} "
+            f"(funding {funding_pct:.5f}%)"
+        )
+        self._funding_states[bot.id] = {"last_exit_time": datetime.utcnow()}
+        return TradeSignal(
+            action="sell",
+            amount=sell_amount,
+            order_type="market",
+            reason=f"Funding Carry: exit ({exit_reason})",
+        )
 
     async def _strategy_volatility_breakout(
         self,
@@ -3634,9 +4083,13 @@ class TradingEngine:
         )
 
         # === STEP 6: ORDER SIZE VALIDATION ===
-        # Ensure order size is still meaningful after adjustments
+        # Ensure order size is still meaningful after adjustments.
+        # H3: the minimum applies to BUYS only (opening/adding risk). Sells must
+        # never be blocked by it, or a small/dust position could not be closed -
+        # defeating stop-loss and trailing-stop exits. Live sells are still
+        # validated against the exchange's own min-notional in _preflight_order.
         min_order_size = 10.0  # $10 minimum
-        if signal.amount < min_order_size:
+        if signal.action == "buy" and signal.amount < min_order_size:
             logger.warning(
                 f"Bot {bot.id}: Trade REJECTED - order size ${signal.amount:.2f} < ${min_order_size:.2f} minimum"
             )
@@ -3761,137 +4214,18 @@ class TradingEngine:
         await session.flush()  # Get order.id for trade recording
 
         # === ACCOUNTING-GRADE LEDGER INTEGRATION ===
-        # CRITICAL: This is the single source of truth for all financial transactions
-        # All balance changes, tax lots, and realized gains are recorded here
-        
-        # Only record trades for FILLED orders (not for PENDING limit orders)
+        # Record trade, tax lots, invariants, wallet and position for FILLED
+        # orders. PENDING orders (e.g. a resting limit order, or a market order
+        # the exchange has not yet confirmed) are finalized later by
+        # _resolve_pending_orders once the exchange confirms the fill.
         if order.status == OrderStatus.FILLED:
-            # Parse trading pair to get base and quote assets
-            base_asset, quote_asset = bot.trading_pair.split('/')
-
-            # Determine owner_id (TODO: Get from Bot model when owner_id field exists)
-            owner_id = str(bot.id)  # FIXME: Use bot.owner_id when available
-
-            # Record trade execution (creates Trade record + ledger entries)
-            trade_recorder = TradeRecorderService(session)
-            # For partial fills, use the actual filled amount, not the requested amount
-            filled_amount = getattr(exchange_order, 'filled', exchange_order.amount) or exchange_order.amount
-            # Prefer the exchange-reported notional cost; fall back to filled * price
-            reported_cost = getattr(exchange_order, 'cost', None)
-            executed_cost = (
-                reported_cost
-                if isinstance(reported_cost, (int, float)) and reported_cost > 0
-                else filled_amount * exchange_order.price
+            finalized = await self._finalize_filled_order(
+                session, bot, order, exchange_order, cost_estimate, signal.action
             )
-            # Record the fee in the currency the exchange actually charged it
-            # (only trust a real string; fall back to the quote asset)
-            reported_fee_currency = getattr(exchange_order, 'fee_currency', None)
-            fee_asset = (
-                reported_fee_currency
-                if isinstance(reported_fee_currency, str) and reported_fee_currency
-                else quote_asset
-            )
-            trade = await trade_recorder.record_trade(
-                order_id=order.id,
-                owner_id=owner_id,
-                bot_id=bot.id,
-                exchange=bot.exchange if hasattr(bot, 'exchange') else 'simulated',
-                trading_pair=bot.trading_pair,
-                side=TradeSide.BUY if signal.action == "buy" else TradeSide.SELL,
-                base_asset=base_asset,
-                quote_asset=quote_asset,
-                base_amount=filled_amount,  # Use actual filled amount
-                quote_amount=executed_cost,
-                price=exchange_order.price,
-                fee_amount=exchange_order.fee,
-                fee_asset=fee_asset,
-                modeled_cost=cost_estimate.total_cost,
-                exchange_trade_id=exchange_order.id,
-                executed_at=datetime.utcnow(),
-                strategy_used=bot.strategy,
-            )
-
-            # Process tax lots (FIFO cost basis tracking)
-            tax_engine = FIFOTaxEngine(session)
-            if signal.action == "buy":
-                # BUY creates a new tax lot
-                await tax_engine.process_buy(trade=trade, bot_id=bot.id)
-                logger.info(
-                    f"Bot {bot.id}: Created tax lot for {trade.base_amount:.8f} {base_asset} "
-                    f"@ ${trade.get_cost_basis_per_unit():.2f}/unit"
-                )
-            else:
-                # SELL consumes tax lots in FIFO order and records realized gains
-                realized_gains = await tax_engine.process_sell(trade=trade, bot_id=bot.id)
-                if realized_gains:
-                    # Handle different return formats for compatibility with tests:
-                    # - List of RealizedGain objects (production)
-                    # - List of floats (some tests)
-                    # - Tuple (realized_gain_float, consumed_lots) (legacy test format)
-                    if isinstance(realized_gains, tuple):
-                        # Legacy format: (realized_gain, consumed_lots)
-                        total_gain = realized_gains[0] if realized_gains else 0.0
-                        lot_count = len(realized_gains[1]) if len(realized_gains) > 1 else 0
-                    else:
-                        # List format: support both objects with .gain_loss and plain floats
-                        total_gain = sum(
-                            g.gain_loss if hasattr(g, "gain_loss") else g
-                            for g in realized_gains
-                        )
-                        lot_count = len(realized_gains)
-                        
-                    logger.info(
-                        f"Bot {bot.id}: Realized gain/loss ${total_gain:+.2f} "
-                        f"from {lot_count} tax lot(s)"
-                    )
-
-            # === ACCOUNTING INVARIANT VALIDATION ===
-            # CRITICAL: Validate all accounting invariants before updating cached state
-            # If validation fails, roll back and return None
-            invariant_validator = LedgerInvariantService(session)
-            try:
-                await invariant_validator.validate_trade(trade.id)
-            except Exception as e:
-                logger.critical(
-                    f"Bot {bot.id}: ACCOUNTING VALIDATION FAILED for trade {trade.id}. "
-                    f"Rolling back transaction. Error: {e}"
-                )
-                # Rollback the transaction to prevent corrupt state
-                await session.rollback()
-                # Mark order as failed
-                order.status = OrderStatus.FAILED
-                # Return None to indicate failure (order was not successfully processed)
+            if not finalized:
+                # Invariant validation failed; the transaction is already rolled
+                # back. The order is left unresolved for later reconciliation.
                 return None
-
-            # Update wallet (LEGACY - kept for backward compatibility)
-            # NOTE: Ledger entries are already created by trade_recorder
-            wallet = VirtualWalletService(session)
-            total_cost = exchange_order.fee + cost_estimate.total_cost
-
-            if signal.action == "buy":
-                await wallet.record_trade_result(bot.id, -total_cost, 0)
-            else:
-                await wallet.record_trade_result(bot.id, -total_cost, 0)
-
-            # Update running balance
-            result = await session.execute(select(Bot).where(Bot.id == bot.id))
-            updated_bot = result.scalar_one_or_none()
-            if updated_bot:
-                order.running_balance_after = updated_bot.current_balance
-
-            # Update/create position (derived state cache)
-            # Use the actual filled amount so partial fills cannot
-            # desynchronize positions from the ledger
-            if signal.action == "buy":
-                await self._open_or_add_position(
-                    bot.id, bot.trading_pair, filled_amount,
-                    exchange_order.price, session
-                )
-            else:
-                await self._close_or_reduce_position(
-                    bot.id, bot.trading_pair, filled_amount,
-                    exchange_order.price, session, wallet
-                )
 
         # Commit all changes (order, trade, ledger entries, tax lots, gains)
         await session.commit()
@@ -3899,9 +4233,8 @@ class TradingEngine:
         # Export to CSV (async, best-effort - failures don't block trading)
         try:
             csv_exporter = CSVExportService(session)
-            # Include is_simulated in filename to prevent mixing live/simulated data
-            suffix = "simulated" if bot.is_dry_run else "live"
-            log_path = Path(f"backend/logs/{bot.id}/trades_{suffix}.csv")
+            # L3: absolute, CWD-independent path under the canonical logs dir.
+            log_path = self._trades_csv_path(bot)
             await csv_exporter.export_trades_csv(bot.id, log_path, bot.is_dry_run)
         except Exception as e:
             logger.warning(f"Bot {bot.id}: Failed to export trades CSV: {e}")
@@ -3931,6 +4264,434 @@ class TradingEngine:
             ))
 
         return order
+
+    async def _finalize_filled_order(
+        self,
+        session: AsyncSession,
+        bot: Bot,
+        order: Order,
+        exchange_order,
+        cost_estimate,
+        action: str,
+    ) -> bool:
+        """Record the accounting consequences of a FILLED order.
+
+        Single source of truth for a fill: creates the Trade + ledger entries,
+        processes tax lots, validates invariants, updates the wallet and the
+        position cache. Used by both _execute_trade and the order-recovery paths
+        (_resolve_pending_orders, _reconcile_orders_with_exchange) so a fill is
+        recorded identically however it is discovered.
+
+        Does NOT commit. Returns True on success; on accounting-invariant failure
+        it rolls back, marks the order FAILED, and returns False.
+        """
+        # Parse trading pair to get base and quote assets
+        base_asset, quote_asset = bot.trading_pair.split('/')
+
+        # Determine owner_id (TODO: Get from Bot model when owner_id field exists)
+        owner_id = str(bot.id)  # FIXME: Use bot.owner_id when available
+
+        # Record trade execution (creates Trade record + ledger entries)
+        trade_recorder = TradeRecorderService(session)
+        # For partial fills, use the actual filled amount, not the requested amount
+        filled_amount = getattr(exchange_order, 'filled', exchange_order.amount) or exchange_order.amount
+        # Prefer the exchange-reported notional cost; fall back to filled * price
+        reported_cost = getattr(exchange_order, 'cost', None)
+        executed_cost = (
+            reported_cost
+            if isinstance(reported_cost, (int, float)) and reported_cost > 0
+            else filled_amount * exchange_order.price
+        )
+        # Record the fee in the currency the exchange actually charged it
+        # (only trust a real string; fall back to the quote asset)
+        reported_fee_currency = getattr(exchange_order, 'fee_currency', None)
+        fee_asset = (
+            reported_fee_currency
+            if isinstance(reported_fee_currency, str) and reported_fee_currency
+            else quote_asset
+        )
+        trade = await trade_recorder.record_trade(
+            order_id=order.id,
+            owner_id=owner_id,
+            bot_id=bot.id,
+            exchange=bot.exchange if hasattr(bot, 'exchange') else 'simulated',
+            trading_pair=bot.trading_pair,
+            side=TradeSide.BUY if action == "buy" else TradeSide.SELL,
+            base_asset=base_asset,
+            quote_asset=quote_asset,
+            base_amount=filled_amount,  # Use actual filled amount
+            quote_amount=executed_cost,
+            price=exchange_order.price,
+            fee_amount=exchange_order.fee,
+            fee_asset=fee_asset,
+            modeled_cost=cost_estimate.total_cost,
+            exchange_trade_id=exchange_order.id,
+            executed_at=datetime.utcnow(),
+            strategy_used=bot.strategy,
+        )
+
+        # Process tax lots (FIFO cost basis tracking)
+        tax_engine = FIFOTaxEngine(session)
+        if action == "buy":
+            # BUY creates a new tax lot
+            await tax_engine.process_buy(trade=trade, bot_id=bot.id)
+            logger.info(
+                f"Bot {bot.id}: Created tax lot for {trade.base_amount:.8f} {base_asset} "
+                f"@ ${trade.get_cost_basis_per_unit():.2f}/unit"
+            )
+        else:
+            # SELL consumes tax lots in FIFO order and records realized gains.
+            # CR-3: the FIFO realized P&L is authoritative; it (not a separate
+            # average-cost calc) is what updates bot.total_pnl/current_balance,
+            # so the operational balance stays consistent with the ledger.
+            realized_pnl = 0.0
+            realized_gains = await tax_engine.process_sell(trade=trade, bot_id=bot.id)
+            if realized_gains:
+                # Handle different return formats for compatibility with tests:
+                # - List of RealizedGain objects (production)
+                # - List of floats (some tests)
+                # - Tuple (realized_gain_float, consumed_lots) (legacy test format)
+                if isinstance(realized_gains, tuple):
+                    # Legacy format: (realized_gain, consumed_lots)
+                    total_gain = realized_gains[0] if realized_gains else 0.0
+                    lot_count = len(realized_gains[1]) if len(realized_gains) > 1 else 0
+                else:
+                    # List format: support both objects with .gain_loss and plain floats
+                    total_gain = sum(
+                        g.gain_loss if hasattr(g, "gain_loss") else g
+                        for g in realized_gains
+                    )
+                    lot_count = len(realized_gains)
+
+                realized_pnl = total_gain
+                logger.info(
+                    f"Bot {bot.id}: Realized gain/loss ${total_gain:+.2f} "
+                    f"from {lot_count} tax lot(s)"
+                )
+
+        # === ACCOUNTING INVARIANT VALIDATION ===
+        # CRITICAL: Validate all accounting invariants before updating cached state
+        # If validation fails, roll back and signal failure to the caller.
+        invariant_validator = LedgerInvariantService(session)
+        try:
+            await invariant_validator.validate_trade(trade.id)
+        except Exception as e:
+            logger.critical(
+                f"Bot {bot.id}: ACCOUNTING VALIDATION FAILED for trade {trade.id}. "
+                f"Rolling back transaction. Error: {e}"
+            )
+            # Rollback the transaction to prevent corrupt state
+            await session.rollback()
+            # Mark order as failed
+            order.status = OrderStatus.FAILED
+            return False
+
+        # Update wallet (LEGACY - kept for backward compatibility)
+        # NOTE: Ledger entries are already created by trade_recorder
+        wallet = VirtualWalletService(session)
+        total_cost = exchange_order.fee + cost_estimate.total_cost
+
+        if action == "buy":
+            await wallet.record_trade_result(bot.id, -total_cost, 0)
+        else:
+            await wallet.record_trade_result(bot.id, -total_cost, 0)
+
+        # Update running balance
+        result = await session.execute(select(Bot).where(Bot.id == bot.id))
+        updated_bot = result.scalar_one_or_none()
+        if updated_bot:
+            order.running_balance_after = updated_bot.current_balance
+
+        # Update/create position (derived state cache)
+        # Use the actual filled amount so partial fills cannot
+        # desynchronize positions from the ledger
+        if action == "buy":
+            await self._open_or_add_position(
+                bot.id, bot.trading_pair, filled_amount,
+                exchange_order.price, session
+            )
+        else:
+            await self._close_or_reduce_position(
+                bot.id, bot.trading_pair, filled_amount,
+                exchange_order.price, session, wallet, realized_pnl=realized_pnl
+            )
+
+        return True
+
+    # === ORDER RECOVERY / RECONCILIATION (C2, H2) ===
+    # Guarantee that every order and position can be recovered after a failure
+    # by treating the exchange as the source of truth.
+
+    @staticmethod
+    def _action_for_order_type(order_type: OrderType) -> str:
+        """Map an order type to a buy/sell action."""
+        return "buy" if order_type in (OrderType.MARKET_BUY, OrderType.LIMIT_BUY) else "sell"
+
+    def _cost_estimate_for(self, bot: Bot, action: str, notional: float, price: float):
+        """Build a cost estimate for a recovered fill (mirrors _execute_trade)."""
+        cost_model = get_cost_model(
+            exchange_fee_pct=getattr(bot, 'exchange_fee', 0.0) or 0.0,
+        )
+        return cost_model.estimate_cost(side=action, notional_usd=notional, price=price)
+
+    async def _resolve_pending_orders(
+        self,
+        bot_id: int,
+        exchange: ExchangeService,
+        session: AsyncSession,
+    ) -> int:
+        """Resolve locally-PENDING orders against the exchange (H2).
+
+        For each PENDING order, ask the exchange for its true state:
+        - filled/closed -> finalize (record trade, tax lots, position)
+        - canceled/expired/rejected -> mark CANCELLED
+        - still open -> leave untouched
+        Returns the number of orders whose state changed.
+        """
+        result = await session.execute(
+            select(Order).where(
+                Order.bot_id == bot_id,
+                Order.status == OrderStatus.PENDING,
+            )
+        )
+        pending = result.scalars().all()
+        resolved = 0
+
+        for order in pending:
+            if not order.exchange_order_id:
+                continue
+            ex_order = await exchange.get_order(order.exchange_order_id, order.trading_pair)
+            if ex_order is None:
+                continue
+
+            status = (getattr(ex_order, "status", "") or "").lower()
+            filled = getattr(ex_order, "filled", 0) or 0
+
+            if status in ("closed", "filled", "partial") and (filled or ex_order.amount):
+                bot = (
+                    await session.execute(select(Bot).where(Bot.id == bot_id))
+                ).scalar_one_or_none()
+                if bot is None:
+                    continue
+                action = self._action_for_order_type(order.order_type)
+                # Sync the local order to the exchange's reported fill.
+                order.status = OrderStatus.FILLED
+                order.filled_at = datetime.utcnow()
+                order.amount = filled or ex_order.amount or order.amount
+                order.price = ex_order.price or order.price
+                order.fees = ex_order.fee or order.fees
+                notional = (getattr(ex_order, "cost", None) or order.amount * order.price)
+                cost_estimate = self._cost_estimate_for(bot, action, notional, order.price)
+                ok = await self._finalize_filled_order(
+                    session, bot, order, ex_order, cost_estimate, action
+                )
+                if ok:
+                    await session.commit()
+                    resolved += 1
+                    logger.info(
+                        f"Bot {bot_id}: resolved pending order {order.exchange_order_id} -> FILLED"
+                    )
+            elif status in ("canceled", "cancelled", "expired", "rejected"):
+                order.status = OrderStatus.CANCELLED
+                await session.commit()
+                resolved += 1
+                logger.info(
+                    f"Bot {bot_id}: pending order {order.exchange_order_id} -> {status.upper()}"
+                )
+            # else: still open on the exchange; leave it for a later cycle.
+
+        return resolved
+
+    async def _reconcile_orders_with_exchange(
+        self,
+        bot: Bot,
+        exchange: ExchangeService,
+        session: AsyncSession,
+    ) -> int:
+        """Import exchange fills that have no local order (C2 recovery).
+
+        Covers the irreducible window where a fill succeeded on the exchange but
+        the local write was lost (e.g. a crash between fill and commit). The
+        exchange is the source of truth: any recent filled order whose id is not
+        recorded locally is imported and finalized. Returns the import count.
+        """
+        if not hasattr(exchange, "get_recent_orders"):
+            return 0
+
+        recent = await exchange.get_recent_orders(bot.trading_pair, limit=50)
+        if not recent:
+            return 0
+
+        known_result = await session.execute(
+            select(Order.exchange_order_id).where(Order.bot_id == bot.id)
+        )
+        known_ids = {row[0] for row in known_result.all() if row[0]}
+
+        imported = 0
+        for ex_order in recent:
+            status = (getattr(ex_order, "status", "") or "").lower()
+            filled = getattr(ex_order, "filled", 0) or 0
+            if status not in ("closed", "filled", "partial"):
+                continue
+            if not (filled or ex_order.amount):
+                continue
+            if ex_order.id in known_ids:
+                continue
+
+            action = "buy" if getattr(ex_order, "side", "") == "buy" else "sell"
+            is_limit = getattr(ex_order, "type", "market") == "limit"
+            order_type = {
+                ("buy", False): OrderType.MARKET_BUY,
+                ("sell", False): OrderType.MARKET_SELL,
+                ("buy", True): OrderType.LIMIT_BUY,
+                ("sell", True): OrderType.LIMIT_SELL,
+            }[(action, is_limit)]
+
+            order = Order(
+                bot_id=bot.id,
+                exchange_order_id=ex_order.id,
+                order_type=order_type,
+                trading_pair=bot.trading_pair,
+                amount=filled or ex_order.amount,
+                price=ex_order.price,
+                fees=ex_order.fee or 0.0,
+                status=OrderStatus.FILLED,
+                strategy_used=bot.strategy,
+                is_simulated=bot.is_dry_run,
+                reason="recovered: imported from exchange",
+                filled_at=datetime.utcnow(),
+            )
+            session.add(order)
+            await session.flush()
+
+            notional = (getattr(ex_order, "cost", None) or order.amount * order.price)
+            cost_estimate = self._cost_estimate_for(bot, action, notional, order.price)
+            ok = await self._finalize_filled_order(
+                session, bot, order, ex_order, cost_estimate, action
+            )
+            if ok:
+                await session.commit()
+                known_ids.add(ex_order.id)
+                imported += 1
+                logger.warning(
+                    f"Bot {bot.id}: imported untracked exchange fill "
+                    f"{ex_order.id} ({action} {order.amount}) during recovery"
+                )
+
+        return imported
+
+    async def _recover_bot_orders(
+        self,
+        bot: Bot,
+        exchange: ExchangeService,
+        session: AsyncSession,
+    ) -> int:
+        """Full order recovery for a bot: resolve pending + import missing fills.
+
+        Run on startup/resume so no order or position is left desynchronized
+        from the exchange after a failure.
+        """
+        recovered = 0
+        try:
+            recovered += await self._resolve_pending_orders(bot.id, exchange, session)
+            recovered += await self._reconcile_orders_with_exchange(bot, exchange, session)
+        except Exception as e:
+            logger.error(f"Bot {bot.id}: order recovery failed: {e}")
+        if recovered:
+            logger.info(f"Bot {bot.id}: order recovery reconciled {recovered} order(s)")
+        return recovered
+
+    # === OPERATIONAL ALERTING & LIFECYCLE (M1, M2, L4) ===
+
+    async def _emit_alert(
+        self,
+        session: AsyncSession,
+        bot_id: Optional[int],
+        alert_type: str,
+        message: str,
+        *,
+        email_subject: Optional[str] = None,
+    ) -> None:
+        """Persist an operational Alert and best-effort send an email.
+
+        Never raises: alerting must not take down the trading loop. An email is
+        attempted only when a subject is given and email delivery is enabled.
+        """
+        email_sent = False
+        try:
+            if email_subject and email_service.is_enabled():
+                email_sent = bool(
+                    email_service.send_email(email_subject, f"<p>{message}</p>", message)
+                )
+        except Exception as e:
+            logger.error(f"Failed to send alert email for bot {bot_id}: {e}")
+        try:
+            session.add(Alert(
+                bot_id=bot_id,
+                alert_type=alert_type,
+                message=message,
+                email_sent=email_sent,
+            ))
+            await session.commit()
+        except Exception as e:
+            logger.error(f"Failed to persist alert for bot {bot_id}: {e}")
+
+    async def _pause_bot_for_failures(
+        self, bot_id: int, failures: int, last_error: str
+    ) -> None:
+        """Circuit breaker (M1): pause a persistently failing bot and alert."""
+        reason = (
+            f"Paused by failure circuit breaker after {failures} consecutive "
+            f"errors. Last error: {last_error}"
+        )
+        logger.critical(f"Bot {bot_id}: {reason}")
+        try:
+            async with async_session_maker() as session:
+                result = await session.execute(select(Bot).where(Bot.id == bot_id))
+                bot = result.scalar_one_or_none()
+                if bot:
+                    bot.status = BotStatus.PAUSED
+                    bot.paused_at = datetime.utcnow()
+                    bot.updated_at = datetime.utcnow()
+                    await session.commit()
+                    await self._emit_alert(
+                        session, bot_id, "failure_circuit_breaker", reason,
+                        email_subject=f"TradingBot: bot {bot_id} paused after repeated failures",
+                    )
+        except Exception as e:
+            logger.error(f"Bot {bot_id}: failed to pause via circuit breaker: {e}")
+        finally:
+            self._stop_flags[bot_id] = True
+
+    def _cleanup_bot_state(self, bot_id: int) -> None:
+        """Drop a bot's in-memory state to prevent unbounded growth (L4)."""
+        state_dicts = (
+            "_price_histories", "_funding_cache", "_funding_states", "_trend_states",
+            "_grid_states", "_mean_reversion_states", "_volatility_breakout_states",
+            "_twap_states", "_vwap_states", "_auto_states", "_last_pending_resolve",
+            "_bot_loggers",
+        )
+        for attr in state_dicts:
+            store = getattr(self, attr, None)
+            if isinstance(store, dict):
+                store.pop(bot_id, None)
+        warned = getattr(self, "_funding_unavailable_warned", None)
+        if isinstance(warned, set):
+            warned.discard(bot_id)
+
+    def cleanup_bot_state(self, bot_id: int) -> None:
+        """Public hook to release a bot's in-memory state (e.g. on delete)."""
+        self._cleanup_bot_state(bot_id)
+
+    @staticmethod
+    def _trades_csv_path(bot) -> Path:
+        """Absolute path of a bot's trades CSV, independent of the process CWD (L3).
+
+        Anchored to the canonical per-bot log directory so logs are never written
+        to a stray relative location when the server is started elsewhere.
+        """
+        suffix = "simulated" if bot.is_dry_run else "live"
+        return ensure_bot_log_directory(bot.id) / f"trades_{suffix}.csv"
 
     # === EXECUTION LAYER METHODS ===
     # These methods implement HOW to execute trades, not WHAT/WHY to trade.
@@ -4367,8 +5128,14 @@ class TradingEngine:
         price: float,
         session: AsyncSession,
         wallet: VirtualWalletService,
+        realized_pnl: Optional[float] = None,
     ) -> None:
-        """Close or reduce a position and realize P&L."""
+        """Close or reduce a position and realize P&L.
+
+        CR-3: when ``realized_pnl`` is provided (the FIFO realized gain from the
+        ledger), it is the authoritative P&L recorded to the wallet. The
+        average-cost fallback is kept only for callers that don't supply it.
+        """
         result = await session.execute(
             select(Position).where(
                 Position.bot_id == bot_id,
@@ -4384,9 +5151,13 @@ class TradingEngine:
         bot_result = await session.execute(select(Bot).where(Bot.id == bot_id))
         bot = bot_result.scalar_one_or_none()
 
-        # Calculate realized P&L
         sell_amount = min(amount, position.amount)
-        pnl = (price - position.entry_price) * sell_amount
+        # Prefer the FIFO realized P&L (ledger truth); fall back to average-cost
+        # only when no FIFO value was supplied.
+        if realized_pnl is not None:
+            pnl = realized_pnl
+        else:
+            pnl = (price - position.entry_price) * sell_amount
 
         # Record P&L
         await wallet.record_trade_result(bot_id, pnl, 0)
@@ -4570,12 +5341,10 @@ class TradingEngine:
         Returns:
             Next strategy name
         """
-        strategies = [
-            "dca_accumulator",
-            "adaptive_grid",
-            "mean_reversion",
-            "twap",
-        ]
+        # H-3: rotate ONLY among valid alpha strategies. Rotating into an
+        # execution algorithm (twap/vwap) would leave the bot with no executor
+        # and silently stop it from trading.
+        strategies = list(_ALPHA_STRATEGIES)
 
         try:
             idx = strategies.index(current_strategy)
@@ -4593,27 +5362,42 @@ class TradingEngine:
         """
         resumed = 0
 
+        # Collect the bot ids in a short-lived session, then resume each bot in
+        # ITS OWN session (M-3): a failure or mid-loop commit for one bot must
+        # not poison the session used for the others.
         async with async_session_maker() as session:
-            # Find all bots that were running
             result = await session.execute(
-                select(Bot).where(Bot.status == BotStatus.RUNNING)
+                select(Bot.id).where(Bot.status == BotStatus.RUNNING)
             )
-            running_bots = result.scalars().all()
+            bot_ids = [row[0] for row in result.all()]
 
-            if not running_bots:
-                logger.info("No bots to resume on startup")
-                return 0
+        if not bot_ids:
+            logger.info("No bots to resume on startup")
+            return 0
 
-            logger.info(f"Found {len(running_bots)} bot(s) to resume")
+        logger.info(f"Found {len(bot_ids)} bot(s) to resume")
 
-            for bot in running_bots:
-                try:
+        for bot_id in bot_ids:
+            try:
+                async with async_session_maker() as session:
+                    bot = (
+                        await session.execute(select(Bot).where(Bot.id == bot_id))
+                    ).scalar_one_or_none()
+                    if not bot:
+                        continue
+
                     # Restore strategy state from database if available
-                    await self._restore_strategy_state(bot.id, bot.strategy_params)
+                    await self._restore_strategy_state(bot)
 
                     # Create exchange service
                     if bot.is_dry_run:
-                        exchange = SimulatedExchangeService(initial_balance=bot.budget)
+                        exchange = self._make_simulated_exchange(bot.budget)
+                        # CR-2: restore persisted simulated balances so a dry run
+                        # resumes from where it left off instead of resetting to
+                        # the initial budget (which would desync DB vs simulator).
+                        sim_state = (bot.strategy_state or {}).get("_sim_state")
+                        if sim_state:
+                            exchange.import_state(sim_state)
                     else:
                         exchange = ExchangeService()
                         if not exchange.has_credentials():
@@ -4637,6 +5421,13 @@ class TradingEngine:
 
                     self._exchange_services[bot.id] = exchange
 
+                    # C2/H2: before resuming trading, reconcile orders against the
+                    # exchange - resolve any orders left pending and import fills
+                    # that never reached the database (e.g. a crash between fill
+                    # and commit). This guarantees positions/orders are recovered
+                    # before the strategy acts on possibly-stale local state.
+                    await self._recover_bot_orders(bot, exchange, session)
+
                     # Initialize per-bot file logger
                     ensure_bot_log_directory(bot.id)
                     self._bot_loggers[bot.id] = BotLoggingService(
@@ -4654,56 +5445,89 @@ class TradingEngine:
                     resumed += 1
                     logger.info(f"Resumed bot {bot.id} ({bot.name})")
 
-                except Exception as e:
-                    logger.error(f"Failed to resume bot {bot.id}: {e}")
+            except Exception as e:
+                logger.error(f"Failed to resume bot {bot_id}: {e}")
 
         logger.info(f"Resumed {resumed} bot(s) on startup")
         return resumed
 
-    async def _restore_strategy_state(self, bot_id: int, strategy_params: dict) -> None:
-        """Restore strategy state from saved data.
+    async def _restore_strategy_state(self, bot) -> None:
+        """Restore a bot's strategy runtime state on resume.
+
+        Prefers the dedicated Bot.strategy_state column (current format). Falls
+        back to legacy state previously embedded in strategy_params so bots saved
+        by older builds still resume correctly.
 
         Args:
-            bot_id: Bot ID
-            strategy_params: Strategy params which may contain saved state
+            bot: The Bot model being resumed.
         """
+        strategy_state = getattr(bot, "strategy_state", None)
+        if strategy_state:
+            self._restore_bot_state(bot.id, strategy_state)
+            return
+
+        # Backward compatibility: older builds stored state inside strategy_params.
+        self._restore_legacy_state(bot.id, bot.strategy_params)
+
+    def _state_store(self, attr: str) -> dict:
+        """Return (creating if needed) a per-bot state dict by attribute name."""
+        store = getattr(self, attr, None)
+        if store is None:
+            store = {}
+            setattr(self, attr, store)
+        return store
+
+    def _collect_bot_state(self, bot_id: int) -> dict:
+        """Collect all persistable in-memory state for a bot into one dict.
+
+        Returns JSON-safe data (datetimes tagged) ready to store in
+        Bot.strategy_state.
+        """
+        state: Dict[str, Any] = {}
+        for attr in _PERSISTED_STATE_ATTRS:
+            store = getattr(self, attr, None)
+            if isinstance(store, dict) and bot_id in store:
+                state[attr] = store[bot_id]
+
+        histories = getattr(self, "_price_histories", None)
+        if isinstance(histories, dict) and bot_id in histories:
+            state["_price_histories"] = histories[bot_id][-_PERSISTED_PRICE_HISTORY_LEN:]
+
+        # CR-2: persist dry-run simulator balances so they survive a restart.
+        exchange = self._exchange_services.get(bot_id)
+        if exchange is not None and hasattr(exchange, "export_state"):
+            state["_sim_state"] = exchange.export_state()
+
+        return _to_jsonable(state)
+
+    def _restore_bot_state(self, bot_id: int, strategy_state: dict) -> None:
+        """Restore a bot's state from a saved strategy_state dict."""
+        data = _from_jsonable(strategy_state)
+        if not isinstance(data, dict):
+            return
+
+        for attr in _PERSISTED_STATE_ATTRS:
+            if attr in data:
+                self._state_store(attr)[bot_id] = data[attr]
+
+        if "_price_histories" in data:
+            self._state_store("_price_histories")[bot_id] = data["_price_histories"]
+
+        logger.debug(f"Bot {bot_id}: Restored strategy state ({list(data.keys())})")
+
+    def _restore_legacy_state(self, bot_id: int, strategy_params: dict) -> None:
+        """Restore state from the legacy strategy_params embedding (pre-3)."""
         if not strategy_params:
             return
 
-        # Restore grid state
-        if "_grid_state" in strategy_params:
-            if not hasattr(self, "_grid_states"):
-                self._grid_states = {}
-            self._grid_states[bot_id] = strategy_params["_grid_state"]
-            logger.debug(f"Bot {bot_id}: Restored grid state")
+        for legacy_key, attr in _LEGACY_STATE_KEYS.items():
+            if legacy_key in strategy_params:
+                self._state_store(attr)[bot_id] = _from_jsonable(strategy_params[legacy_key])
+                logger.debug(f"Bot {bot_id}: Restored legacy {legacy_key}")
 
-        # Restore TWAP state
-        if "_twap_state" in strategy_params:
-            if not hasattr(self, "_twap_states"):
-                self._twap_states = {}
-            self._twap_states[bot_id] = strategy_params["_twap_state"]
-            logger.debug(f"Bot {bot_id}: Restored TWAP state")
-
-        # Restore VWAP state
-        if "_vwap_state" in strategy_params:
-            if not hasattr(self, "_vwap_states"):
-                self._vwap_states = {}
-            self._vwap_states[bot_id] = strategy_params["_vwap_state"]
-            logger.debug(f"Bot {bot_id}: Restored VWAP state")
-
-        # Restore Auto mode state
-        if "_auto_state" in strategy_params:
-            if not hasattr(self, "_auto_states"):
-                self._auto_states = {}
-            self._auto_states[bot_id] = strategy_params["_auto_state"]
-            logger.debug(f"Bot {bot_id}: Restored Auto mode state")
-
-        # Restore price history
         if "_price_history" in strategy_params:
-            if not hasattr(self, "_price_histories"):
-                self._price_histories = {}
-            self._price_histories[bot_id] = strategy_params["_price_history"]
-            logger.debug(f"Bot {bot_id}: Restored price history")
+            self._state_store("_price_histories")[bot_id] = strategy_params["_price_history"]
+            logger.debug(f"Bot {bot_id}: Restored legacy price history")
 
     async def graceful_shutdown(self) -> int:
         """Perform graceful shutdown - save state and stop all bots.
@@ -4783,31 +5607,18 @@ class TradingEngine:
         if not bot:
             return
 
-        # Collect strategy state
-        strategy_params = dict(bot.strategy_params) if bot.strategy_params else {}
+        # Persist ALL strategy runtime state (trailing stops, locked entry ATR,
+        # cooldowns, price history) into the dedicated strategy_state column.
+        bot.strategy_state = self._collect_bot_state(bot_id)
 
-        # Save grid state
-        if hasattr(self, "_grid_states") and bot_id in self._grid_states:
-            strategy_params["_grid_state"] = self._grid_states[bot_id]
+        # M5: strategy_params is user config only. Strip any runtime state that
+        # older builds may have embedded there so it cannot pollute config or
+        # fail parameter validation on a later edit.
+        if bot.strategy_params:
+            cleaned = {k: v for k, v in bot.strategy_params.items() if not k.startswith("_")}
+            if cleaned != bot.strategy_params:
+                bot.strategy_params = cleaned
 
-        # Save TWAP state
-        if hasattr(self, "_twap_states") and bot_id in self._twap_states:
-            strategy_params["_twap_state"] = self._twap_states[bot_id]
-
-        # Save VWAP state
-        if hasattr(self, "_vwap_states") and bot_id in self._vwap_states:
-            strategy_params["_vwap_state"] = self._vwap_states[bot_id]
-
-        # Save Auto mode state
-        if hasattr(self, "_auto_states") and bot_id in self._auto_states:
-            strategy_params["_auto_state"] = self._auto_states[bot_id]
-
-        # Save price history (limited to last 50 to avoid bloat)
-        if hasattr(self, "_price_histories") and bot_id in self._price_histories:
-            strategy_params["_price_history"] = self._price_histories[bot_id][-50:]
-
-        # Update database
-        bot.strategy_params = strategy_params
         bot.updated_at = datetime.utcnow()
 
         logger.debug(f"Saved state for bot {bot_id}")

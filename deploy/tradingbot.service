@@ -1,0 +1,27 @@
+[Unit]
+Description=TradingBot backend (dry-run)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=tradingbot
+Group=tradingbot
+# Adjust to where you cloned the repo.
+WorkingDirectory=/opt/tradingbot/backend
+EnvironmentFile=-/opt/tradingbot/deploy/tradingbot.env
+ExecStart=/opt/tradingbot/venv/bin/uvicorn app.main:app --host 127.0.0.1 --port 8000
+
+# Auto-restart on crash; combined with resume_bots_on_startup this gives a
+# continuous run. SIGTERM triggers the FastAPI lifespan shutdown, which saves
+# bot state and flushes a final DB backup — give it time to finish.
+Restart=always
+RestartSec=5
+TimeoutStopSec=30
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=tradingbot
+
+[Install]
+WantedBy=multi-user.target

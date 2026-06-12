@@ -37,6 +37,8 @@ CONFIG_SCHEMA = {
             "port": {"type": "int", "required": False, "min": 1, "max": 65535},
             "debug": {"type": "bool", "required": False},
             "api_token": {"type": "str", "required": False},
+            "cors_origins": {"type": "list", "required": False},
+            "frontend_dist": {"type": "str", "required": False},
         }
     },
     "database": {
@@ -55,6 +57,11 @@ CONFIG_SCHEMA = {
             "reconciliation_interval_seconds": {"type": "int", "required": False, "min": 1},
             "default_stop_loss_percent": {"type": "float", "required": False, "min": 0, "max": 100},
             "default_daily_loss_limit": {"type": "float", "required": False, "min": 0},
+            "max_consecutive_failures": {"type": "int", "required": False, "min": 1},
+            "failure_backoff_max_seconds": {"type": "float", "required": False, "min": 1},
+            "state_checkpoint_seconds": {"type": "float", "required": False, "min": 1},
+            "backup_interval_seconds": {"type": "float", "required": False, "min": 1},
+            "ticker_cache_ttl_seconds": {"type": "float", "required": False, "min": 0},
         }
     },
     "exchange": {

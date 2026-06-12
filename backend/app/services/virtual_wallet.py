@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 
-from ..models import Bot
+from ..models import Bot, Position
 
 logger = logging.getLogger(__name__)
 
@@ -58,7 +58,12 @@ class VirtualWalletService:
         if not bot:
             return None
 
-        available = self._calculate_available_balance(bot)
+        # CR-1: capital already deployed in open positions must count against the
+        # budget, otherwise a bot can repeatedly "buy" up to its full budget while
+        # holding positions and over-allocate well beyond the cap. Subtract the
+        # cost basis of open positions from the available balance.
+        deployed = await self._deployed_capital(bot_id)
+        available = max(0.0, self._calculate_available_balance(bot) - deployed)
 
         return WalletStatus(
             budget=bot.budget,
@@ -67,6 +72,23 @@ class VirtualWalletService:
             available_for_trade=available,
             compound_enabled=bot.compound_enabled,
             is_budget_exceeded=bot.current_balance <= 0,
+        )
+
+    async def _deployed_capital(self, bot_id: int) -> float:
+        """Cost basis of the bot's currently open positions (quote currency).
+
+        Returns 0 when there are no open positions. SQLAlchemy's ``.all()``
+        always yields a list in production; the isinstance guard keeps the math
+        well-defined if positions cannot be resolved.
+        """
+        result = await self.session.execute(
+            select(Position).where(Position.bot_id == bot_id)
+        )
+        positions = result.scalars().all()
+        if not isinstance(positions, (list, tuple)):
+            return 0.0
+        return sum(
+            (p.amount or 0.0) * (p.entry_price or 0.0) for p in positions
         )
 
     def _calculate_available_balance(self, bot: Bot) -> float:
