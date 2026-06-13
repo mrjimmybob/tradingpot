@@ -44,6 +44,10 @@ logs/*.log
 config/exchanges.yaml
 config/email.yaml
 
+# Deployment secrets — the live env file holds API tokens/keys; never commit
+# it. The *.env.example template is tracked (it does not match *.env).
+deploy/*.env
+
 # OS
 .DS_Store
 Thumbs.db

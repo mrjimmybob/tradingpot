@@ -86,7 +86,21 @@
       "Bash(cp src/hooks/useWebSocket.ts /tmp/useWebSocket.ts.bak)",
       "Bash(sed -i 's/\\\\}, \\\\[url, reconnectAttempts, reconnectInterval, clearTimers\\\\]\\)/}, [url, reconnectAttempts, reconnectInterval, clearTimers, callbacksRef.current.onOpen, callbacksRef.current.onClose]\\)/' src/hooks/useWebSocket.ts)",
       "Bash(npx eslint *)",
-      "Bash(echo \"exit: $?\")"
+      "Bash(echo \"exit: $?\")",
+      "Bash(gh repo *)",
+      "Bash(grep -iE \"\\\\.env$|exchanges\\\\.yaml|email\\\\.yaml|tradingbot\\\\.env|secret|credential\")",
+      "Bash(git check-ignore *)",
+      "Bash(chmod +x deploy/deploy.sh)",
+      "Bash(bash -n deploy/deploy.sh)",
+      "Bash(echo \"deploy/tradingbot.env -> $\\(git check-ignore deploy/tradingbot.env || echo NOT-IGNORED\\)\")",
+      "Bash(echo \"deploy/tradingbot.env.example -> $\\(git check-ignore deploy/tradingbot.env.example >/dev/null 2>&1 && echo IGNORED-BAD || echo tracked-OK\\)\")",
+      "Bash(python3 -c \"import yaml,sys; [yaml.safe_load\\(open\\(f\\)\\) for f in ['.github/workflows/ci.yml','.github/workflows/deploy.yml']]; print\\('YAML OK'\\)\")",
+      "Bash(pip install *)",
+      "Bash(python3 -c \"import yaml; [print\\(f,'OK'\\) or yaml.safe_load\\(open\\(f\\)\\) for f in ['.github/workflows/ci.yml','.github/workflows/deploy.yml']]\")",
+      "Bash(python3 -m venv /tmp/yamlcheck)",
+      "Bash(/tmp/yamlcheck/bin/pip install *)",
+      "Bash(/tmp/yamlcheck/bin/python -)",
+      "Bash(rm -rf /tmp/yamlcheck)"
     ]
   }
 }
