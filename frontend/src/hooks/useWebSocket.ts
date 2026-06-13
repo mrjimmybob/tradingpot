@@ -117,6 +117,21 @@ export function useWebSocket(options: UseWebSocketOptions = {}): UseWebSocketRet
   const [isConnected, setIsConnected] = useState(false)
   const [isConnecting, setIsConnecting] = useState(false)
 
+  // Keep the latest option callbacks in a ref so connect()/disconnect() stay
+  // referentially stable across renders. Callers (e.g. WebSocketProvider) pass
+  // inline onOpen/onClose closures that change identity every render; if connect
+  // depended on them, the mount effect below would tear down and recreate the
+  // socket on every render — the "Connecting <-> Disconnected" thrash where the
+  // backend logs connection open/closed with no error.
+  const callbacksRef = useRef({
+    onOpen, onClose, onError, onMessage,
+    onPriceUpdate, onIndicatorUpdate, onBotUpdate, onStatsUpdate,
+  })
+  callbacksRef.current = {
+    onOpen, onClose, onError, onMessage,
+    onPriceUpdate, onIndicatorUpdate, onBotUpdate, onStatsUpdate,
+  }
+
   const clearTimers = useCallback(() => {
     if (reconnectTimeoutRef.current) {
       clearTimeout(reconnectTimeoutRef.current)
@@ -151,7 +166,7 @@ export function useWebSocket(options: UseWebSocketOptions = {}): UseWebSocketRet
           }
         }, 30000)
 
-        onOpen?.()
+        callbacksRef.current.onOpen?.()
       }
 
       ws.onclose = () => {
@@ -159,7 +174,7 @@ export function useWebSocket(options: UseWebSocketOptions = {}): UseWebSocketRet
         setIsConnecting(false)
         clearTimers()
 
-        onClose?.()
+        callbacksRef.current.onClose?.()
 
         // Attempt reconnect
         if (reconnectCountRef.current < reconnectAttempts) {
@@ -170,28 +185,28 @@ export function useWebSocket(options: UseWebSocketOptions = {}): UseWebSocketRet
       }
 
       ws.onerror = (error) => {
-        onError?.(error)
+        callbacksRef.current.onError?.(error)
       }
 
       ws.onmessage = (event) => {
         try {
           const message = JSON.parse(event.data) as WebSocketMessage
 
-          onMessage?.(message)
+          callbacksRef.current.onMessage?.(message)
 
           // Route to specific handlers
           switch (message.type) {
             case 'price_update':
-              onPriceUpdate?.(message as PriceUpdate)
+              callbacksRef.current.onPriceUpdate?.(message as PriceUpdate)
               break
             case 'indicator_update':
-              onIndicatorUpdate?.(message as IndicatorUpdate)
+              callbacksRef.current.onIndicatorUpdate?.(message as IndicatorUpdate)
               break
             case 'bot_update':
-              onBotUpdate?.(message as BotUpdate)
+              callbacksRef.current.onBotUpdate?.(message as BotUpdate)
               break
             case 'stats_update':
-              onStatsUpdate?.(message as StatsUpdate)
+              callbacksRef.current.onStatsUpdate?.(message as StatsUpdate)
               break
           }
         } catch (e) {
@@ -208,20 +223,9 @@ export function useWebSocket(options: UseWebSocketOptions = {}): UseWebSocketRet
         console.debug('[WS] Connection error:', e)
       }
     }
-  }, [
-    url,
-    reconnectAttempts,
-    reconnectInterval,
-    clearTimers,
-    onOpen,
-    onClose,
-    onError,
-    onMessage,
-    onPriceUpdate,
-    onIndicatorUpdate,
-    onBotUpdate,
-    onStatsUpdate,
-  ])
+    // Option callbacks are intentionally read from callbacksRef (not deps), so
+    // connect() stays stable and the mount effect doesn't churn the socket.
+  }, [url, reconnectAttempts, reconnectInterval, clearTimers])
 
   const disconnect = useCallback(() => {
     clearTimers()

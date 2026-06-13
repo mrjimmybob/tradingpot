@@ -79,7 +79,14 @@
       "Bash(chmod +x init.sh deploy/validate_deployment.sh deploy/install.sh deploy/tests/test_deploy.sh)",
       "Bash(bash deploy/tests/test_deploy.sh)",
       "Bash(git update-index *)",
-      "Bash(node -e \"const s=require\\('./frontend/package.json'\\).scripts; console.log\\('build:', s.build||'MISSING'\\); console.log\\('dev:', s.dev||'MISSING'\\)\")"
+      "Bash(node -e \"const s=require\\('./frontend/package.json'\\).scripts; console.log\\('build:', s.build||'MISSING'\\); console.log\\('dev:', s.dev||'MISSING'\\)\")",
+      "Bash(npx vitest *)",
+      "Bash(node -e \"const p=require\\('./package.json'\\); console.log\\(JSON.stringify\\(p.scripts,null,2\\)\\); console.log\\('jest dep:', p.devDependencies?.jest||p.dependencies?.jest||'none'\\); console.log\\('vitest dep:', p.devDependencies?.vitest||'none'\\)\")",
+      "Bash(ls jest.config* vitest.config*)",
+      "Bash(cp src/hooks/useWebSocket.ts /tmp/useWebSocket.ts.bak)",
+      "Bash(sed -i 's/\\\\}, \\\\[url, reconnectAttempts, reconnectInterval, clearTimers\\\\]\\)/}, [url, reconnectAttempts, reconnectInterval, clearTimers, callbacksRef.current.onOpen, callbacksRef.current.onClose]\\)/' src/hooks/useWebSocket.ts)",
+      "Bash(npx eslint *)",
+      "Bash(echo \"exit: $?\")"
     ]
   }
 }

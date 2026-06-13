@@ -34,6 +34,10 @@ class MockWebSocket {
     return this.instances[this.instances.length - 1];
   }
 
+  static count(): number {
+    return this.instances.length;
+  }
+
   static clearInstances() {
     this.instances = [];
   }
@@ -198,17 +202,24 @@ describe('useRealtimePrice Hook', () => {
 
       jest.runAllTimers();
 
-      const initialInstanceCount = MockWebSocket.clearInstances.length;
+      // One socket after the initial mount + open.
+      await waitFor(() => {
+        expect(MockWebSocket.getLastInstance()?.readyState).toBe(WebSocket.OPEN);
+      });
+      const initialInstanceCount = MockWebSocket.count();
 
-      // Force multiple re-renders
+      // Force multiple re-renders. Each provider render recreates the inline
+      // onOpen/onClose callbacks; the hook must NOT tear down and reopen the
+      // socket in response (regression: Connecting/Disconnected thrash).
       rerender();
       rerender();
       rerender();
 
       jest.runAllTimers();
 
-      // Should not create additional WebSocket instances
-      expect(MockWebSocket.clearInstances.length).toBe(initialInstanceCount);
+      // No additional WebSocket instances, and the original stays open.
+      expect(MockWebSocket.count()).toBe(initialInstanceCount);
+      expect(MockWebSocket.getLastInstance()?.readyState).toBe(WebSocket.OPEN);
     });
   });
 
