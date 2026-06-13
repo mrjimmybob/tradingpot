@@ -48,26 +48,83 @@ else
     exit 1
 fi
 
-# Create Python virtual environment if it doesn't exist
+# --- Python virtual environment (hardened, idempotent) --------------------
+# The systemd unit runs ExecStart=<repo>/venv/bin/uvicorn, so the venv MUST
+# live at the repo root and MUST actually contain uvicorn. We build it
+# explicitly and VERIFY the result rather than assuming success. Run from the
+# repo root regardless of the caller's working directory.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$SCRIPT_DIR"
+VENV_DIR="$SCRIPT_DIR/venv"
+
+# bin/ on POSIX, Scripts/ on Windows (Git Bash / Cygwin dev boxes).
+venv_bin() {
+    if [ -d "$VENV_DIR/bin" ]; then echo "$VENV_DIR/bin"
+    elif [ -d "$VENV_DIR/Scripts" ]; then echo "$VENV_DIR/Scripts"
+    else echo "$VENV_DIR/bin"; fi
+}
+
+# A venv is only "healthy" if its interpreter runs AND pip/ensurepip work. A
+# directory alone is NOT proof of a usable environment.
+venv_is_healthy() {
+    local bin py
+    bin="$(venv_bin)"
+    py="$bin/python"; [ -x "$py" ] || py="$bin/python.exe"
+    [ -x "$py" ] || return 1
+    "$py" -c 'import ensurepip, pip' >/dev/null 2>&1
+}
+
 echo -e "\n${YELLOW}Setting up Python virtual environment...${NC}"
-if [ ! -d "venv" ]; then
-    python3 -m venv venv
-    echo -e "${GREEN}Virtual environment created${NC}"
-else
-    echo -e "${GREEN}Virtual environment already exists${NC}"
+if [ -d "$VENV_DIR" ] && ! venv_is_healthy; then
+    echo -e "${YELLOW}Existing venv is broken/incomplete - rebuilding it${NC}"
+    rm -rf "$VENV_DIR"
 fi
 
-# Activate virtual environment
-source venv/bin/activate 2>/dev/null || source venv/Scripts/activate 2>/dev/null
-
-# Install Python dependencies
-echo -e "\n${YELLOW}Installing Python dependencies...${NC}"
-if [ -f "backend/requirements.txt" ]; then
-    pip install -r backend/requirements.txt
-    echo -e "${GREEN}Python dependencies installed${NC}"
+if [ ! -d "$VENV_DIR" ]; then
+    if ! python3 -m venv "$VENV_DIR"; then
+        echo -e "${RED}Failed to create the virtual environment.${NC}"
+        echo -e "${RED}On Debian/Ubuntu the venv module is a separate package:${NC}"
+        echo -e "${RED}  sudo apt install -y python3-venv${NC}"
+        exit 1
+    fi
+    echo -e "${GREEN}Virtual environment created at $VENV_DIR${NC}"
 else
-    echo -e "${YELLOW}No requirements.txt found - will be created during development${NC}"
+    echo -e "${GREEN}Virtual environment already present${NC}"
 fi
+
+# Even after `python3 -m venv` returns 0, the env can lack pip/ensurepip
+# (the classic Debian failure when python3-venv is absent). Fail loudly
+# instead of silently falling back to system pip.
+if ! venv_is_healthy; then
+    echo -e "${RED}Virtual environment at $VENV_DIR has no working pip.${NC}"
+    echo -e "${RED}Install python3-venv (sudo apt install -y python3-venv) and re-run.${NC}"
+    exit 1
+fi
+
+VENV_BIN="$(venv_bin)"
+PYTHON="$VENV_BIN/python"
+
+# Install dependencies using the venv's OWN pip. Never rely on
+# `source activate`, which can silently no-op and leak installs into system
+# Python without anyone noticing.
+echo -e "\n${YELLOW}Upgrading pip and installing Python dependencies...${NC}"
+"$PYTHON" -m pip install --upgrade pip >/dev/null
+if [ ! -f "backend/requirements.txt" ]; then
+    echo -e "${RED}backend/requirements.txt is missing - cannot build the backend env.${NC}"
+    exit 1
+fi
+"$PYTHON" -m pip install -r backend/requirements.txt
+echo -e "${GREEN}Python dependencies installed${NC}"
+
+# Verify the EXACT artifact the systemd unit's ExecStart depends on. If this
+# is missing the service would die with status=203/EXEC at runtime; catch it
+# here instead.
+if [ ! -x "$VENV_BIN/uvicorn" ] && [ ! -f "$VENV_BIN/uvicorn.exe" ]; then
+    echo -e "${RED}uvicorn was not installed into $VENV_BIN.${NC}"
+    echo -e "${RED}The systemd ExecStart target would not exist - aborting.${NC}"
+    exit 1
+fi
+echo -e "${GREEN}uvicorn present at $VENV_BIN/uvicorn${NC}"
 
 # Install Node.js dependencies
 echo -e "\n${YELLOW}Installing Node.js dependencies...${NC}"

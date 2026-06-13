@@ -10,6 +10,9 @@ Group=tradingbot
 # Adjust to where you cloned the repo.
 WorkingDirectory=/opt/tradingbot/backend
 EnvironmentFile=-/opt/tradingbot/deploy/tradingbot.env
+# Fail fast with a readable journal message if the venv/uvicorn/packages are
+# missing, instead of an opaque status=203/EXEC from a non-existent ExecStart.
+ExecStartPre=/opt/tradingbot/deploy/validate_deployment.sh --quiet
 ExecStart=/opt/tradingbot/venv/bin/uvicorn app.main:app --host 127.0.0.1 --port 8000
 
 # Auto-restart on crash; combined with resume_bots_on_startup this gives a

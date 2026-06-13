@@ -10,7 +10,49 @@ by **systemd**, and the **web UI served by the backend** on the same origin.
 
 ---
 
-## 1. Prerequisites
+## 1. Get the code
+
+```bash
+sudo mkdir -p /opt/tradingbot && sudo chown "$USER" /opt/tradingbot
+git clone <your-repo-url> /opt/tradingbot
+cd /opt/tradingbot
+```
+
+Python 3.11+ (Debian 12 ships 3.11, Debian 13/Trixie ships 3.13 — both fine).
+
+## 2. One-command deploy (recommended)
+
+```bash
+./deploy/install.sh
+```
+
+This is the reproducible path. It installs apt prerequisites, builds the
+backend venv and web UI, creates the service user, **validates the install,
+and only then enables the service**. It renders the systemd unit to point at
+wherever you actually cloned the repo, so no manual path-editing is needed.
+
+The deployment is checked **before** the service is enabled, so a broken
+backend environment fails the installer with a clear message instead of
+surfacing later as `systemctl status` → `status=203/EXEC`. You can re-run the
+validation at any time:
+
+```bash
+./deploy/validate_deployment.sh --deep
+```
+
+Then skip to **§3 Serve the web UI** (config tweak) and **§6 onwards**. The
+manual steps below (§2a–§5) are the same thing broken out, for the curious or
+for non-`/opt/tradingbot` setups.
+
+After deploy, in `/opt/tradingbot/backend/config.yaml` under `server:`
+uncomment `frontend_dist: "../frontend/dist"` so the API serves the built UI
+on one origin, then `sudo systemctl restart tradingbot`. Leave
+`host: "127.0.0.1"` (loopback); no API token is needed on loopback.
+
+<details>
+<summary><b>Manual steps (what install.sh automates)</b></summary>
+
+### 2a. Prerequisites
 
 ```bash
 sudo apt update
@@ -20,37 +62,26 @@ sudo apt install -y git python3 python3-venv python3-pip
 sudo apt install -y nodejs npm
 ```
 
-Python 3.11+ (Debian 12 ships 3.11, Debian 13/Trixie ships 3.13 — both fine).
-
-## 2. Get the code and install
+### 2b. Build the backend env
 
 ```bash
-sudo mkdir -p /opt/tradingbot && sudo chown "$USER" /opt/tradingbot
-git clone <your-repo-url> /opt/tradingbot
 cd /opt/tradingbot
 ./init.sh          # creates venv, installs backend + frontend deps, writes config templates
 ```
 
-`init.sh` ends by suggesting `uvicorn --reload` — **ignore that for the dry run**;
-use the systemd service below (`--reload` is dev-only and won't survive a crash).
+`init.sh` is self-verifying: it rebuilds a broken/partial venv and **aborts if
+the venv or `venv/bin/uvicorn` is missing** after install. It ends by
+suggesting `uvicorn --reload` — **ignore that for the dry run**; use the
+systemd service (`--reload` is dev-only and won't survive a crash).
 
-## 3. Build the web UI
+### 3. Build the web UI
 
 ```bash
 cd /opt/tradingbot/frontend
 npm run build       # produces frontend/dist
 ```
 
-Enable the backend to serve it (one origin → one port to tunnel). In
-`/opt/tradingbot/backend/config.yaml`, under `server:` uncomment:
-
-```yaml
-  frontend_dist: "../frontend/dist"
-```
-
-Leave `host: "127.0.0.1"` (loopback). No API token is needed on loopback.
-
-## 4. Service user and permissions
+### 4. Service user and permissions
 
 ```bash
 sudo useradd --system --home /opt/tradingbot --shell /usr/sbin/nologin tradingbot
@@ -60,11 +91,16 @@ sudo chown -R tradingbot:tradingbot /opt/tradingbot
 The service writes to `backend/tradingbot.db`, `backend/logs/`, and
 `backend/backups/`, so the `tradingbot` user must own the tree (above does this).
 
-## 5. Install and start the systemd service
+### 5. Validate, install, and start the service
 
 ```bash
 cp /opt/tradingbot/deploy/tradingbot.env.example /opt/tradingbot/deploy/tradingbot.env
 # (loopback dry run: nothing to edit)
+
+# Gate: confirm venv + uvicorn + packages + ExecStart target all exist.
+/opt/tradingbot/deploy/validate_deployment.sh --deep \
+  --unit /opt/tradingbot/deploy/tradingbot.service
+
 sudo cp /opt/tradingbot/deploy/tradingbot.service /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now tradingbot
@@ -72,7 +108,13 @@ systemctl status tradingbot
 ```
 
 If you cloned somewhere other than `/opt/tradingbot`, edit the `WorkingDirectory`,
-`EnvironmentFile`, and `ExecStart` paths in the unit first.
+`EnvironmentFile`, `ExecStart`, and `ExecStartPre` paths in the unit first
+(or just use `./deploy/install.sh`, which does this for you). The unit also
+runs `validate_deployment.sh` as an `ExecStartPre`, so even a hand-installed
+service refuses to start with a broken environment rather than dying with
+`status=203/EXEC`.
+
+</details>
 
 A fresh database is created automatically on first start (schema includes the
 `strategy_state` column). **Reusing an older DB?** Run
@@ -134,6 +176,7 @@ after a restart, so the run continues across reboots/crashes.
 cd /opt/tradingbot && git pull
 venv/bin/pip install -r backend/requirements.txt
 ( cd frontend && npm run build )
+./deploy/validate_deployment.sh --deep   # re-check before restarting
 sudo systemctl restart tradingbot
 
 # stop (graceful: saves bot state; bots stay RUNNING and resume on next start)
