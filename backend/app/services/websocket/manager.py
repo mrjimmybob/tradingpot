@@ -216,7 +216,12 @@ class WebSocketManager:
         while self._running:
             try:
                 if self._rest_exchange is not None:
-                    for symbol in [s for s in self._tracked_symbols if s != "*"]:
+                    # Defense in depth: never poll the "*" sentinel or a blank
+                    # symbol even if one somehow got tracked.
+                    for symbol in [
+                        s for s in self._tracked_symbols
+                        if isinstance(s, str) and s.strip() and s != "*"
+                    ]:
                         ticker = await self._rest_exchange.get_ticker(symbol)
                         if not ticker:
                             continue
@@ -295,6 +300,14 @@ class WebSocketManager:
         if symbol == "*":
             return True
 
+        # Reject blank/non-string symbols at the single registration chokepoint.
+        # An empty symbol from a frontend WS subscribe used to land in
+        # _tracked_symbols and make the REST poll loop call fetch_ticker("")
+        # every tick ("mexc does not have market symbol").
+        if not isinstance(symbol, str) or not symbol.strip():
+            logger.warning("Ignoring blank market-data subscription request")
+            return False
+
         # Lock spans the check and the exchange subscription so concurrent calls
         # for the same symbol can't race past the guard and double-subscribe.
         async with self._subscribe_lock:
@@ -358,6 +371,9 @@ class WebSocketManager:
             if action == "subscribe":
                 symbols = data.get("symbols", [])
                 for symbol in symbols:
+                    # Skip blanks; "*" (broadcast sentinel) is intentionally kept.
+                    if not isinstance(symbol, str) or (symbol != "*" and not symbol.strip()):
+                        continue
                     await self.subscribe_symbol(symbol)
                     self._client_subscriptions[websocket].add(symbol)
 
