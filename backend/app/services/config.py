@@ -452,6 +452,12 @@ class ConfigService:
         }
 
         if expected_type == "dict":
+            # A section header whose child keys are all commented out parses as
+            # YAML null (e.g. `market_data:` with only comments under it). Treat
+            # that as an empty section — every property is optional — rather than
+            # failing startup. This is a normal config-editing pattern.
+            if value is None:
+                value = {}
             if not isinstance(value, dict):
                 errors.append(ConfigValidationError(
                     path=path,

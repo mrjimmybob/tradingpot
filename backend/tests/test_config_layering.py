@@ -73,6 +73,32 @@ class TestPrecedence:
         assert cs.get("server.host") == "127.0.0.1"
         assert cs.get("logging.level") == "INFO"
 
+    def test_null_section_is_treated_as_empty(self, base_config):
+        """A section header with all child keys commented out parses as YAML
+        null; it must validate (all properties optional), not crash startup.
+
+        Regression: a `market_data:` section with everything commented produced
+        `market_data: Expected dict, got NoneType` and `sys.exit(1)` on boot.
+        """
+        with open(base_config, "a") as f:
+            f.write("\nmarket_data:\n")  # null section, like all-commented keys
+        cs = ConfigService(str(base_config))
+        cs.load_and_validate()  # must not raise
+        assert cs.get("market_data.source") is None  # absent -> default downstream
+        assert cs.get("server.port") == 8000          # rest of config intact
+
+    def test_shipped_config_yaml_validates(self):
+        """The actual shipped backend/config.yaml must pass validation.
+
+        Guards against the gap that let `market_data: null` reach production: a
+        config edit that boots fine in synthetic tests but crashes the REAL app
+        at startup with a ConfigValidationException -> sys.exit(1) -> failed
+        deploy. This validates the real file the server boots from.
+        """
+        real = Path(__file__).resolve().parent.parent / "config.yaml"
+        cs = ConfigService(str(real))
+        cs.load_and_validate()  # must not raise
+
     def test_profile_overrides_base(self, base_config, monkeypatch):
         _write(base_config.parent / "config.production.yaml", """
             server:

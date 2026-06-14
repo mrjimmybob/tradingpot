@@ -29,8 +29,14 @@ yarn-error.log*
 # Testing/Screenshots
 .playwright-mcp/
 
-# Databases
+# Databases — including SQLite WAL/SHM sidecars and ad-hoc backups. These MUST
+# stay untracked: a tracked -wal/-shm gets overwritten by `git reset --hard`
+# during deploy, which desyncs/corrupts the live database (can drop committed
+# rows still resident in the WAL).
 *.db
+*.db-wal
+*.db-shm
+*.db.bak*
 
 # Environment files (may hold secrets/tokens) — never commit. Loaded at
 # startup as a config layer; process env still overrides file values.
