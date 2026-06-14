@@ -32,6 +32,16 @@ database:
   # so the DB location is stable regardless of the process working directory.
   url: "sqlite+aiosqlite:///./tradingbot.db"
 
+market_data:
+  # Source for the dashboard's live price + indicators. Does NOT affect trading:
+  # the engine always reads its own REST tickers.
+  #   rest      (default) poll fetch_ticker. Works everywhere REST works; MEXC
+  #             blocks its public WEBSOCKET streams from many IPs/regions.
+  #   websocket native MEXC stream connector (richer orderbook/volume data) -
+  #             only where MEXC permits streams from this host's IP.
+  # source: "rest"
+  # rest_poll_interval_seconds: 2.0
+
 trading:
   # Default values for bot execution
   execution_interval_seconds: 1

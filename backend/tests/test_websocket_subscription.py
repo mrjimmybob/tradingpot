@@ -15,11 +15,13 @@ exceeded: 36 > 30 / Current Price 0" report:
 """
 
 import asyncio
+from datetime import datetime
 
 import pytest
 
 from app.services.websocket.mexc import MEXCWebSocketConnector
 from app.services.websocket.manager import WebSocketManager
+from app.services.exchange import Ticker
 
 
 class TestSymbolNormalization:
@@ -143,3 +145,66 @@ class TestSubscribeSymbolSafety:
         assert await m.subscribe_symbol("*") is True
         assert fc.calls == 0
         assert "*" not in m._tracked_symbols
+
+    @pytest.mark.asyncio
+    async def test_rest_mode_subscribe_tracks_without_connector(self):
+        """With no stream connector (REST feed), subscribing just tracks the
+        symbol so the poll loop can pick it up."""
+        m = WebSocketManager()  # no connectors registered
+        assert await m.subscribe_symbol("BTC/USDT") is True
+        assert "BTC/USDT" in m._tracked_symbols
+
+
+class TestRestPriceFeed:
+    @pytest.mark.asyncio
+    async def test_poll_loop_broadcasts_and_caches_price(self):
+        m = WebSocketManager()
+
+        class FakeRest:
+            async def get_ticker(self, symbol):
+                return Ticker(
+                    symbol=symbol, bid=63851.0, ask=63852.0, last=63851.5,
+                    volume=10.0, timestamp=datetime.utcnow(),
+                )
+
+        m._rest_exchange = FakeRest()
+        m._tracked_symbols.add("BTC/USDT")
+        m._running = True
+
+        seen = []
+
+        async def fake_broadcast(msg):
+            seen.append(msg)
+        m.broadcast = fake_broadcast
+
+        task = asyncio.create_task(m._price_poll_loop())
+        await asyncio.sleep(0.2)
+        m._running = False
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+        prices = [s for s in seen if s.get("type") == "price_update"]
+        assert prices, "no price_update broadcast"
+        assert prices[0]["symbol"] == "BTC/USDT"
+        assert prices[0]["price"] == 63851.5
+        assert m._price_cache["BTC/USDT"].price == 63851.5
+
+
+class TestSubscriptionResponseHandling:
+    def test_blocked_rejection_is_not_treated_as_success(self, caplog):
+        """MEXC returns code:0 even for rejections; a 'Blocked!' response must
+        be logged as rejected, not silently confirmed."""
+        import logging
+
+        c = MEXCWebSocketConnector()
+        blocked = (
+            '{"id":0,"code":0,"msg":"Not Subscribed successfully! '
+            '[spot@public.bookTicker.v3.api@BTCUSDT].  Reason： Blocked! "}'
+        )
+        with caplog.at_level(logging.WARNING):
+            result = c._parse_message(blocked)
+        assert result is None  # control message, not market data
+        assert any("rejected" in r.message.lower() for r in caplog.records)

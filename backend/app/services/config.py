@@ -48,6 +48,17 @@ CONFIG_SCHEMA = {
             "url": {"type": "str", "required": False},
         }
     },
+    "market_data": {
+        "type": "dict",
+        "required": False,
+        "properties": {
+            # UI live-price/indicator feed source. "rest" (default) polls
+            # fetch_ticker; "websocket" uses the native MEXC stream connector
+            # (only where MEXC permits streams from the host IP).
+            "source": {"type": "str", "required": False, "options": ["rest", "websocket"]},
+            "rest_poll_interval_seconds": {"type": "float", "required": False, "min": 0.5},
+        }
+    },
     "trading": {
         "type": "dict",
         "required": False,

@@ -109,6 +109,24 @@ The web GUI is part of the product and is served **by default**:
 Because serving is automatic, the UI works with **no manual config edit** and
 survives CI/CD `git reset` of tracked files.
 
+## Market-data feed (UI live price)
+
+The dashboard's live price and indicators are fed from one of two sources,
+selected by `market_data.source`. **This does not affect trading** — the engine
+always reads its own REST tickers regardless.
+
+| `market_data.source` | Behaviour |
+|----------------------|-----------|
+| `rest` (default) | Polls `fetch_ticker` every `market_data.rest_poll_interval_seconds` (default 2.0s) for subscribed symbols and broadcasts price updates. Works wherever REST works. |
+| `websocket` | Uses the native MEXC stream connector (richer orderbook/volume indicators). |
+
+MEXC **blocks its public websocket streams from many IPs/regions** (the stream
+subscribe returns `Reason: Blocked!`) while REST stays available, which is why
+`rest` is the default. Use `websocket` only on a host whose IP MEXC permits for
+streaming. In `rest` mode the orderbook/volume/spread indicators are limited
+(they need stream data); price and price-based indicators (e.g. realized
+volatility) still populate.
+
 ## CI/CD reproducibility
 
 Automated deploys reset the working tree to the repository state

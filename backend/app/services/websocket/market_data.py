@@ -302,8 +302,14 @@ class MarketDataService:
         """Background loop to compute and broadcast indicators."""
         while self._running:
             try:
-                # Compute indicators for all tracked symbols
-                symbols = set(self._depth_history.keys()) | set(self._trade_history.keys())
+                # Compute indicators for all tracked symbols. price_history is
+                # included so a REST-only feed (no depth/trades) still produces
+                # price-based indicators (e.g. realized volatility, last_price).
+                symbols = (
+                    set(self._depth_history.keys())
+                    | set(self._trade_history.keys())
+                    | set(self._price_history.keys())
+                )
 
                 for symbol in symbols:
                     indicators = await self._compute_indicators(symbol)

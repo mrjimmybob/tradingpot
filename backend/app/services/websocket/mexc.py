@@ -158,12 +158,18 @@ class MEXCWebSocketConnector(BaseWebSocketConnector):
                 logger.debug("MEXC: Received PONG")
                 return None
 
-            # Handle subscription responses
+            # Handle subscription responses. MEXC returns code:0 even for
+            # REJECTIONS (e.g. "Not Subscribed successfully! ... Reason: Blocked!"
+            # when streams are IP/region-restricted), so the message must be
+            # inspected, not just the code, to avoid reporting a blocked stream
+            # as a live subscription.
             if "code" in data and "msg" in data:
-                if data["code"] == 0:
-                    logger.debug(f"MEXC: Subscription confirmed: {data['msg']}")
+                msg = str(data.get("msg", ""))
+                low = msg.lower()
+                if data["code"] == 0 and "not subscribed" not in low and "blocked" not in low:
+                    logger.debug(f"MEXC: Subscription confirmed: {msg}")
                 else:
-                    logger.warning(f"MEXC: Subscription error: {data}")
+                    logger.warning(f"MEXC: Subscription rejected: {msg}")
                 return None
 
             # Handle data messages

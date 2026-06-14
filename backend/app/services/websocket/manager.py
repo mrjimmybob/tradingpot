@@ -137,6 +137,13 @@ class WebSocketManager:
         self._bot_update_task: Optional[asyncio.Task] = None
         self._running = False
 
+        # UI market-data feed. Default is REST polling because MEXC blocks its
+        # public websocket streams from many IPs; "websocket" re-enables the
+        # native stream connector. Trading is unaffected by this choice.
+        self._market_source = "rest"
+        self._rest_exchange = None
+        self._price_poll_task: Optional[asyncio.Task] = None
+
     async def start(self) -> None:
         """Start WebSocket manager."""
         if self._running:
@@ -144,34 +151,100 @@ class WebSocketManager:
 
         self._running = True
 
-        # Initialize MEXC connector
-        mexc = MEXCWebSocketConnector()
-        self._connectors["MEXC"] = mexc
+        from ..config import config_service
+        self._market_source = (config_service.get("market_data.source") or "rest").lower()
 
-        # Connect market data handlers
-        mexc.on_depth(self._market_data.handle_depth)
-        mexc.on_trade(self._market_data.handle_trade)
-        mexc.on_kline(self._market_data.handle_kline)
-        mexc.on_ticker(self._market_data.handle_ticker)
-
-        # Connect price update handler for frontend
-        mexc.on_trade(self._handle_trade_for_frontend)
-        mexc.on_ticker(self._handle_ticker_for_frontend)
-
-        # Connect indicator handler for frontend
+        # Indicator broadcasting is shared by both feeds.
         self._market_data.on_indicators(self._handle_indicators)
-
-        # Start market data service
         await self._market_data.start()
 
-        # Connect to exchange
-        await mexc.connect()
+        if self._market_source == "websocket":
+            await self._start_websocket_feed()
+        else:
+            await self._start_rest_feed()
 
         # Start background tasks
         self._broadcast_task = asyncio.create_task(self._broadcast_loop())
         self._bot_update_task = asyncio.create_task(self._bot_status_loop())
 
-        logger.info("WebSocketManager started")
+        logger.info(f"WebSocketManager started (market_data source: {self._market_source})")
+
+    async def _start_websocket_feed(self) -> None:
+        """Wire the native MEXC stream connector (opt-in via market_data.source).
+
+        Only usable where MEXC permits websocket streams from the host IP; many
+        IPs/regions are blocked, in which case use the default REST feed.
+        """
+        mexc = MEXCWebSocketConnector()
+        self._connectors["MEXC"] = mexc
+
+        mexc.on_depth(self._market_data.handle_depth)
+        mexc.on_trade(self._market_data.handle_trade)
+        mexc.on_kline(self._market_data.handle_kline)
+        mexc.on_ticker(self._market_data.handle_ticker)
+
+        # Price updates to the frontend.
+        mexc.on_trade(self._handle_trade_for_frontend)
+        mexc.on_ticker(self._handle_ticker_for_frontend)
+
+        await mexc.connect()
+
+    async def _start_rest_feed(self) -> None:
+        """Start the REST price poller — the default UI price source.
+
+        MEXC blocks its public websocket streams from many IPs but serves REST,
+        so the dashboard price is polled via fetch_ticker. The trading engine is
+        independent of this and uses its own REST tickers regardless.
+        """
+        from ..exchange import ExchangeService
+
+        self._rest_exchange = ExchangeService()
+        if not await self._rest_exchange.connect():
+            logger.error(
+                "REST price feed: exchange connect failed; UI live price disabled "
+                "(trading is unaffected)"
+            )
+            self._rest_exchange = None
+            return
+        self._price_poll_task = asyncio.create_task(self._price_poll_loop())
+
+    async def _price_poll_loop(self) -> None:
+        """Poll REST tickers for tracked symbols and broadcast UI price updates."""
+        from ..config import config_service
+
+        interval = float(config_service.get("market_data.rest_poll_interval_seconds") or 2.0)
+        while self._running:
+            try:
+                if self._rest_exchange is not None:
+                    for symbol in [s for s in self._tracked_symbols if s != "*"]:
+                        ticker = await self._rest_exchange.get_ticker(symbol)
+                        if not ticker:
+                            continue
+                        ts = ticker.timestamp or datetime.utcnow()
+                        price_update = PriceUpdate(
+                            symbol=symbol,
+                            price=ticker.last,
+                            bid=ticker.bid,
+                            ask=ticker.ask,
+                            timestamp=ts.isoformat(),
+                        )
+                        self._price_cache[symbol] = price_update
+                        await self.broadcast(asdict(price_update))
+
+                        # Feed price-based indicators (e.g. realized volatility).
+                        await self._market_data.handle_ticker(TickerUpdate(
+                            symbol=symbol, timestamp=ts, exchange="MEXC",
+                            last_price=ticker.last, bid_price=ticker.bid,
+                            ask_price=ticker.ask, high_24h=0, low_24h=0,
+                            volume_24h=ticker.volume, price_change_24h=0,
+                            price_change_percent_24h=0,
+                        ))
+                await asyncio.sleep(interval)
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"REST price poll error: {e}")
+                await asyncio.sleep(interval)
 
     async def stop(self) -> None:
         """Stop WebSocket manager."""
@@ -185,6 +258,17 @@ class WebSocketManager:
         if self._bot_update_task:
             self._bot_update_task.cancel()
             self._bot_update_task = None
+
+        # Stop the REST price poller and release its exchange connection.
+        if self._price_poll_task:
+            self._price_poll_task.cancel()
+            self._price_poll_task = None
+        if self._rest_exchange is not None:
+            try:
+                await self._rest_exchange.disconnect()
+            except Exception:
+                pass
+            self._rest_exchange = None
 
         # Stop market data service
         await self._market_data.stop()
@@ -217,11 +301,16 @@ class WebSocketManager:
             if symbol in self._tracked_symbols:
                 return True
 
-            # Subscribe on all connectors
-            success = False
-            for connector in self._connectors.values():
-                if await connector.subscribe_all(symbol):
-                    success = True
+            if self._connectors:
+                # websocket feed: a subscription must be accepted by a connector.
+                success = False
+                for connector in self._connectors.values():
+                    if await connector.subscribe_all(symbol):
+                        success = True
+            else:
+                # REST feed: tracking the symbol is the subscription; the poll
+                # loop picks it up on its next tick.
+                success = True
 
             if success:
                 self._tracked_symbols.add(symbol)
