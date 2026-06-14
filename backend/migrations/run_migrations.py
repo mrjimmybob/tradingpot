@@ -121,17 +121,28 @@ async def main():
     logger.info("=" * 70)
 
     try:
+        # Ensure the ORM-owned baseline schema exists BEFORE applying SQL
+        # migrations. The SQL migrations are incremental: they ALTER/extend core
+        # tables that the ORM owns (e.g. 001 -> `orders`, 003 -> `bots`). Those
+        # tables are created by `Base.metadata.create_all` (what the app runs at
+        # startup via init_db), NOT by the migrations themselves. The deployment
+        # applies migrations while the service is stopped — i.e. before the app's
+        # init_db ever runs — so without this step a migration that touches a
+        # core table fails on an empty / partially-initialized database with
+        # "no such table". create_all is idempotent: it creates only missing
+        # tables and is a no-op on an existing production DB, so running it here
+        # makes the migration runner self-sufficient regardless of start order.
+        await create_tables_from_models()
+
         # Find all migration files
         migrations_dir = Path(__file__).parent
         migration_files = sorted(migrations_dir.glob("*.sql"))
-        
+
         if migration_files:
             for migration_file in migration_files:
                 await apply_sql_migration(migration_file)
         else:
-            logger.warning("No SQL migration files found")
-            logger.info("Using ORM-based table creation instead...")
-            await create_tables_from_models()
+            logger.info("No SQL migration files found (ORM baseline already ensured)")
 
         # Verify migration (check accounting tables)
         success = await verify_migration()

@@ -36,6 +36,16 @@ jobs:
         working-directory: backend
         run: pytest
 
+  deploy-scripts:
+    name: Deploy script tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Syntax-check deploy.sh
+        run: bash -n deploy/deploy.sh
+      - name: Deploy orchestration tests (stubbed; no real server)
+        run: bash deploy/tests/test_deploy_rollback.sh
+
   frontend:
     name: Frontend build + lint
     runs-on: ubuntu-latest
