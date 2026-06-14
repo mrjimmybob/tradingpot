@@ -78,7 +78,7 @@ async def lifespan(app: FastAPI):
 
     # Auto-resume bots that were running when server stopped
     try:
-        resumed_count = await trading_engine.trading_engine.resume_bots_on_startup()
+        resumed_count = await trading_engine.resume_bots_on_startup()
         if resumed_count > 0:
             print(f"Resumed {resumed_count} bot(s) from previous session")
     except Exception as e:
@@ -91,7 +91,7 @@ async def lifespan(app: FastAPI):
 
     # Graceful shutdown of trading engine (saves state)
     try:
-        shutdown_count = await trading_engine.trading_engine.graceful_shutdown()
+        shutdown_count = await trading_engine.graceful_shutdown()
         if shutdown_count > 0:
             print(f"Saved state for {shutdown_count} bot(s)")
     except Exception as e:

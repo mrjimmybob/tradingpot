@@ -100,7 +100,18 @@
       "Bash(python3 -m venv /tmp/yamlcheck)",
       "Bash(/tmp/yamlcheck/bin/pip install *)",
       "Bash(/tmp/yamlcheck/bin/python -)",
-      "Bash(rm -rf /tmp/yamlcheck)"
+      "Bash(rm -rf /tmp/yamlcheck)",
+      "Bash(python3 -c \"import fastapi, sqlalchemy, pytest, aiosqlite; print\\('system has deps'\\)\")",
+      "Bash(python3 -m venv .venv)",
+      "Bash(.venv/bin/pip install *)",
+      "Bash(echo \"EXIT=$?\")",
+      "Bash(.venv/bin/python -c \"import fastapi, ccxt, sqlalchemy, aiosqlite, pytest, httpx; print\\('deps OK'\\)\")",
+      "Bash(.venv/bin/python -m pytest tests/test_startup_resume.py -v)",
+      "Bash(.venv/bin/python -c \"from app.services.websocket import ws_manager; print\\([m for m in \\('start','stop'\\) if hasattr\\(ws_manager,m\\)]\\)\")",
+      "Bash(.venv/bin/python -c \"from app.services.db_backup import db_backup_service; print\\([m for m in \\('backup_once','start','stop'\\) if hasattr\\(db_backup_service,m\\)]\\)\")",
+      "Bash(cp app/main.py /tmp/main.py.good)",
+      "Bash(.venv/bin/python -m pytest tests/test_startup_resume.py -q)",
+      "Bash(.venv/bin/python -m pytest -q)"
     ]
   }
 }
