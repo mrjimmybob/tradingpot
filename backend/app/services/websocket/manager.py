@@ -123,6 +123,10 @@ class WebSocketManager:
 
         # Symbol tracking
         self._tracked_symbols: Set[str] = set()
+        # Serialize subscribe_symbol so concurrent calls for the same symbol
+        # (e.g. several UI components mounting at once) can't both pass the
+        # "already tracked?" check and double-subscribe on the exchange.
+        self._subscribe_lock = asyncio.Lock()
 
         # Latest data cache for new clients
         self._price_cache: Dict[str, PriceUpdate] = {}
@@ -202,20 +206,28 @@ class WebSocketManager:
 
     async def subscribe_symbol(self, symbol: str) -> bool:
         """Subscribe to market data for a symbol."""
-        if symbol in self._tracked_symbols:
+        # "*" is a broadcast-filter sentinel (see broadcast()/_client_subscriptions),
+        # not a real market symbol — it must never be sent to the exchange.
+        if symbol == "*":
             return True
 
-        # Subscribe on all connectors
-        success = False
-        for connector in self._connectors.values():
-            if await connector.subscribe_all(symbol):
-                success = True
+        # Lock spans the check and the exchange subscription so concurrent calls
+        # for the same symbol can't race past the guard and double-subscribe.
+        async with self._subscribe_lock:
+            if symbol in self._tracked_symbols:
+                return True
 
-        if success:
-            self._tracked_symbols.add(symbol)
-            logger.info(f"Subscribed to market data for {symbol}")
+            # Subscribe on all connectors
+            success = False
+            for connector in self._connectors.values():
+                if await connector.subscribe_all(symbol):
+                    success = True
 
-        return success
+            if success:
+                self._tracked_symbols.add(symbol)
+                logger.info(f"Subscribed to market data for {symbol}")
+
+            return success
 
     async def unsubscribe_symbol(self, symbol: str) -> bool:
         """Unsubscribe from market data for a symbol."""

@@ -72,6 +72,20 @@ class MEXCWebSocketConnector(BaseWebSocketConnector):
     def ws_url(self) -> str:
         return self.WS_URL
 
+    def _native_symbol(self, symbol: str) -> str:
+        """MEXC symbols are slash-less and upper-case (e.g. ``BTCUSDT``).
+
+        Unified pairs such as ``BTC/USDT`` must have the separator stripped or
+        MEXC rejects the channel and closes the socket (close code 1005).
+        """
+        return symbol.replace("/", "").upper()
+
+    def _reset_subscription_state(self) -> None:
+        # A fresh socket starts with zero server-side subscriptions; the local
+        # counter must follow or a reconnect's _resubscribe re-adds the full set
+        # on top of a stale count and falsely trips MAX_SUBSCRIPTIONS.
+        self._subscription_count = 0
+
     async def _send_subscribe(self, channels: List[str]) -> None:
         """Send subscription to MEXC."""
         if not self._ws:
@@ -116,21 +130,21 @@ class MEXCWebSocketConnector(BaseWebSocketConnector):
 
     def _get_depth_channel(self, symbol: str) -> str:
         """Get depth channel for symbol."""
-        return self.DEPTH_CHANNEL.format(symbol=symbol.upper())
+        return self.DEPTH_CHANNEL.format(symbol=self._native_symbol(symbol))
 
     def _get_trade_channel(self, symbol: str) -> str:
         """Get trade channel for symbol."""
-        return self.TRADE_CHANNEL.format(symbol=symbol.upper())
+        return self.TRADE_CHANNEL.format(symbol=self._native_symbol(symbol))
 
     def _get_ticker_channel(self, symbol: str) -> str:
         """Get book ticker channel for symbol."""
-        return self.BOOK_TICKER_CHANNEL.format(symbol=symbol.upper())
+        return self.BOOK_TICKER_CHANNEL.format(symbol=self._native_symbol(symbol))
 
     def _get_kline_channel(self, symbol: str, interval: str) -> str:
         """Get kline channel for symbol and interval."""
         mexc_interval = self.INTERVAL_MAP.get(interval, "Min1")
         return self.KLINE_CHANNEL.format(
-            symbol=symbol.upper(),
+            symbol=self._native_symbol(symbol),
             interval=mexc_interval,
         )
 
@@ -154,7 +168,11 @@ class MEXCWebSocketConnector(BaseWebSocketConnector):
 
             # Handle data messages
             channel = data.get("c") or data.get("channel", "")
-            symbol = data.get("s") or data.get("symbol", "")
+            raw_symbol = data.get("s") or data.get("symbol", "")
+            # MEXC echoes the native symbol ("BTCUSDT"); map it back to the
+            # unified form ("BTC/USDT") the manager and frontend key on. Falls
+            # back to the raw value for an unrecognised (unsubscribed) symbol.
+            symbol = self._symbol_map.get((raw_symbol or "").upper(), raw_symbol)
 
             # Determine message type from channel
             if "depth" in channel.lower():

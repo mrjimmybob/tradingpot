@@ -203,6 +203,28 @@ class BaseWebSocketConnector(ABC):
         self._ticker_subscriptions: set = set()
         self._kline_subscriptions: Dict[str, set] = {}  # symbol -> intervals
 
+        # Map native exchange symbol (e.g. "BTCUSDT") -> unified symbol
+        # ("BTC/USDT"). Outbound channels use the native form; inbound messages
+        # are mapped back so the manager/frontend see the unified symbol.
+        self._symbol_map: Dict[str, str] = {}
+
+    def _native_symbol(self, symbol: str) -> str:
+        """Exchange-native form of a unified symbol. Override per exchange."""
+        return symbol
+
+    def _register_symbol(self, symbol: str) -> None:
+        """Record the native<->unified mapping for inbound message lookup."""
+        self._symbol_map[self._native_symbol(symbol)] = symbol
+
+    def _reset_subscription_state(self) -> None:
+        """Reset exchange-specific subscription accounting on (re)connect.
+
+        A new socket starts with zero server-side subscriptions, so connectors
+        that track a count must reset it here; otherwise a stale count makes
+        ``_resubscribe`` falsely trip the per-connection subscription limit.
+        """
+        pass
+
     @property
     @abstractmethod
     def ws_url(self) -> str:
@@ -279,6 +301,7 @@ class BaseWebSocketConnector(ABC):
         channel = self._get_depth_channel(symbol)
         try:
             await self._send_subscribe([channel])
+            self._register_symbol(symbol)
             self._depth_subscriptions.add(symbol)
             self.state.subscriptions.add(channel)
             logger.info(f"{self.exchange_name}: Subscribed to depth for {symbol}")
@@ -295,6 +318,7 @@ class BaseWebSocketConnector(ABC):
         channel = self._get_trade_channel(symbol)
         try:
             await self._send_subscribe([channel])
+            self._register_symbol(symbol)
             self._trade_subscriptions.add(symbol)
             self.state.subscriptions.add(channel)
             logger.info(f"{self.exchange_name}: Subscribed to trades for {symbol}")
@@ -311,6 +335,7 @@ class BaseWebSocketConnector(ABC):
         channel = self._get_ticker_channel(symbol)
         try:
             await self._send_subscribe([channel])
+            self._register_symbol(symbol)
             self._ticker_subscriptions.add(symbol)
             self.state.subscriptions.add(channel)
             logger.info(f"{self.exchange_name}: Subscribed to ticker for {symbol}")
@@ -330,6 +355,7 @@ class BaseWebSocketConnector(ABC):
         channel = self._get_kline_channel(symbol, interval)
         try:
             await self._send_subscribe([channel])
+            self._register_symbol(symbol)
             self._kline_subscriptions[symbol].add(interval)
             self.state.subscriptions.add(channel)
             logger.info(f"{self.exchange_name}: Subscribed to kline {interval} for {symbol}")
@@ -396,6 +422,10 @@ class BaseWebSocketConnector(ABC):
             self.state.is_connecting = False
             self.state.last_connected = datetime.utcnow()
             self.state.reconnect_attempts = 0
+
+            # A fresh socket has zero server-side subscriptions; reset any
+            # exchange-specific count so _resubscribe re-counts from scratch.
+            self._reset_subscription_state()
 
             # Start background tasks
             self._receive_task = asyncio.create_task(self._receive_loop())

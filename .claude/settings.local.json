@@ -114,7 +114,9 @@
       "Bash(.venv/bin/python -m pytest -q)",
       "Bash(.venv/bin/python -c ' *)",
       "Bash(.venv/bin/python -m pytest tests/test_auth.py tests/test_operational_hardening.py tests/test_startup_resume.py -q)",
-      "Bash(.venv/bin/python -m pytest tests/test_config_layering.py -v)"
+      "Bash(.venv/bin/python -m pytest tests/test_config_layering.py -v)",
+      "Bash(.venv/bin/python -m pytest tests/test_websocket_subscription.py -q)",
+      "Bash(timeout 60 .venv/bin/python -c ' *)"
     ]
   }
 }
