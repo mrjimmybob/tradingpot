@@ -491,6 +491,20 @@ class TradingEngine:
                     # Generate trading signal from strategy
                     signal = await self._execute_strategy(bot, ticker.last, session)
 
+                    # TEMP DIAGNOSTIC [EVAL]: proves the evaluation loop is
+                    # executing and shows each decision. Remove once the
+                    # no-trades investigation is resolved. (TradeSignal has no
+                    # numeric score; decision=action, with the strategy's reason.)
+                    logger.info(
+                        "[EVAL] bot=%s symbol=%s ts=%s price=%s decision=%s reason=%s",
+                        bot_id,
+                        bot.trading_pair,
+                        datetime.utcnow().isoformat(),
+                        ticker.last,
+                        (signal.action.upper() if signal else "NONE"),
+                        (signal.reason if signal else "no signal (strategy returned None)"),
+                    )
+
                     if signal and signal.action != "hold":
                         # CR-1: budget validation gates BUYS only (capital
                         # deployment). Sells reduce exposure and must never be

@@ -35,9 +35,50 @@ def binding_failsafe_error(host: str, token: str) -> str:
     return ""
 
 
+def _configure_logging() -> None:
+    """Route application logs (``logging.getLogger('app.*')``) to stdout at the
+    configured level.
+
+    Under uvicorn nothing configures the root logger for app modules, so
+    Python's last-resort handler drops everything below WARNING — which silently
+    hides every ``logger.info`` (including all strategy-evaluation logs) in
+    production. We attach a handler to the ``app`` logger namespace (not root,
+    to avoid duplicating uvicorn's access logs) using ``logging.level`` /
+    ``logging.format`` from config.
+    """
+    import logging
+
+    default_fmt = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+    try:
+        level_name = str(config_service.get("logging.level") or "INFO").upper()
+        level = getattr(logging, level_name, logging.INFO)
+        if not isinstance(level, int):  # e.g. a non-level attribute name
+            level = logging.INFO
+
+        fmt = config_service.get("logging.format") or default_fmt
+        try:
+            formatter = logging.Formatter(fmt)
+        except Exception:
+            # A malformed logging.format must not crash startup.
+            formatter = logging.Formatter(default_fmt)
+
+        app_logger = logging.getLogger("app")
+        app_logger.setLevel(level)
+        if not any(isinstance(h, logging.StreamHandler) for h in app_logger.handlers):
+            handler = logging.StreamHandler()
+            handler.setFormatter(formatter)
+            app_logger.addHandler(handler)
+        app_logger.propagate = False  # don't double-emit via the root logger
+    except Exception as e:  # logging setup must never prevent startup
+        print(f"WARNING: could not configure application logging: {e}")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan handler."""
+    # Make application logs visible (otherwise INFO is dropped under uvicorn).
+    _configure_logging()
+
     # Startup: Validate configuration
     try:
         config = config_service.load_and_validate()
