@@ -32,21 +32,22 @@ yarn-error.log*
 # Databases
 *.db
 
-# Environment
+# Environment files (may hold secrets/tokens) — never commit. Loaded at
+# startup as a config layer; process env still overrides file values.
+# Templates are kept tracked: *.env.example / *.env.template do not match *.env.
 .env
-.env.local
-.env.*.local
+*.env
+!*.env.example
+!*.env.template
 
 # Logs
 logs/*.log
 
-# Config secrets (but keep templates)
+# Config secrets (but keep templates). Profile files (config.<name>.yaml) are
+# intentionally NOT ignored: they hold reproducible, non-secret overrides and
+# must survive CI/CD git resets. Secrets belong in *.env files (above).
 config/exchanges.yaml
 config/email.yaml
-
-# Deployment secrets — the live env file holds API tokens/keys; never commit
-# it. The *.env.example template is tracked (it does not match *.env).
-deploy/*.env
 
 # OS
 .DS_Store

@@ -40,14 +40,15 @@ validation at any time:
 ./deploy/validate_deployment.sh --deep
 ```
 
-Then skip to **§3 Serve the web UI** (config tweak) and **§6 onwards**. The
-manual steps below (§2a–§5) are the same thing broken out, for the curious or
-for non-`/opt/tradingbot` setups.
+Then skip to **§3 Serve the web UI** and **§6 onwards**. The manual steps below
+(§2a–§5) are the same thing broken out, for the curious or for
+non-`/opt/tradingbot` setups.
 
-After deploy, in `/opt/tradingbot/backend/config.yaml` under `server:`
-uncomment `frontend_dist: "../frontend/dist"` so the API serves the built UI
-on one origin, then `sudo systemctl restart tradingbot`. Leave
-`host: "127.0.0.1"` (loopback); no API token is needed on loopback.
+The built web UI is **auto-discovered at `frontend/dist` and served by
+default** — no config edit is required (this is why it survives CI/CD
+`git reset`). Just `npm run build` (§3) and restart. Leave `host: "127.0.0.1"`
+(loopback); no API token is needed on loopback. To serve a build from a
+non-default path, set `server.frontend_dist` (see **CONFIGURATION.md**).
 
 <details>
 <summary><b>Manual steps (what install.sh automates)</b></summary>

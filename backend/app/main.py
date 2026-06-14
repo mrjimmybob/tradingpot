@@ -179,29 +179,58 @@ app.include_router(portfolio.router, prefix="/api", tags=["Portfolio"])
 app.include_router(ledger.router, prefix="/api", tags=["Ledger"])
 
 
-def _mount_frontend() -> bool:
-    """Optionally serve a built frontend (SPA) so the UI and API share one origin.
+def _resolve_frontend_dist(backend_dir=None):
+    """Resolve the frontend build directory to serve, or None for API-only.
 
-    Enabled only when server.frontend_dist points at an existing build directory
-    (e.g. frontend/dist). Off by default, so the backend-only behaviour and the
-    test suite are unaffected. API/docs/ws routes are registered earlier and take
-    precedence; unmatched GET paths fall back to index.html for client routing.
+    The web GUI is part of the product, so it is served BY DEFAULT: when
+    ``server.frontend_dist`` is not configured, the conventional build location
+    ``<repo>/frontend/dist`` is auto-discovered. This makes the UI work without
+    manual config edits and survives CI/CD ``git reset`` of tracked files.
+
+    The path stays configurable via ``server.frontend_dist`` (or the
+    ``TRADINGBOT__SERVER__FRONTEND_DIST`` env override). Relative configured
+    paths are anchored to the backend directory, so resolution is independent
+    of the current working directory. Returns the directory when it contains
+    ``index.html``; otherwise logs a warning and returns None (API-only mode).
+
+    Args:
+        backend_dir: Override for the backend directory (testing only).
     """
     from pathlib import Path
+
+    if backend_dir is None:
+        backend_dir = Path(__file__).resolve().parent.parent
+    backend_dir = Path(backend_dir)
+
+    dist_setting = config_service.get("server.frontend_dist")
+    if dist_setting:
+        dist = Path(dist_setting)
+        if not dist.is_absolute():
+            dist = (backend_dir / dist_setting).resolve()
+    else:
+        # Auto-discover the conventional build location (CWD-independent).
+        dist = (backend_dir.parent / "frontend" / "dist").resolve()
+
+    if not (dist / "index.html").is_file():
+        print(f"WARNING: no frontend build at {dist}; serving API only")
+        return None
+    return dist
+
+
+def _mount_frontend() -> bool:
+    """Mount the resolved frontend build (SPA) on the API, if one exists.
+
+    API/docs/ws routes are registered earlier and take precedence; unmatched
+    GET paths fall back to index.html for client-side routing.
+    """
     from fastapi.staticfiles import StaticFiles
     from fastapi.responses import FileResponse
 
-    dist_setting = config_service.get("server.frontend_dist")
-    if not dist_setting:
-        return False
-    dist = Path(dist_setting)
-    if not dist.is_absolute():
-        dist = (Path(__file__).resolve().parent.parent / dist_setting).resolve()
-    index = dist / "index.html"
-    if not index.is_file():
-        print(f"WARNING: server.frontend_dist set but no build at {dist}; serving API only")
+    dist = _resolve_frontend_dist()
+    if dist is None:
         return False
 
+    index = dist / "index.html"
     assets = dist / "assets"
     if assets.is_dir():
         app.mount("/assets", StaticFiles(directory=str(assets)), name="assets")

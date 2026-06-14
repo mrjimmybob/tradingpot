@@ -111,7 +111,10 @@
       "Bash(.venv/bin/python -c \"from app.services.db_backup import db_backup_service; print\\([m for m in \\('backup_once','start','stop'\\) if hasattr\\(db_backup_service,m\\)]\\)\")",
       "Bash(cp app/main.py /tmp/main.py.good)",
       "Bash(.venv/bin/python -m pytest tests/test_startup_resume.py -q)",
-      "Bash(.venv/bin/python -m pytest -q)"
+      "Bash(.venv/bin/python -m pytest -q)",
+      "Bash(.venv/bin/python -c ' *)",
+      "Bash(.venv/bin/python -m pytest tests/test_auth.py tests/test_operational_hardening.py tests/test_startup_resume.py -q)",
+      "Bash(.venv/bin/python -m pytest tests/test_config_layering.py -v)"
     ]
   }
 }

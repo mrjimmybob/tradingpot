@@ -1,7 +1,16 @@
-# TradingBot Configuration
+# TradingBot Configuration (base layer)
 # This file is validated on server startup. Unknown keys are rejected, so keep
 # options you are not using COMMENTED OUT. Values shown commented are the
 # built-in defaults; uncomment only to override.
+#
+# This is the LOWEST-precedence layer. Configuration is merged in order:
+#   1. this file (config.yaml)
+#   2. profile file config.<name>.yaml   (selected via TRADINGBOT_PROFILE)
+#   3. environment files                 (TRADINGBOT_ENV_FILE, deploy/tradingbot.env)
+#   4. process environment variables     (TRADINGBOT__SECTION__KEY=value)
+# Higher layers override lower ones. Put reproducible, non-secret overrides in a
+# tracked profile file; put secrets in an (untracked) env file or the process
+# environment. See CONFIGURATION.md for details.
 
 server:
   # Loopback by default. To expose beyond this machine you MUST set an API
@@ -13,7 +22,10 @@ server:
   # api_token: ""  # prefer the TRADINGBOT_API_TOKEN environment variable
   # cors_origins:  # browser origins allowed to call the API (defaults to local dev)
   #   - "http://localhost:5173"
-  # frontend_dist: "../frontend/dist"  # serve the built web UI from the API origin
+  # frontend_dist:  # OPTIONAL override for the web UI build location.
+  #   The built web UI is auto-discovered at ../frontend/dist by default and
+  #   served from the API origin — you do NOT need to set this. Set it only to
+  #   serve a build from a non-default path.
 
 database:
   # Relative SQLite paths are anchored to the backend directory automatically,

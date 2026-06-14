@@ -97,6 +97,41 @@ CONFIG_SCHEMA = {
 }
 
 
+# --- Configuration layering: environment-variable conventions ---------------
+# Single-underscore names below are *special-cased* selectors (not generic
+# config overrides) and are kept distinct from the generic override prefix.
+PROFILE_ENV_VAR = "TRADINGBOT_PROFILE"        # selects config.<profile>.yaml
+ENV_FILE_ENV_VAR = "TRADINGBOT_ENV_FILE"      # extra env file to load (optional)
+
+# Generic "env var -> config key" overrides. A double underscore separates
+# nested keys, e.g. TRADINGBOT__SERVER__FRONTEND_DIST -> server.frontend_dist.
+# Double-underscore nesting keeps single-underscore key segments intact
+# (e.g. frontend_dist, execution_interval_seconds) and avoids collision with
+# the single-underscore selectors above and legacy names like
+# TRADINGBOT_API_TOKEN / TRADINGBOT_DATABASE_URL.
+ENV_OVERRIDE_PREFIX = "TRADINGBOT__"
+ENV_KEY_SEPARATOR = "__"
+
+
+def _leaf_schema_for_path(path: List[str]) -> Optional[Dict[str, Any]]:
+    """Return the schema node for a dotted config path, or None if unknown.
+
+    Used to type-coerce environment-variable overrides (which are always
+    strings) into the type the schema expects.
+    """
+    if not path:
+        return None
+    schema: Any = CONFIG_SCHEMA.get(path[0])
+    if not isinstance(schema, dict):
+        return None
+    for seg in path[1:]:
+        props = schema.get("properties") if isinstance(schema, dict) else None
+        if not isinstance(props, dict) or seg not in props:
+            return None
+        schema = props[seg]
+    return schema if isinstance(schema, dict) else None
+
+
 class ConfigService:
     """Service for loading and validating configuration."""
 
@@ -114,54 +149,224 @@ class ConfigService:
         self.config_path = config_path
         self._config: Dict[str, Any] = {}
 
+    @property
+    def _base_dir(self) -> Path:
+        """Directory holding the base config file (CWD-independent anchor)."""
+        return Path(self.config_path).resolve().parent
+
     def load_and_validate(self) -> Dict[str, Any]:
-        """Load and validate the configuration file.
+        """Load, layer, and validate configuration.
+
+        Precedence (lowest to highest):
+          1. config.yaml (the base file)
+          2. optional profile file config.<profile>.yaml (TRADINGBOT_PROFILE)
+          3. environment files (loaded into the process environment)
+          4. process environment variables (TRADINGBOT__SECTION__KEY overrides)
+
+        Higher-precedence sources override lower ones. The merged result is
+        validated against CONFIG_SCHEMA.
 
         Returns:
             Validated configuration dictionary.
 
         Raises:
             ConfigValidationException: If validation fails.
-            FileNotFoundError: If config file not found.
         """
         errors: List[ConfigValidationError] = []
 
-        # Check if file exists
-        if not os.path.exists(self.config_path):
-            logger.warning(f"Config file not found at {self.config_path}, using defaults")
-            self._config = {}
-            return self._config
+        # Layer 1: base config.yaml (optional; absent -> empty base + warning).
+        config = self._load_yaml_file(self.config_path, required=False, errors=errors)
 
-        # Load YAML
-        try:
-            with open(self.config_path, 'r') as f:
-                config = yaml.safe_load(f)
-        except yaml.YAMLError as e:
-            errors.append(ConfigValidationError(
-                path="",
-                message=f"Invalid YAML syntax: {str(e)}"
-            ))
-            raise ConfigValidationException(errors)
+        # Layer 2: optional profile, selected by env var, resolved next to the
+        # base config file so it is independent of the current directory.
+        profile = os.environ.get(PROFILE_ENV_VAR, "").strip()
+        if profile:
+            profile_path = self._profile_path(profile)
+            if profile_path.is_file():
+                profile_cfg = self._load_yaml_file(
+                    str(profile_path), required=True, errors=errors
+                )
+                config = self._deep_merge(config, profile_cfg)
+                logger.info(f"Loaded configuration profile '{profile}' from {profile_path}")
+            else:
+                logger.warning(
+                    f"Configuration profile '{profile}' selected "
+                    f"({PROFILE_ENV_VAR}={profile}) but no file found at "
+                    f"{profile_path}; continuing without it"
+                )
 
-        if config is None:
-            config = {}
+        # Layer 3: environment files -> process environment (gap-fill only, so
+        # already-set process variables keep precedence over file values).
+        self._load_env_files()
 
-        if not isinstance(config, dict):
-            errors.append(ConfigValidationError(
-                path="",
-                message=f"Config must be a dictionary, got {type(config).__name__}"
-            ))
-            raise ConfigValidationException(errors)
+        # Layer 4: process environment variable overrides (highest precedence).
+        env_cfg = self._env_overrides(errors)
+        config = self._deep_merge(config, env_cfg)
 
-        # Validate against schema
-        errors.extend(self._validate_dict(config, CONFIG_SCHEMA, ""))
-
+        # Surface load/coercion problems before schema validation.
         if errors:
             raise ConfigValidationException(errors)
 
+        # Validate the fully merged configuration.
+        validation_errors = self._validate_dict(config, CONFIG_SCHEMA, "")
+        if validation_errors:
+            raise ConfigValidationException(validation_errors)
+
         self._config = config
-        logger.info(f"Configuration loaded and validated from {self.config_path}")
+        logger.info(f"Configuration loaded and validated (base={self.config_path})")
         return config
+
+    # --- Layering helpers --------------------------------------------------
+
+    def _load_yaml_file(
+        self, path: str, required: bool, errors: List[ConfigValidationError]
+    ) -> Dict[str, Any]:
+        """Load one YAML file into a dict, recording problems in ``errors``.
+
+        A missing optional file yields ``{}`` with a warning (matching the
+        historical base-config behaviour). YAML/shape problems are recorded as
+        validation errors rather than raised here, so all sources can be
+        reported together.
+        """
+        if not os.path.exists(path):
+            if required:
+                errors.append(ConfigValidationError(
+                    path="", message=f"Config file not found: {path}"
+                ))
+            else:
+                logger.warning(f"Config file not found at {path}, using defaults")
+            return {}
+
+        try:
+            with open(path, "r") as f:
+                data = yaml.safe_load(f)
+        except yaml.YAMLError as e:
+            errors.append(ConfigValidationError(
+                path="", message=f"Invalid YAML syntax in {path}: {e}"
+            ))
+            return {}
+
+        if data is None:
+            return {}
+        if not isinstance(data, dict):
+            errors.append(ConfigValidationError(
+                path="",
+                message=f"Config in {path} must be a dictionary, got {type(data).__name__}",
+            ))
+            return {}
+        return data
+
+    def _profile_path(self, profile: str) -> Path:
+        """Resolve a profile name to config.<profile>.yaml next to the base file."""
+        return self._base_dir / f"config.{profile}.yaml"
+
+    @staticmethod
+    def _deep_merge(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any]:
+        """Recursively merge ``override`` onto ``base`` (override wins)."""
+        result = dict(base)
+        for key, value in override.items():
+            existing = result.get(key)
+            if isinstance(value, dict) and isinstance(existing, dict):
+                result[key] = ConfigService._deep_merge(existing, value)
+            else:
+                result[key] = value
+        return result
+
+    def _env_file_candidates(self) -> List[Path]:
+        """Env files to load, in priority order (first wins on conflicts).
+
+        - ``TRADINGBOT_ENV_FILE`` (explicit, optional)
+        - ``<repo>/deploy/tradingbot.env`` (project convention; untracked)
+        """
+        candidates: List[Path] = []
+        explicit = os.environ.get(ENV_FILE_ENV_VAR, "").strip()
+        if explicit:
+            p = Path(explicit)
+            candidates.append(p if p.is_absolute() else (self._base_dir / p))
+        candidates.append(self._base_dir.parent / "deploy" / "tradingbot.env")
+        return candidates
+
+    def _load_env_files(self) -> None:
+        """Load KEY=VALUE pairs from env files into ``os.environ`` (gap-fill).
+
+        Optional: missing files are skipped silently. Process environment
+        variables already set are never overwritten, so they take precedence
+        over file-loaded values.
+        """
+        for path in self._env_file_candidates():
+            try:
+                if not path.is_file():
+                    continue
+                for raw in path.read_text().splitlines():
+                    line = raw.strip()
+                    if not line or line.startswith("#"):
+                        continue
+                    if line.startswith("export "):
+                        line = line[len("export "):].strip()
+                    if "=" not in line:
+                        continue
+                    key, _, val = line.partition("=")
+                    key = key.strip()
+                    if not key:
+                        continue
+                    val = val.strip().strip('"').strip("'")
+                    # Process env wins -> only fill if not already present.
+                    os.environ.setdefault(key, val)
+            except OSError as e:
+                logger.warning(f"Could not read env file {path}: {e}")
+
+    def _env_overrides(
+        self, errors: List[ConfigValidationError]
+    ) -> Dict[str, Any]:
+        """Build a config overlay from TRADINGBOT__SECTION__KEY env variables."""
+        overrides: Dict[str, Any] = {}
+        for raw_key, raw_val in os.environ.items():
+            if not raw_key.startswith(ENV_OVERRIDE_PREFIX):
+                continue
+            suffix = raw_key[len(ENV_OVERRIDE_PREFIX):]
+            path = [seg.lower() for seg in suffix.split(ENV_KEY_SEPARATOR) if seg]
+            if not path:
+                continue
+            leaf = _leaf_schema_for_path(path)
+            type_name = leaf.get("type") if isinstance(leaf, dict) else None
+            try:
+                value = self._coerce_env_value(raw_val, type_name)
+            except (ValueError, TypeError):
+                errors.append(ConfigValidationError(
+                    path=".".join(path),
+                    message=(
+                        f"Environment override {raw_key}={raw_val!r} could not "
+                        f"be coerced to {type_name}"
+                    ),
+                ))
+                continue
+            self._set_nested(overrides, path, value)
+        return overrides
+
+    @staticmethod
+    def _coerce_env_value(value: str, type_name: Optional[str]) -> Any:
+        """Coerce a string env value to the schema type (str if unknown)."""
+        if type_name == "int":
+            return int(value)
+        if type_name == "float":
+            return float(value)
+        if type_name == "bool":
+            return value.strip().lower() in ("1", "true", "yes", "on")
+        if type_name == "list":
+            return [s.strip() for s in value.split(",") if s.strip()]
+        return value
+
+    @staticmethod
+    def _set_nested(target: Dict[str, Any], path: List[str], value: Any) -> None:
+        """Set ``value`` at a nested ``path`` inside ``target``, creating dicts."""
+        node = target
+        for seg in path[:-1]:
+            nxt = node.get(seg)
+            if not isinstance(nxt, dict):
+                nxt = {}
+                node[seg] = nxt
+            node = nxt
+        node[path[-1]] = value
 
     def _validate_dict(
         self,
