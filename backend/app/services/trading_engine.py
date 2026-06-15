@@ -34,6 +34,7 @@ from .strategy_capacity import StrategyCapacityService
 from .ledger_writer import LedgerWriterService
 from .accounting import TradeRecorderService, FIFOTaxEngine, CSVExportService
 from .ledger_invariants import LedgerInvariantService, ValidationError
+from .decision_status import decision_status_store, DecisionState
 
 logger = logging.getLogger(__name__)
 
@@ -144,6 +145,12 @@ class TradeSignal:
     # Execution layer fields (new)
     execution: Optional[str] = None  # "market", "twap", "vwap" (None defaults to "market")
     execution_params: Optional[dict] = None  # Execution-specific parameters
+
+    # Observability only (not used for trading): optional strategy conviction
+    # score and the threshold it was compared against, surfaced in the bot
+    # detail "Decision Status" panel when a strategy chooses to populate them.
+    score: Optional[float] = None
+    threshold: Optional[float] = None
 
 
 def validate_funding_carry_params(params: dict) -> list:
@@ -284,6 +291,12 @@ class TradingEngine:
                 f"Bot started with strategy '{bot.strategy}' on {bot.trading_pair}"
             )
 
+            # Seed an immediate decision status so the UI shows activity at once.
+            decision_status_store.update(
+                bot_id, DecisionState.EVALUATING,
+                reason="Bot started", symbol=bot.trading_pair,
+            )
+
             # Start bot task
             self._stop_flags[bot_id] = False
             task = asyncio.create_task(self._run_bot_loop(bot_id))
@@ -324,6 +337,10 @@ class TradingEngine:
                 bot.paused_at = datetime.utcnow()
                 bot.updated_at = datetime.utcnow()
                 await session.commit()
+                decision_status_store.update(
+                    bot_id, DecisionState.PAUSED,
+                    reason="Bot paused by operator", symbol=bot.trading_pair,
+                )
 
         logger.info(f"Paused bot {bot_id}")
         return True
@@ -435,6 +452,10 @@ class TradingEngine:
 
                     if risk_assessment.action == RiskAction.PAUSE_BOT:
                         logger.warning(f"Bot {bot_id}: Pausing due to {risk_assessment.reason}")
+                        decision_status_store.update(
+                            bot_id, DecisionState.RISK_LIMIT,
+                            reason=risk_assessment.reason, symbol=bot.trading_pair,
+                        )
                         bot.status = BotStatus.PAUSED
                         bot.paused_at = datetime.utcnow()
                         await session.commit()
@@ -452,6 +473,10 @@ class TradingEngine:
 
                     if risk_assessment.action == RiskAction.STOP_BOT:
                         logger.warning(f"Bot {bot_id}: Stopping due to {risk_assessment.reason}")
+                        decision_status_store.update(
+                            bot_id, DecisionState.RISK_LIMIT,
+                            reason=risk_assessment.reason, symbol=bot.trading_pair,
+                        )
                         bot.status = BotStatus.STOPPED
                         await session.commit()
                         self._stop_flags[bot_id] = True
@@ -476,6 +501,10 @@ class TradingEngine:
                         # outage pauses + alerts instead of looping silently.
                         consecutive_failures += 1
                         last_error = f"market data unavailable for {bot.trading_pair}"
+                        decision_status_store.update(
+                            bot_id, DecisionState.WAITING_FOR_DATA,
+                            reason=last_error, symbol=bot.trading_pair,
+                        )
                         logger.warning(
                             f"Bot {bot_id}: {last_error} "
                             f"(failure {consecutive_failures}/{max_failures})"
@@ -491,18 +520,21 @@ class TradingEngine:
                     # Generate trading signal from strategy
                     signal = await self._execute_strategy(bot, ticker.last, session)
 
-                    # TEMP DIAGNOSTIC [EVAL]: proves the evaluation loop is
-                    # executing and shows each decision. Remove once the
-                    # no-trades investigation is resolved. (TradeSignal has no
-                    # numeric score; decision=action, with the strategy's reason.)
-                    logger.info(
-                        "[EVAL] bot=%s symbol=%s ts=%s price=%s decision=%s reason=%s",
+                    # Publish the engine's current "thinking" to the in-memory
+                    # decision-status store (read by the bot detail UI). State
+                    # transitions are logged at INFO so evaluations and decision
+                    # changes are visible without spamming a line every second.
+                    changed = decision_status_store.update_from_signal(
+                        bot_id, signal, symbol=bot.trading_pair
+                    )
+                    status = decision_status_store.get(bot_id)
+                    log = logger.info if changed else logger.debug
+                    log(
+                        "Bot %s decision: %s @ %s — %s",
                         bot_id,
-                        bot.trading_pair,
-                        datetime.utcnow().isoformat(),
+                        status.state if status else "?",
                         ticker.last,
-                        (signal.action.upper() if signal else "NONE"),
-                        (signal.reason if signal else "no signal (strategy returned None)"),
+                        status.reason if status else "",
                     )
 
                     if signal and signal.action != "hold":
@@ -520,6 +552,17 @@ class TradingEngine:
                                 )
 
                         if proceed:
+                            # Reflect the actual order intent in the status panel.
+                            decision_status_store.update(
+                                bot_id,
+                                DecisionState.ENTERING_POSITION
+                                if signal.action == "buy"
+                                else DecisionState.EXITING_POSITION,
+                                reason=signal.reason,
+                                symbol=bot.trading_pair,
+                                score=signal.score,
+                                threshold=signal.threshold,
+                            )
                             # Execute trade
                             await self._execute_trade(
                                 bot, exchange, signal, ticker.last, session
@@ -4659,6 +4702,7 @@ class TradingEngine:
             f"errors. Last error: {last_error}"
         )
         logger.critical(f"Bot {bot_id}: {reason}")
+        decision_status_store.update(bot_id, DecisionState.RISK_LIMIT, reason=reason)
         try:
             async with async_session_maker() as session:
                 result = await session.execute(select(Bot).where(Bot.id == bot_id))
@@ -4692,6 +4736,8 @@ class TradingEngine:
         warned = getattr(self, "_funding_unavailable_warned", None)
         if isinstance(warned, set):
             warned.discard(bot_id)
+        # Drop the transient decision status too (bot stopped/deleted).
+        decision_status_store.clear(bot_id)
 
     def cleanup_bot_state(self, bot_id: int) -> None:
         """Public hook to release a bot's in-memory state (e.g. on delete)."""
@@ -5449,6 +5495,11 @@ class TradingEngine:
                     )
                     self._bot_loggers[bot.id].log_activity(
                         f"Bot resumed after server restart"
+                    )
+
+                    decision_status_store.update(
+                        bot.id, DecisionState.EVALUATING,
+                        reason="Bot resumed after restart", symbol=bot.trading_pair,
                     )
 
                     # Start bot task

@@ -17,6 +17,7 @@ import {
   Check,
   Rocket,
   Loader2,
+  Activity,
 } from 'lucide-react'
 import { useToast } from '../components/Toast'
 import { useRealtimeBot, useRealtimePrice } from '../contexts/WebSocketContext'
@@ -69,6 +70,16 @@ interface Order {
   created_at: string
 }
 
+interface DecisionStatus {
+  bot_id: number
+  state: string | null
+  reason: string
+  symbol: string | null
+  score: number | null
+  threshold: number | null
+  updated_at: string | null
+}
+
 async function fetchBot(id: string): Promise<Bot> {
   const res = await apiFetch(`/api/bots/${id}`)
   if (!res.ok) {
@@ -88,6 +99,35 @@ async function fetchOrders(id: string): Promise<Order[]> {
   const res = await apiFetch(`/api/bots/${id}/orders?limit=10`)
   if (!res.ok) throw new Error('Failed to fetch orders')
   return res.json()
+}
+
+async function fetchDecisionStatus(id: string): Promise<DecisionStatus> {
+  const res = await apiFetch(`/api/bots/${id}/decision-status`)
+  if (!res.ok) throw new Error('Failed to fetch decision status')
+  return res.json()
+}
+
+// Map a decision state to a Tailwind color class for the status pill. Falls
+// back to a neutral gray for unknown/idle states.
+function getDecisionStateColor(state: string | null): string {
+  switch (state) {
+    case 'Buy signal detected':
+    case 'Entering position':
+      return 'bg-running/20 text-running border-running'
+    case 'Sell signal detected':
+    case 'Exiting position':
+      return 'bg-accent/20 text-accent border-accent'
+    case 'Risk limit reached':
+      return 'bg-loss/20 text-loss border-loss'
+    case 'Paused':
+    case 'Cooldown active':
+      return 'bg-paused/20 text-paused border-paused'
+    case 'Waiting for data':
+    case 'Warming up indicators':
+      return 'bg-yellow-500/20 text-yellow-500 border-yellow-500'
+    default:
+      return 'bg-gray-700 text-gray-300 border-gray-600'
+  }
 }
 
 function getStatusColor(status: string): string {
@@ -135,6 +175,15 @@ export default function BotDetail() {
     queryKey: ['orders', id],
     queryFn: () => fetchOrders(id!),
     enabled: isValidId,
+  })
+
+  // Poll the in-memory decision status so the panel reflects what the engine is
+  // doing in near-real-time without a websocket dependency.
+  const { data: decisionStatus } = useQuery({
+    queryKey: ['decision-status', id],
+    queryFn: () => fetchDecisionStatus(id!),
+    enabled: isValidId,
+    refetchInterval: 3000,
   })
 
   // Real-time bot data from WebSocket
@@ -617,6 +666,57 @@ export default function BotDetail() {
             {displayPositions?.length ?? 0}
           </p>
         </div>
+      </div>
+
+      {/* Decision Status — what the strategy is currently thinking */}
+      <div className="bg-gray-800 rounded-lg p-6">
+        <div className="flex items-center gap-2 mb-4">
+          <Activity size={18} className="text-accent" />
+          <h3 className="text-lg font-semibold">Decision Status</h3>
+        </div>
+        {decisionStatus ? (
+          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+            <div className="flex items-center gap-3">
+              <span
+                className={`px-3 py-1 rounded-full text-sm border ${getDecisionStateColor(
+                  decisionStatus.state
+                )}`}
+              >
+                {decisionStatus.state ?? 'Idle'}
+              </span>
+              {decisionStatus.reason && (
+                <p className="text-gray-300 text-sm">{decisionStatus.reason}</p>
+              )}
+            </div>
+            <div className="flex items-center gap-6 text-sm">
+              {decisionStatus.score != null && (
+                <div className="text-right">
+                  <p className="text-gray-400">Signal Score</p>
+                  <p className="font-mono-numbers">
+                    {decisionStatus.score.toFixed(3)}
+                    {decisionStatus.threshold != null && (
+                      <span className="text-gray-400">
+                        {' '}/ {decisionStatus.threshold.toFixed(3)}
+                      </span>
+                    )}
+                  </p>
+                </div>
+              )}
+              <div className="text-right">
+                <p className="text-gray-400">Last Update</p>
+                <p className="font-mono-numbers">
+                  {decisionStatus.updated_at
+                    ? new Date(decisionStatus.updated_at).toLocaleTimeString()
+                    : '—'}
+                </p>
+              </div>
+            </div>
+          </div>
+        ) : (
+          <div className="text-center py-6 text-gray-400">
+            <p>No decision data yet</p>
+          </div>
+        )}
       </div>
 
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">

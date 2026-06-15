@@ -10,6 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from ..models import get_session, Bot, BotStatus, Order, Position
 from ..services import trading_engine
 from ..services.trading_engine import BotStartError, validate_funding_carry_params
+from ..services.decision_status import decision_status_store, DecisionState
 from ..services.logging_service import ensure_bot_log_directory
 from .config import STRATEGIES
 
@@ -208,6 +209,21 @@ class PositionResponse(BaseModel):
 
     class Config:
         from_attributes = True
+
+
+class DecisionStatusResponse(BaseModel):
+    """Schema for a bot's latest in-memory decision status.
+
+    Non-persisted observability data: ``state`` is None when the engine has no
+    current snapshot for the bot (e.g. it has never run this process).
+    """
+    bot_id: int
+    state: Optional[str]
+    reason: str = ""
+    symbol: Optional[str] = None
+    score: Optional[float] = None
+    threshold: Optional[float] = None
+    updated_at: Optional[datetime] = None
 
 
 @router.get("", response_model=List[BotResponse])
@@ -649,3 +665,43 @@ async def get_bot_positions(
     )
     positions = result.scalars().all()
     return positions
+
+
+@router.get("/{bot_id}/decision-status", response_model=DecisionStatusResponse)
+async def get_bot_decision_status(
+    bot_id: int,
+    session: AsyncSession = Depends(get_session),
+):
+    """Get the bot's latest in-memory decision status.
+
+    Lets the UI show what the strategy is currently doing (evaluating, warming
+    up, holding, entering, paused by risk, ...) without reading server logs.
+    Returns ``state: null`` when the engine has no live snapshot for the bot.
+    """
+    # Confirm the bot exists so a bad id is a 404, not a silent empty status.
+    result = await session.execute(select(Bot).where(Bot.id == bot_id))
+    bot = result.scalar_one_or_none()
+    if not bot:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Bot with id {bot_id} not found"
+        )
+
+    snapshot = decision_status_store.get(bot_id)
+    if snapshot is not None:
+        return DecisionStatusResponse(**snapshot.to_dict())
+
+    # No live in-memory snapshot. Derive a meaningful state from the bot's
+    # persisted status so a RUNNING bot is NEVER shown as blank — e.g. right
+    # after a server restart before the loop's first evaluation, or for a bot
+    # left RUNNING in the DB without a live loop (its status would otherwise be
+    # missing entirely). Non-running bots legitimately have no decision state.
+    if bot.status == BotStatus.RUNNING:
+        state, reason = DecisionState.EVALUATING, "Starting evaluation"
+    elif bot.status == BotStatus.PAUSED:
+        state, reason = DecisionState.PAUSED, "Bot is paused"
+    else:
+        state, reason = None, "Bot is not running"
+    return DecisionStatusResponse(
+        bot_id=bot_id, state=state, reason=reason, symbol=bot.trading_pair,
+    )
