@@ -3,6 +3,7 @@
 import asyncio
 import pytest
 from httpx import AsyncClient, ASGITransport
+from sqlalchemy import event
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy.orm import sessionmaker
 
@@ -12,6 +13,18 @@ from app.models import Base, get_session
 
 # Test database URL (in-memory SQLite)
 TEST_DATABASE_URL = "sqlite+aiosqlite:///:memory:"
+
+
+def _enable_sqlite_fks(engine) -> None:
+    """Enforce foreign keys on the test engine, matching production.
+
+    Production sets ``PRAGMA foreign_keys=ON`` (see models/database.py); without
+    it SQLite silently ignores FK constraints, so cascade/cleanup regressions
+    (e.g. the bot-deletion FK failures) would not surface in tests.
+    """
+    @event.listens_for(engine.sync_engine, "connect")
+    def _fk_on(dbapi_connection, _record):
+        dbapi_connection.execute("PRAGMA foreign_keys=ON")
 
 
 @pytest.fixture(scope="session")
@@ -49,6 +62,46 @@ async def client(test_db):
 
     async def override_get_session():
         yield test_db
+
+    app.dependency_overrides[get_session] = override_get_session
+
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as ac:
+        yield ac
+
+    app.dependency_overrides.clear()
+
+
+@pytest.fixture(scope="function")
+async def fk_test_db():
+    """Like ``test_db`` but with ``PRAGMA foreign_keys=ON`` so FK constraints are
+    enforced exactly as in production (models/database.py).
+
+    Scoped (not global) because a couple of ledger-invariant tests deliberately
+    insert referentially-invalid rows to exercise the application-level checker;
+    only the deletion/cascade tests need true FK enforcement.
+    """
+    engine = create_async_engine(TEST_DATABASE_URL, echo=False)
+    _enable_sqlite_fks(engine)
+
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+
+    async_session = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+    async with async_session() as session:
+        yield session
+
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.drop_all)
+    await engine.dispose()
+
+
+@pytest.fixture(scope="function")
+async def fk_client(fk_test_db):
+    """Test client bound to the FK-enforcing database."""
+
+    async def override_get_session():
+        yield fk_test_db
 
     app.dependency_overrides[get_session] = override_get_session
 

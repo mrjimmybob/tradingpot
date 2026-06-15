@@ -4,10 +4,12 @@ from datetime import datetime
 from typing import List, Optional
 from fastapi import APIRouter, Depends, HTTPException, status, BackgroundTasks
 from pydantic import BaseModel, Field, field_validator
-from sqlalchemy import select
+from sqlalchemy import select, delete
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from ..models import get_session, Bot, BotStatus, Order, Position
+from ..models import (
+    get_session, Bot, BotStatus, Order, Position, Trade, TaxLot, RealizedGain,
+)
 from ..services import trading_engine
 from ..services.trading_engine import BotStartError, validate_funding_carry_params
 from ..services.decision_status import decision_status_store, DecisionState
@@ -355,6 +357,32 @@ async def update_bot(
     return bot
 
 
+async def _purge_bot_accounting_records(session: AsyncSession, bot_id: int) -> None:
+    """Delete tax_lots / realized_gains tied to a bot's trades, in FK-safe order.
+
+    These accounting tables reference ``trades.id`` via NOT NULL foreign keys but
+    have no relationship to Bot and no ON DELETE cascade, so they are invisible to
+    the ORM's bot→trades cascade. They must be removed before the trades they
+    point at, or SQLite (foreign_keys=ON) raises "FOREIGN KEY constraint failed".
+
+    We resolve them through the bot's trade ids (the actual referential link),
+    not the ``owner_id`` convention, so this is correct regardless of owner_id
+    semantics. realized_gains is deleted first because it also references
+    tax_lots(id); tax_lots is deleted second.
+    """
+    trade_ids = select(Trade.id).where(Trade.bot_id == bot_id).scalar_subquery()
+
+    await session.execute(
+        delete(RealizedGain).where(
+            RealizedGain.purchase_trade_id.in_(trade_ids)
+            | RealizedGain.sell_trade_id.in_(trade_ids)
+        )
+    )
+    await session.execute(
+        delete(TaxLot).where(TaxLot.purchase_trade_id.in_(trade_ids))
+    )
+
+
 @router.delete("/{bot_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_bot(
     bot_id: int,
@@ -375,6 +403,15 @@ async def delete_bot(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Cannot delete a running bot. Stop it first."
         )
+
+    # Purge accounting records that reference this bot's trades BEFORE the ORM
+    # cascade deletes those trades. tax_lots/realized_gains hold NOT NULL foreign
+    # keys to trades.id with no ORM relationship to Bot and no ON DELETE action,
+    # so with PRAGMA foreign_keys=ON, deleting a trade they reference raises
+    # "FOREIGN KEY constraint failed". We key off the trades themselves (the real
+    # referential link) and delete in dependency order: realized_gains (which
+    # reference both trades and tax_lots) first, then tax_lots.
+    await _purge_bot_accounting_records(session, bot_id)
 
     await session.delete(bot)
     await session.commit()
