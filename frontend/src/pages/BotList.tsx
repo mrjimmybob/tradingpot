@@ -330,7 +330,9 @@ export default function BotList() {
       try {
         const res = await apiFetch(`/api/bots/${id}`, { method: 'DELETE' })
         if (!res.ok) {
-          const data = await res.json()
+          // Tolerate a non-JSON/empty error body so a failure never surfaces as
+          // an opaque JSON.parse error. Success is a 204 with no body (not parsed).
+          const data = await res.json().catch(() => ({}))
           throw new Error(data.detail || 'Failed to delete bot')
         }
         refetch()

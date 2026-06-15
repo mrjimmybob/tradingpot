@@ -156,7 +156,14 @@
       "Bash(echo \"TSC EXIT: $?\")",
       "Bash(echo \"ESLINT EXIT: $?\")",
       "Bash(git checkout *)",
-      "Bash(.venv-check/bin/python -m pytest tests/test_decision_status.py tests/test_bots.py -q)"
+      "Bash(.venv-check/bin/python -m pytest tests/test_decision_status.py tests/test_bots.py -q)",
+      "Bash(grep -rn \"bots/\\\\${.*}\\\\`\\\\|/bots/\\\\|method: 'DELETE'\\\\|res.json\\(\\)\" frontend/src/pages/BotList.tsx)",
+      "Bash(.venv-check/bin/python -m pytest tests/test_bot_deletion.py -q)",
+      "Bash(cp app/models/strategy_performance.py /tmp/sp.bak)",
+      "Bash(cp app/models/bot.py /tmp/bot.bak)",
+      "Bash(python3 -)",
+      "Bash(cp /tmp/sp.bak app/models/strategy_performance.py)",
+      "Bash(cp /tmp/bot.bak app/models/bot.py)"
     ]
   }
 }

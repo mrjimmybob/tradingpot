@@ -44,7 +44,14 @@ class StrategyPerformanceMetrics(Base):
     )
     
     # Relationships
-    bot = relationship("Bot", backref="strategy_metrics")
+    # Use back_populates against an explicit Bot-side relationship that declares
+    # cascade="all, delete-orphan" (see Bot.strategy_metrics). A bare backref
+    # would create a Bot-side collection with SQLAlchemy's DEFAULT cascade
+    # ("save-update, merge"), which on bot deletion DISASSOCIATES children by
+    # emitting `UPDATE strategy_performance_metrics SET bot_id=NULL` — a NOT NULL
+    # violation, since bot_id is non-nullable. Matching the other child models
+    # makes the ORM DELETE these rows with the parent instead.
+    bot = relationship("Bot", back_populates="strategy_metrics")
     
     def __repr__(self):
         return (
