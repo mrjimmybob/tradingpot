@@ -524,18 +524,29 @@ class TradingEngine:
                     # decision-status store (read by the bot detail UI). State
                     # transitions are logged at INFO so evaluations and decision
                     # changes are visible without spamming a line every second.
-                    changed = decision_status_store.update_from_signal(
-                        bot_id, signal, symbol=bot.trading_pair
-                    )
-                    status = decision_status_store.get(bot_id)
-                    log = logger.info if changed else logger.debug
-                    log(
-                        "Bot %s decision: %s @ %s — %s",
-                        bot_id,
-                        status.state if status else "?",
-                        ticker.last,
-                        status.reason if status else "",
-                    )
+                    #
+                    # This is presentation/observability only and must never affect
+                    # trading: a formatting or logging error here is isolated so it
+                    # cannot bubble to the failure circuit breaker below and pause an
+                    # otherwise-healthy bot.
+                    try:
+                        changed = decision_status_store.update_from_signal(
+                            bot_id, signal, symbol=bot.trading_pair
+                        )
+                        status = decision_status_store.get(bot_id)
+                        log = logger.info if changed else logger.debug
+                        log(
+                            "Bot %s decision: %s @ %s — %s",
+                            bot_id,
+                            status.state if status else "?",
+                            ticker.last,
+                            status.reason if status else "",
+                        )
+                    except Exception as status_err:  # noqa: BLE001 - presentation only
+                        logger.warning(
+                            "Bot %s: failed to publish decision status (non-fatal): %s",
+                            bot_id, status_err,
+                        )
 
                     if signal and signal.action != "hold":
                         # CR-1: budget validation gates BUYS only (capital
@@ -1684,10 +1695,14 @@ class TradingEngine:
             # Update state and hold
             self._mean_reversion_states[bot.id] = state
 
+            # A conditional inside the f-string format spec ({x:.2f if ...}) is a
+            # ValueError ("Invalid format specifier"); format the optional stop
+            # outside the f-string so a held position never raises here.
+            stop_str = f"${hard_stop:.2f}" if hard_stop is not None else "N/A"
             return TradeSignal(
                 action="hold",
                 amount=0,
-                reason=f"Mean Reversion: Holding, target ${exit_level:.2f}, stop ${hard_stop:.2f if hard_stop else 'N/A'}, bars {state['bars_since_entry']}/{max_hold_bars}"
+                reason=f"Mean Reversion: Holding, target ${exit_level:.2f}, stop {stop_str}, bars {state['bars_since_entry']}/{max_hold_bars}"
             )
 
         # === ENTRY LOGIC (BAR-BASED) ===
