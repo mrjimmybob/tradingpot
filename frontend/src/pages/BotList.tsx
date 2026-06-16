@@ -2,6 +2,8 @@ import { apiFetch } from '../lib/api'
 import { Link, useSearchParams } from 'react-router-dom'
 import { useQuery } from '@tanstack/react-query'
 import { useState, useEffect, useMemo, useCallback } from 'react'
+import { useBotActions, type BotActionVars } from '../hooks/useBotActions'
+import type { UseMutationResult } from '@tanstack/react-query'
 import {
   Plus,
   Search,
@@ -223,6 +225,18 @@ export default function BotList() {
     retry: 2,
     retryDelay: 1000,
   })
+
+  // Shared Start/Pause/Stop controls — identical implementation to the bot
+  // detail page (single code path). A success invalidates ['bots'], so this
+  // list refetches and the status badge updates without a manual reload.
+  const { start, pause, stop } = useBotActions()
+
+  // A single shared mutation drives every row; scope the pending/disabled state
+  // to the row whose id is currently in flight so other rows stay clickable.
+  const isActionPending = (
+    mutation: UseMutationResult<unknown, Error, BotActionVars>,
+    botId: number,
+  ) => mutation.isPending && mutation.variables?.id === botId
 
   // #167: Filter, sort, and paginate work together (#118, #120)
   // #177: Uses debounced search term for better performance
@@ -598,7 +612,9 @@ export default function BotList() {
                         <div className="flex items-center justify-end gap-2" role="group" aria-label={`Actions for ${bot.name}`}>
                           {bot.status === 'running' && (
                             <button
-                              className="p-2 text-paused hover:bg-gray-700 rounded"
+                              onClick={() => pause.mutate({ id: bot.id, name: bot.name })}
+                              disabled={isActionPending(pause, bot.id)}
+                              className="p-2 text-paused hover:bg-gray-700 rounded disabled:opacity-50 disabled:cursor-not-allowed"
                               aria-label={`Pause ${bot.name}`}
                               title="Pause"
                             >
@@ -607,7 +623,9 @@ export default function BotList() {
                           )}
                           {(bot.status === 'paused' || bot.status === 'created') && (
                             <button
-                              className="p-2 text-running hover:bg-gray-700 rounded"
+                              onClick={() => start.mutate({ id: bot.id, name: bot.name })}
+                              disabled={isActionPending(start, bot.id)}
+                              className="p-2 text-running hover:bg-gray-700 rounded disabled:opacity-50 disabled:cursor-not-allowed"
                               aria-label={`Start ${bot.name}`}
                               title="Start"
                             >
@@ -616,7 +634,13 @@ export default function BotList() {
                           )}
                           {bot.status !== 'stopped' && (
                             <button
-                              className="p-2 text-stopped hover:bg-gray-700 rounded"
+                              onClick={() => {
+                                if (confirm(`Are you sure you want to stop "${bot.name}"?`)) {
+                                  stop.mutate({ id: bot.id, name: bot.name })
+                                }
+                              }}
+                              disabled={isActionPending(stop, bot.id)}
+                              className="p-2 text-stopped hover:bg-gray-700 rounded disabled:opacity-50 disabled:cursor-not-allowed"
                               aria-label={`Stop ${bot.name}`}
                               title="Stop"
                             >

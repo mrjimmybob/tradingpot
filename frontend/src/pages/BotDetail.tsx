@@ -20,6 +20,7 @@ import {
   Activity,
 } from 'lucide-react'
 import { useToast } from '../components/Toast'
+import { useBotActions } from '../hooks/useBotActions'
 import { useRealtimeBot, useRealtimePrice } from '../contexts/WebSocketContext'
 import { RealtimePrice } from '../components/RealtimePrice'
 
@@ -197,53 +198,9 @@ export default function BotDetail() {
   const displayBalance = realtimeBotData?.current_balance ?? bot?.current_balance ?? 0
   const displayPositions = realtimeBotData?.positions ?? positions
 
-  const startMutation = useMutation({
-    mutationFn: async () => {
-      const res = await apiFetch(`/api/bots/${id}/start`, { method: 'POST' })
-      if (!res.ok) {
-        const data = await res.json().catch(() => ({}))
-        throw new Error(data.detail || 'Failed to start bot')
-      }
-      return res.json()
-    },
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ['bot', id] })
-      toast.success('Bot Started', `"${bot?.name}" is now running and executing trades`)
-    },
-    onError: (err: Error) => toast.error('Start Failed', err.message || 'Could not start the bot. Please try again.'),
-  })
-
-  const pauseMutation = useMutation({
-    mutationFn: async () => {
-      const res = await apiFetch(`/api/bots/${id}/pause`, { method: 'POST' })
-      if (!res.ok) {
-        const data = await res.json().catch(() => ({}))
-        throw new Error(data.detail || 'Failed to pause bot')
-      }
-      return res.json()
-    },
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ['bot', id] })
-      toast.info('Bot Paused', `"${bot?.name}" has been paused. No new trades will be executed.`)
-    },
-    onError: (err: Error) => toast.error('Pause Failed', err.message || 'Could not pause the bot. Please try again.'),
-  })
-
-  const stopMutation = useMutation({
-    mutationFn: async () => {
-      const res = await apiFetch(`/api/bots/${id}/stop`, { method: 'POST' })
-      if (!res.ok) {
-        const data = await res.json().catch(() => ({}))
-        throw new Error(data.detail || 'Failed to stop bot')
-      }
-      return res.json()
-    },
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ['bot', id] })
-      toast.info('Bot Stopped', `"${bot?.name}" has been stopped completely.`)
-    },
-    onError: (err: Error) => toast.error('Stop Failed', err.message || 'Could not stop the bot. Please try again.'),
-  })
+  // Start/Pause/Stop share one implementation with the bots list via
+  // useBotActions (single code path, identical endpoints + behaviour).
+  const { start: startMutation, pause: pauseMutation, stop: stopMutation } = useBotActions()
 
   const killMutation = useMutation({
     mutationFn: async () => {
@@ -437,7 +394,7 @@ export default function BotDetail() {
         <div className="flex items-center gap-2">
           {bot.status === 'running' && (
             <button
-              onClick={() => pauseMutation.mutate()}
+              onClick={() => pauseMutation.mutate({ id: id!, name: bot.name })}
               disabled={pauseMutation.isPending}
               className="flex items-center gap-2 px-4 py-2 bg-paused/20 text-paused hover:bg-paused/30 rounded-lg disabled:opacity-50"
             >
@@ -451,7 +408,7 @@ export default function BotDetail() {
           )}
           {(bot.status === 'paused' || bot.status === 'created') && (
             <button
-              onClick={() => startMutation.mutate()}
+              onClick={() => startMutation.mutate({ id: id!, name: bot.name })}
               disabled={startMutation.isPending}
               className="flex items-center gap-2 px-4 py-2 bg-running/20 text-running hover:bg-running/30 rounded-lg disabled:opacity-50"
             >
@@ -467,7 +424,7 @@ export default function BotDetail() {
             <button
               onClick={() => {
                 if (confirm('Are you sure you want to stop this bot?')) {
-                  stopMutation.mutate()
+                  stopMutation.mutate({ id: id!, name: bot.name })
                 }
               }}
               disabled={stopMutation.isPending}
