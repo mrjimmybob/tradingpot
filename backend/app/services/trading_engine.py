@@ -39,6 +39,13 @@ from .decision_status import decision_status_store, DecisionState
 logger = logging.getLogger(__name__)
 
 
+# Minimum executable order notional (USD). A buy below this is rejected at the
+# execution layer, so strategies must size at or above it (or HOLD with a clear
+# reason) rather than emit a doomed sub-minimum order that gets rejected every
+# loop. Single source of truth shared by strategy sizing and _execute_trade.
+MIN_ORDER_USD = 10.0
+
+
 # === STRATEGY STATE PERSISTENCE (C3/H1, M5) ===
 # Per-bot, in-memory strategy state attributes that must survive a restart so
 # resumed bots keep their risk state (trailing stops, locked entry ATR,
@@ -1019,7 +1026,7 @@ class TradingEngine:
                 "close": current_price,
                 "start_ts": now,
             }
-            return TradeSignal(action="hold", reason="Grid: Starting new bar")
+            return TradeSignal(action="hold", amount=0, reason="Grid: Starting new bar")
 
         # Update current bar
         current_bar["high"] = max(current_bar["high"], current_price)
@@ -1031,6 +1038,7 @@ class TradingEngine:
         if bar_duration < bar_interval_seconds:
             return TradeSignal(
                 action="hold",
+                amount=0,
                 reason=f"Grid: Bar in progress ({bar_duration:.0f}/{bar_interval_seconds}s)"
             )
 
@@ -1074,6 +1082,7 @@ class TradingEngine:
                 )
                 return TradeSignal(
                     action="hold",
+                    amount=0,
                     reason=f"Grid: Cooldown after kill ({remaining_minutes:.0f}min remaining)"
                 )
             else:
@@ -1108,6 +1117,7 @@ class TradingEngine:
                 )
                 return TradeSignal(
                     action="hold",
+                    amount=0,
                     reason=f"Grid: Paused (regime={regime_names}, need flat/normal markets)"
                 )
 
@@ -1161,6 +1171,7 @@ class TradingEngine:
 
             return TradeSignal(
                 action="hold",
+                amount=0,
                 reason=f"Grid: Kill switch (drawdown {drawdown*100:.1f}%), {cooldown_after_kill_hours}h cooldown"
             )
 
@@ -1192,6 +1203,7 @@ class TradingEngine:
 
                 return TradeSignal(
                     action="hold",
+                    amount=0,
                     reason=f"Grid: Re-centered at ${bar_close_price:.2f} (range escape), {cooldown_after_kill_hours}h cooldown"
                 )
 
@@ -1200,6 +1212,7 @@ class TradingEngine:
         if last_order_bar is not None and last_order_bar == completed_bars[-1]["start_ts"]:
             return TradeSignal(
                 action="hold",
+                amount=0,
                 reason="Grid: Already traded this bar (one order per bar limit)"
             )
 
@@ -1258,6 +1271,7 @@ class TradingEngine:
         if nearest_level is None:
             return TradeSignal(
                 action="hold",
+                amount=0,
                 reason="Grid: No levels triggered this bar"
             )
 
@@ -1280,6 +1294,7 @@ class TradingEngine:
                 )
                 return TradeSignal(
                     action="hold",
+                    amount=0,
                     reason=f"Grid: Insufficient virtual cash for buy at level {nearest_level}"
                 )
 
@@ -1320,6 +1335,7 @@ class TradingEngine:
                 )
                 return TradeSignal(
                     action="hold",
+                    amount=0,
                     reason=f"Grid: Insufficient virtual crypto for sell at level {nearest_level}"
                 )
 
@@ -1361,6 +1377,30 @@ class TradingEngine:
         if not hasattr(self, "_grid_states"):
             self._grid_states = {}
         self._grid_states[bot_id] = state
+
+    def calculate_atr_proxy(self, bars: list, period: int) -> float:
+        """ATR proxy from completed OHLC pseudo-bars.
+
+        Average true range approximated as the mean (high - low) over the last
+        ``period`` bars. Used by the Adaptive Grid range-escape kill switch.
+        Returns 0.0 when there is insufficient data.
+
+        NOTE: this is the missing companion to the bar-based grid. Without it
+        the grid raised AttributeError on the first bar past ``atr_period`` -
+        i.e. immediately after warmup, every run.
+        """
+        if not bars or len(bars) < period:
+            return 0.0
+        recent = bars[-period:]
+        true_ranges = []
+        for bar in recent:
+            high = bar.get("high")
+            low = bar.get("low")
+            if isinstance(high, (int, float)) and isinstance(low, (int, float)):
+                true_ranges.append(high - low)
+        if not true_ranges:
+            return 0.0
+        return sum(true_ranges) / len(true_ranges)
 
     async def _strategy_mean_reversion(
         self,
@@ -1731,16 +1771,24 @@ class TradingEngine:
 
         # Entry condition: bar close <= lower Bollinger Band
         if last_bar_close <= lower_band:
-            # Fixed percentage position sizing
+            # Fixed percentage position sizing, floored to the executable
+            # minimum (a sub-minimum buy would be rejected by the engine every
+            # loop). Below the minimum and unaffordable -> HOLD with a reason.
             buy_amount = bot.current_balance * order_size_percent
 
-            if buy_amount < 1:
-                self._mean_reversion_states[bot.id] = state
-                return TradeSignal(
-                    action="hold",
-                    amount=0,
-                    reason="Mean Reversion: Insufficient balance for entry"
-                )
+            if buy_amount < MIN_ORDER_USD:
+                if bot.current_balance >= MIN_ORDER_USD:
+                    buy_amount = MIN_ORDER_USD
+                else:
+                    self._mean_reversion_states[bot.id] = state
+                    return TradeSignal(
+                        action="hold",
+                        amount=0,
+                        reason=(
+                            f"Mean Reversion: balance ${bot.current_balance:.2f} "
+                            f"below ${MIN_ORDER_USD:.0f} minimum order"
+                        ),
+                    )
 
             logger.info(
                 f"Bot {bot.id}: Mean Reversion ENTRY - "
@@ -2028,28 +2076,47 @@ class TradingEngine:
                         reason=f"Trend Following: Entry confirmation {state['entry_confirmation_count']}/{entry_confirmation_loops}"
                     )
 
-                # Confirmed entry - proceed
-                # Volatility-adjusted position sizing
-                # Risk fixed percentage of capital, position size based on ATR
+                # Confirmed entry - proceed.
+                # Volatility-adjusted position sizing: risk a fixed % of capital;
+                # the ATR-based stop distance determines how many COINS that risk
+                # buys, which we convert to a quote-notional order.
+                #
+                # BUGFIX: the conversion to notional (* current_price) was
+                # missing, so position_size was a coin count used as if it were
+                # USD. On a high-priced asset that produced sub-$1 "orders"
+                # (rejected as < $10 minimum), and when ATR collapsed toward 0 it
+                # blew up and was silently capped at the whole balance.
                 risk_amount = bot.current_balance * risk_percent
 
                 if atr > 0:
-                    # Position size = risk_amount / (ATR * atr_multiplier)
-                    # This gives us the position size in quote currency (USDT)
-                    position_size = risk_amount / (atr * atr_multiplier)
+                    stop_distance = atr * atr_multiplier           # USD per coin
+                    position_coins = risk_amount / stop_distance   # base coins
+                    position_size = position_coins * current_price  # quote USD notional
                 else:
-                    # Fallback: use risk_amount directly if ATR is 0
+                    # ATR unavailable (flat/illiquid): risk the nominal amount
+                    # rather than dividing by ~0.
                     position_size = risk_amount
 
-                # Cap position size at available balance
+                # Never deploy more than the available balance.
                 buy_amount = min(position_size, bot.current_balance)
 
-                if buy_amount < 1:
-                    return TradeSignal(
-                        action="hold",
-                        amount=0,
-                        reason="Trend Following: Insufficient balance for entry"
-                    )
+                # Minimum-order floor: a risk-based size below the exchange
+                # minimum cannot execute. Floor to the minimum when the balance
+                # can afford it; otherwise HOLD with a clear reason instead of
+                # emitting a doomed sub-minimum order that the engine rejects
+                # every loop (which presents as a stuck bot).
+                if buy_amount < MIN_ORDER_USD:
+                    if bot.current_balance >= MIN_ORDER_USD:
+                        buy_amount = MIN_ORDER_USD
+                    else:
+                        return TradeSignal(
+                            action="hold",
+                            amount=0,
+                            reason=(
+                                f"Trend Following: balance ${bot.current_balance:.2f} "
+                                f"below ${MIN_ORDER_USD:.0f} minimum order"
+                            ),
+                        )
 
                 logger.info(
                     f"Bot {bot.id}: Trend Following ENTRY - "
@@ -2839,25 +2906,38 @@ class TradingEngine:
         # === BREAKOUT ENTRY CONDITION (LONG-ONLY, UPPER BAND) ===
         # Requires: sufficient compression + breakout above upper BB
         if compression_satisfied and last_bar_close > upper_band:
-            # Volatility-adjusted position sizing
+            # Volatility-adjusted position sizing: risk a fixed % of capital; the
+            # ATR-based stop distance gives the COIN count, converted to a quote
+            # notional. BUGFIX: the * current_price conversion was missing (same
+            # unit bug as trend_following), producing sub-$1 orders or, on ATR
+            # collapse, a blow-up silently capped at the balance.
             risk_amount = bot.current_balance * risk_percent
 
             if atr > 0:
-                # Position size = risk_amount / (ATR * stop_multiplier)
-                position_size = risk_amount / (atr * atr_stop_mult)
+                stop_distance = atr * atr_stop_mult            # USD per coin
+                position_coins = risk_amount / stop_distance   # base coins
+                position_size = position_coins * current_price  # quote USD notional
             else:
                 position_size = risk_amount
 
-            # Cap at available balance
+            # Cap at available balance.
             buy_amount = min(position_size, bot.current_balance)
 
-            if buy_amount < 1:
-                self._volatility_breakout_states[bot.id] = state
-                return TradeSignal(
-                    action="hold",
-                    amount=0,
-                    reason="Volatility Breakout: Insufficient balance for entry"
-                )
+            # Floor to the executable minimum (a sub-minimum buy is rejected by
+            # the engine every loop); HOLD if the balance cannot afford it.
+            if buy_amount < MIN_ORDER_USD:
+                if bot.current_balance >= MIN_ORDER_USD:
+                    buy_amount = MIN_ORDER_USD
+                else:
+                    self._volatility_breakout_states[bot.id] = state
+                    return TradeSignal(
+                        action="hold",
+                        amount=0,
+                        reason=(
+                            f"Volatility Breakout: balance ${bot.current_balance:.2f} "
+                            f"below ${MIN_ORDER_USD:.0f} minimum order"
+                        ),
+                    )
 
             # Calculate BB width percentile for logging
             percentile_rank = "N/A"
@@ -4082,6 +4162,46 @@ class TradingEngine:
         Returns:
             Order if executed, None otherwise
         """
+        # === STEP 2.5: RESOLVE SELL SIZE AGAINST THE OPEN POSITION ===
+        # Resolve how much base to sell BEFORE risk/cost sizing so every
+        # downstream step (portfolio caps, cost model, order, position update)
+        # sees the true notional. Two real, observed failure modes this closes:
+        #   * "Sell all" exits pass amount<=0 as a sentinel (e.g. Auto Mode
+        #     force-exit: TradeSignal(action="sell", amount=0)). Left
+        #     unresolved that places a ZERO-size sell that never closes the
+        #     position, so the strategy retries the exit every loop forever.
+        #   * A full-position exit sizes amount=base*price; dividing back by
+        #     price overshoots the held base by a float rounding error ~5% of
+        #     the time. The old code REJECTED that, leaving the position stuck
+        #     open. We clamp to the holding so a full exit always settles.
+        sell_base = None
+        if signal.action == "sell":
+            result = await session.execute(
+                select(Position).where(
+                    Position.bot_id == bot.id,
+                    Position.trading_pair == bot.trading_pair,
+                )
+            )
+            position = result.scalar_one_or_none()
+            if not position:
+                logger.warning(
+                    f"Bot {bot.id}: Trade REJECTED - cannot sell without open position"
+                )
+                return None
+
+            position_amount = getattr(position, "amount", None)
+            if position_amount is not None and isinstance(position_amount, (int, float)):
+                if signal.amount is None or signal.amount <= 0:
+                    sell_base = position_amount  # sentinel: close entire position
+                else:
+                    sell_base = min(signal.amount / current_price, position_amount)
+                # Realign the signal's quote notional with the resolved base so
+                # risk caps and the cost model price the trade that actually runs.
+                signal.amount = sell_base * current_price
+            else:
+                # Test mock without a numeric position amount: trust the signal.
+                sell_base = (signal.amount or 0.0) / current_price
+
         # === STEP 3: PORTFOLIO RISK CAPS CHECK ===
         portfolio_risk = PortfolioRiskService(session)
         portfolio_check = await portfolio_risk.check_portfolio_risk(
@@ -4160,7 +4280,7 @@ class TradingEngine:
         # never be blocked by it, or a small/dust position could not be closed -
         # defeating stop-loss and trailing-stop exits. Live sells are still
         # validated against the exchange's own min-notional in _preflight_order.
-        min_order_size = 10.0  # $10 minimum
+        min_order_size = MIN_ORDER_USD  # shared $10 minimum
         if signal.action == "buy" and signal.amount < min_order_size:
             logger.warning(
                 f"Bot {bot.id}: Trade REJECTED - order size ${signal.amount:.2f} < ${min_order_size:.2f} minimum"
@@ -4193,38 +4313,15 @@ class TradingEngine:
             )
             execution_mode = "market"
 
-        # === STEP 7.5: VALIDATE SELL AMOUNT AGAINST POSITION ===
-        if signal.action == "sell":
-            # Check if we have an open position to sell from
-            amount_base = signal.amount / current_price
-            result = await session.execute(
-                select(Position).where(
-                    Position.bot_id == bot.id,
-                    Position.trading_pair == bot.trading_pair,
-                )
-            )
-            position = result.scalar_one_or_none()
-            
-            if not position:
-                logger.warning(
-                    f"Bot {bot.id}: Trade REJECTED - cannot sell without open position"
-                )
-                return None
-            
-            # Validate sell amount doesn't exceed position size
-            # Handle both real Position objects and test mocks gracefully
-            position_amount = getattr(position, 'amount', None)
-            # Only validate if we have a numeric amount (skip validation for test mocks without proper amount)
-            if position_amount is not None and isinstance(position_amount, (int, float)):
-                if amount_base > position_amount:
-                    logger.warning(
-                        f"Bot {bot.id}: Trade REJECTED - sell amount {amount_base:.8f} exceeds position size {position_amount:.8f}"
-                    )
-                    return None
-
         # === STEP 8: EXECUTE TRADE ===
-        # Calculate amount in base currency
-        amount_base = signal.amount / current_price
+        # Amount in base currency. Buys size from the signal's quote amount;
+        # sells use the position-resolved base from STEP 2.5 so a full exit
+        # settles exactly (no float-rounding overshoot, no dust left, and the
+        # "sell all" sentinel actually closes the position).
+        if signal.action == "sell":
+            amount_base = sell_base
+        else:
+            amount_base = signal.amount / current_price
 
         # Determine order side
         side = OrderSide.BUY if signal.action == "buy" else OrderSide.SELL

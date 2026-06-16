@@ -482,23 +482,29 @@ class TestMarketOrders:
         assert len(mock_exchange.orders_placed) == 0
 
     @pytest.mark.asyncio
-    async def test_market_sell_more_than_position_rejected(
+    async def test_market_sell_more_than_position_clamps_to_holding(
         self, mock_bot, mock_session, trading_engine, mock_services
     ):
-        """Test that selling more than current position is rejected."""
+        """A sell larger than the position is CLAMPED to the holding, not rejected.
+
+        Rejecting an oversized exit left the position stuck open and made the
+        strategy retry the same failed SELL every loop. Spot can never sell more
+        than is held, so the safe, terminating behavior is to sell exactly the
+        position (close it) — which is what unattended exits require.
+        """
         # Arrange
         mock_exchange = MockExchangeService()
         signal = TradeSignal(
             action="sell", amount=5000.0, order_type="market"
-        )  # Trying to sell 0.1 BTC
+        )  # Strategy asks for 0.1 BTC...
         current_price = 50000.0
 
-        # Mock position with only 0.02 BTC
+        # ...but only 0.02 BTC is held.
         small_position = create_mock_position(
             bot_id=mock_bot.id,
             symbol="BTC/USDT",
             side=PositionSide.LONG,
-            quantity=0.02,  # Only 0.02 BTC available
+            quantity=0.02,
             average_entry_price=48000.0,
         )
 
@@ -506,19 +512,158 @@ class TestMarketOrders:
         mock_position_result.scalar_one_or_none = Mock(return_value=small_position)
         mock_session.execute.return_value = mock_position_result
 
+        mock_trade = create_mock_trade(
+            trade_id=2, bot_id=mock_bot.id, side=TradeSide.SELL,
+            base_amount=0.02, quote_amount=1000.0, price=50000.0, fee=1.0,
+        )
+        mock_services["trade_recorder"].record_trade = AsyncMock(return_value=mock_trade)
+        mock_services["tax_engine"].process_sell = AsyncMock(return_value=(40.0, []))
+
         with patch(
             "app.services.trading_engine.PortfolioRiskService",
             return_value=mock_services["portfolio_risk"],
-        ):
+        ), patch(
+            "app.services.trading_engine.TradeRecorderService",
+            return_value=mock_services["trade_recorder"],
+        ), patch(
+            "app.services.trading_engine.FIFOTaxEngine",
+            return_value=mock_services["tax_engine"],
+        ), patch(
+            "app.services.trading_engine.LedgerInvariantService",
+            return_value=mock_services["invariant_validator"],
+        ), patch(
+            "app.services.trading_engine.VirtualWalletService",
+            return_value=mock_services["wallet"],
+        ), patch("app.services.trading_engine.CSVExportService"):
 
-            # Act - Try to sell 0.1 BTC when only 0.02 available
+            # Act - ask to sell 0.1 BTC when only 0.02 is available
             order = await trading_engine._execute_trade(
                 mock_bot, mock_exchange, signal, current_price, mock_session
             )
 
-        # Assert - Order rejected, no exchange call
-        assert order is None
-        assert len(mock_exchange.orders_placed) == 0
+        # Assert - executes (not rejected) and never oversells: clamps to 0.02 held
+        assert order is not None
+        assert order.order_type == OrderType.MARKET_SELL
+        assert len(mock_exchange.orders_placed) == 1
+        assert mock_exchange.orders_placed[0]["amount"] == pytest.approx(0.02)
+
+    @pytest.mark.asyncio
+    async def test_market_sell_all_sentinel_closes_full_position(
+        self, mock_bot, mock_session, trading_engine, mock_services
+    ):
+        """A SELL with amount<=0 is the "sell all" sentinel and must close the
+        ENTIRE position, not place a zero-size order.
+
+        Auto Mode's force-exit emits TradeSignal(action="sell", amount=0).
+        Unresolved, that placed a 0-base order that never closed the position,
+        so the bot retried the exit forever (the Bot 1 failure loop).
+        """
+        mock_exchange = MockExchangeService()
+        signal = TradeSignal(action="sell", amount=0, order_type="market")
+        current_price = 50000.0
+
+        position = create_mock_position(
+            bot_id=mock_bot.id, symbol="BTC/USDT", side=PositionSide.LONG,
+            quantity=0.037, average_entry_price=48000.0,
+        )
+        mock_position_result = Mock()
+        mock_position_result.scalar_one_or_none = Mock(return_value=position)
+        mock_session.execute.return_value = mock_position_result
+
+        mock_services["trade_recorder"].record_trade = AsyncMock(
+            return_value=create_mock_trade(
+                trade_id=3, bot_id=mock_bot.id, side=TradeSide.SELL,
+                base_amount=0.037, quote_amount=1850.0, price=50000.0, fee=1.85,
+            )
+        )
+        mock_services["tax_engine"].process_sell = AsyncMock(return_value=(10.0, []))
+
+        with patch(
+            "app.services.trading_engine.PortfolioRiskService",
+            return_value=mock_services["portfolio_risk"],
+        ), patch(
+            "app.services.trading_engine.TradeRecorderService",
+            return_value=mock_services["trade_recorder"],
+        ), patch(
+            "app.services.trading_engine.FIFOTaxEngine",
+            return_value=mock_services["tax_engine"],
+        ), patch(
+            "app.services.trading_engine.LedgerInvariantService",
+            return_value=mock_services["invariant_validator"],
+        ), patch(
+            "app.services.trading_engine.VirtualWalletService",
+            return_value=mock_services["wallet"],
+        ), patch("app.services.trading_engine.CSVExportService"):
+            order = await trading_engine._execute_trade(
+                mock_bot, mock_exchange, signal, current_price, mock_session
+            )
+
+        assert order is not None
+        assert order.order_type == OrderType.MARKET_SELL
+        assert len(mock_exchange.orders_placed) == 1
+        # The full 0.037 BTC position was sold — NOT zero.
+        assert mock_exchange.orders_placed[0]["amount"] == pytest.approx(0.037)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("base, price", [
+        (0.333333, 60123.45),
+        (0.1, 49999.99),
+        (1.7, 23456.78),
+        (0.000123, 51234.5),
+    ])
+    async def test_market_sell_full_exit_always_settles(
+        self, base, price, mock_bot, mock_session, trading_engine, mock_services
+    ):
+        """A full-position exit (amount = base*price) must ALWAYS execute.
+
+        Float rounding makes (base*price)/price exceed `base` ~5% of the time;
+        the old code rejected that and left the position stuck open. The clamp
+        makes every full exit settle at exactly the held base, never oversold.
+        """
+        mock_exchange = MockExchangeService()
+        signal = TradeSignal(action="sell", amount=base * price, order_type="market")
+
+        position = create_mock_position(
+            bot_id=mock_bot.id, symbol="BTC/USDT", side=PositionSide.LONG,
+            quantity=base, average_entry_price=price * 0.95,
+        )
+        mock_position_result = Mock()
+        mock_position_result.scalar_one_or_none = Mock(return_value=position)
+        mock_session.execute.return_value = mock_position_result
+
+        mock_services["trade_recorder"].record_trade = AsyncMock(
+            return_value=create_mock_trade(
+                trade_id=4, bot_id=mock_bot.id, side=TradeSide.SELL,
+                base_amount=base, quote_amount=base * price, price=price, fee=0.0,
+            )
+        )
+        mock_services["tax_engine"].process_sell = AsyncMock(return_value=(0.0, []))
+
+        with patch(
+            "app.services.trading_engine.PortfolioRiskService",
+            return_value=mock_services["portfolio_risk"],
+        ), patch(
+            "app.services.trading_engine.TradeRecorderService",
+            return_value=mock_services["trade_recorder"],
+        ), patch(
+            "app.services.trading_engine.FIFOTaxEngine",
+            return_value=mock_services["tax_engine"],
+        ), patch(
+            "app.services.trading_engine.LedgerInvariantService",
+            return_value=mock_services["invariant_validator"],
+        ), patch(
+            "app.services.trading_engine.VirtualWalletService",
+            return_value=mock_services["wallet"],
+        ), patch("app.services.trading_engine.CSVExportService"):
+            order = await trading_engine._execute_trade(
+                mock_bot, mock_exchange, signal, price, mock_session
+            )
+
+        assert order is not None
+        assert len(mock_exchange.orders_placed) == 1
+        # Never oversells the holding; settles at exactly the held base.
+        assert mock_exchange.orders_placed[0]["amount"] <= base + 1e-12
+        assert mock_exchange.orders_placed[0]["amount"] == pytest.approx(base, rel=1e-9)
 
 
 # ============================================================================
