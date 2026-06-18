@@ -1019,7 +1019,12 @@ class TradingEngine:
         kill_atr_mult = params.get("kill_atr_multiplier", 3.0)
         atr_period = params.get("atr_period", 14)
         regime_filter_enabled = params.get("regime_filter_enabled", True)
-        allowed_regimes = params.get("allowed_regimes", ["trend_flat", "volatility_normal"])
+        # NOTE: the regime detector emits volatility in {low, medium, high}; it
+        # never emits 'normal'. The old default ['trend_flat','volatility_normal']
+        # had a DEAD second tag, so the grid effectively only ran when trend was
+        # flat. 'volatility_medium' is the detector's word for normal volatility,
+        # which is the range-bound condition the grid is designed for.
+        allowed_regimes = params.get("allowed_regimes", ["trend_flat", "volatility_medium"])
         cooldown_after_kill_hours = params.get("cooldown_after_kill_hours", 2)
 
         # Long-biased split for crypto: more buy levels below, fewer sell above
@@ -1316,6 +1321,25 @@ class TradingEngine:
                     nearest_level = level_num
 
         if nearest_level is None:
+            # PRODUCTION DIAGNOSIS: how far price is from the closest unfilled
+            # buy/sell level, so an operator can see whether the grid is simply
+            # waiting for a move or is mis-centered. Runs once per completed bar.
+            nearest_buy = min(
+                (lv["price"] for lv in grid_levels.values()
+                 if lv["side"] == "buy" and not lv["filled"]), default=None)
+            nearest_sell = min(
+                (lv["price"] for lv in grid_levels.values()
+                 if lv["side"] == "sell" and not lv["filled"]),
+                key=lambda pr: abs(pr - bar_close_price), default=None)
+            buy_gap = (
+                f"{(bar_close_price - nearest_buy)/bar_close_price*100:+.2f}%"
+                if nearest_buy else "n/a")
+            logger.info(
+                f"Bot {bot.id}: Grid no-trade diag - close=${bar_close_price:.2f} "
+                f"center=${center_price:.2f} nearest_buy=${nearest_buy or 0:.2f} "
+                f"(price {buy_gap} vs nearest buy) virtual_cash=${state['virtual_cash']:.2f} "
+                f"virtual_crypto={state['virtual_crypto']:.6f}"
+            )
             return TradeSignal(
                 action="hold",
                 amount=0,
@@ -1620,12 +1644,17 @@ class TradingEngine:
         regime_name = "regime_filter_disabled"
 
         if regime_filter_enabled:
-            # Get price history for regime detection
-            price_history_for_regime = self._get_price_history(bot.id)
-            price_history_for_regime.append(current_price)
-
-            # Detect current market regime
-            current_regime = self._detect_market_regime(price_history_for_regime, None)
+            # Detect regime from THIS strategy's own completed bar closes. The
+            # shared tick price-history buffer (_get_price_history) is only
+            # populated by trend_following/funding_carry, so a standalone
+            # mean-reversion bot fed it an empty series -> _detect_market_regime
+            # returned the neutral 'flat/medium' default forever. That silently
+            # disabled BOTH the regime entry gate AND the trend force-exit
+            # (mean reversion would happily enter and hold through a downtrend).
+            # By here we already have >= period bars (checked above), so the
+            # detector has enough data.
+            bar_closes = [b["close"] for b in state["bars"]] + [current_price]
+            current_regime = self._detect_market_regime(bar_closes, None)
             trend_state = current_regime.get("trend_state", "flat")
             volatility_state = current_regime.get("volatility_state", "medium")
 
@@ -1641,7 +1670,7 @@ class TradingEngine:
             force_exit_regime = trend_state in ["up", "down"]
             regime_name = f"{trend_regime}, vol={volatility_state}"
 
-            logger.debug(
+            logger.info(
                 f"Bot {bot.id}: Mean Reversion regime - {regime_name}, "
                 f"Entry allowed: {regime_allows_entry}, Force exit: {force_exit_regime}"
             )
@@ -1658,6 +1687,24 @@ class TradingEngine:
             f"SMA: ${sma:.2f}, Upper: ${upper_band:.2f}, Lower: ${lower_band:.2f}, "
             f"ATR: ${atr:.2f}, Regime: {regime_name}"
         )
+
+        # PRODUCTION DIAGNOSIS (once per completed bar, ~1/min): exactly why this
+        # bot is/ isn't trading - entry distance to the lower band, regime gate,
+        # and position state. Answers "why no trade?" without DEBUG logging.
+        if bar_completed:
+            entry_gap_pct = (
+                (last_bar_close - lower_band) / lower_band * 100 if lower_band > 0 else 0.0
+            )
+            cd_remaining = 0
+            if state.get("last_exit_time") is not None:
+                cd_remaining = max(0, int(cooldown_seconds - (
+                    datetime.utcnow() - state["last_exit_time"]).total_seconds()))
+            logger.info(
+                f"Bot {bot.id}: MR no-trade diag - close=${last_bar_close:.2f} "
+                f"lower_band=${lower_band:.2f} gap_to_entry={entry_gap_pct:+.3f}% "
+                f"regime={regime_name} entry_allowed={regime_allows_entry} "
+                f"cooldown={cd_remaining}s has_position={has_position} bars={len(state['bars'])}"
+            )
 
         # === POSITION EXIT LOGIC (BOUNDED RISK) ===
         # Exits: Mean reached | Hard stop | Time stop | Regime flip
@@ -2301,11 +2348,19 @@ class TradingEngine:
                     state["exit_confirmation_count"] = 0
                     self._trend_states[bot.id] = state
 
-            # Hold position - trend still valid
+            # Hold position - trend still valid.
+            # A conditional inside an f-string format spec ({x:.2f if ...}) is a
+            # ValueError ("Invalid format specifier"), raised on EVERY hold tick
+            # once a position is open -> the failure breaker pauses the bot.
+            # Format the optional stop outside the f-string.
+            stop_str = (
+                f"${state['trailing_stop']:.2f}"
+                if state["trailing_stop"] is not None else "N/A"
+            )
             return TradeSignal(
                 action="hold",
                 amount=0,
-                reason=f"Trend Following: Holding position, stop at ${state['trailing_stop']:.2f if state['trailing_stop'] else 'N/A'}"
+                reason=f"Trend Following: Holding position, stop at {stop_str}"
             )
 
     async def _get_funding_signal(
@@ -2603,6 +2658,7 @@ class TradingEngine:
             "compression_active": False,
             "compression_bars": 0,
             "compression_start": None,
+            "breakout_armed": False,  # latched after compression, survives breakout bar
             "entry_price": None,
             "entry_atr": None,  # LOCKED at entry - risk never expands
             "highest_price": None,  # For monotonic trailing stop
@@ -2721,12 +2777,13 @@ class TradingEngine:
         # === REGIME GATING (pauses entries during wrong conditions) ===
         # Uses system-wide regime detection to avoid entries in adverse markets
         if regime_filter_enabled:
-            # Get price history for regime detection (uses existing tick data)
-            price_history_for_regime = self._get_price_history(bot.id)
-            price_history_for_regime.append(current_price)
-
-            # Detect current market regime
-            current_regime = self._detect_market_regime(price_history_for_regime, None)
+            # Detect regime from THIS strategy's own bar closes (same fix as
+            # mean_reversion): the shared tick buffer is empty for a standalone
+            # breakout bot, which pinned volatility to 'medium' -> 'volatility_
+            # normal' and, with the default allow-list of ['volatility_expanding']
+            # only, PERMANENTLY blocked every entry. >= bb_period bars exist here.
+            bar_closes = [b["close"] for b in state["bars"]] + [current_price]
+            current_regime = self._detect_market_regime(bar_closes, None)
             volatility_state = current_regime.get("volatility_state", "medium")
 
             # Map volatility_state to regime names
@@ -2855,70 +2912,50 @@ class TradingEngine:
                         reason=f"Volatility Breakout: Trailing stop (${state['trailing_stop']:.2f})",
                     )
 
-            # Update state and hold
+            # Update state and hold.
+            # Same f-string format-spec crash class as trend_following/mean
+            # reversion: a conditional in the spec raises on every hold tick.
             self._volatility_breakout_states[bot.id] = state
 
+            stop_str = (
+                f"${state['trailing_stop']:.2f}"
+                if state["trailing_stop"] is not None else "N/A"
+            )
             return TradeSignal(
                 action="hold",
                 amount=0,
-                reason=f"Volatility Breakout: Holding position, stop at ${state['trailing_stop']:.2f if state['trailing_stop'] else 'N/A'}"
+                reason=f"Volatility Breakout: Holding position, stop at {stop_str}"
             )
 
-        # === ENTRY LOGIC (RARE, REGIME-AWARE) ===
+        # === ENTRY LOGIC (RARE) ===
+        # The volatility "regime" veto was REMOVED as a hard entry gate here.
+        # Two bugs made it pathological: (1) it ran BEFORE compression tracking
+        # and early-returned, so a regime-blocked bot never accumulated a single
+        # compression bar; (2) it demanded 'volatility_expanding' at the very
+        # instant the compression check demands LOW volatility - a contradiction
+        # that meant the strategy could never enter. The compression-then-
+        # breakout sequence already encodes the volatility thesis (compression =
+        # low vol, a close above the upper band = the expansion), so the separate
+        # volatility veto was redundant. volatility_regime_name is kept for logs.
 
-        # Regime gate: Block entries if wrong market conditions
-        if not regime_allows_entry:
-            self._volatility_breakout_states[bot.id] = state
-            return TradeSignal(
-                action="hold",
-                amount=0,
-                reason=f"Volatility Breakout: PAUSED (regime={volatility_regime_name}, waiting for {allowed_regimes})"
-            )
-
-        # Cooldown period (sparse trading)
-        if state["last_breakout_attempt"] is not None:
-            last_attempt = datetime.fromisoformat(state["last_breakout_attempt"])
-            hours_since = (datetime.utcnow() - last_attempt).total_seconds() / 3600
-
-            if hours_since < cooldown_hours:
-                self._volatility_breakout_states[bot.id] = state
-                return TradeSignal(
-                    action="hold",
-                    amount=0,
-                    reason=f"Volatility Breakout: Cooldown ({cooldown_hours - hours_since:.1f}h remaining)"
-                )
-
-        # === COMPRESSION DETECTION (BAR-BASED) ===
-        # Only update compression state when bar completes (not on every tick)
+        # === COMPRESSION DETECTION (BAR-BASED) - ALWAYS TRACKED ===
+        # Must run regardless of regime/cooldown, or compression_bars can never
+        # reach min_compression_bars.
         is_compressed = False
+        percentile_value = None
 
         if compression_method == "bb_width":
             # Use Bollinger Band width percentile
             if len(state["bb_width_history"]) >= 20:
-                # Calculate percentile threshold
                 sorted_widths = sorted(state["bb_width_history"])
                 percentile_index = int(len(sorted_widths) * (compression_percentile / 100))
                 percentile_value = sorted_widths[percentile_index]
-
                 is_compressed = bb_width <= percentile_value
-
-                logger.debug(
-                    f"Bot {bot.id}: Volatility Breakout compression check - "
-                    f"BB width: {bb_width:.4f}, {compression_percentile}th percentile: {percentile_value:.4f}, "
-                    f"Compressed: {is_compressed}"
-                )
-
         elif compression_method == "atr_average":
             # Use ATR below its rolling average
             if len(state["atr_history"]) >= 20:
                 avg_atr = sum(state["atr_history"][-20:]) / 20
                 is_compressed = atr <= (avg_atr * atr_threshold_mult)
-
-                logger.debug(
-                    f"Bot {bot.id}: Volatility Breakout compression check - "
-                    f"ATR: {atr:.4f}, Avg ATR: {avg_atr:.4f}, "
-                    f"Threshold: {avg_atr * atr_threshold_mult:.4f}, Compressed: {is_compressed}"
-                )
 
         # Track compression duration (BAR-BASED)
         if bar_completed:
@@ -2944,15 +2981,53 @@ class TradingEngine:
                     state["compression_start"] = None
                     state["compression_bars"] = 0
 
-        # Check if compression has persisted long enough
-        compression_satisfied = (
-            state["compression_active"] and
-            state["compression_bars"] >= min_compression_bars
-        )
+        # Latch a "breakout armed" flag once compression has persisted long
+        # enough. It MUST survive the expansion that follows: a genuine breakout
+        # bar has wide close-dispersion (high BB width) and therefore reads as
+        # NOT compressed, which would otherwise reset compression on the very bar
+        # we want to act on (so the strategy could never fire). Arming decouples
+        # "we were compressed" from "now we break out". It disarms on entry or if
+        # price falls back to the mean (the setup has gone stale).
+        if state["compression_active"] and state["compression_bars"] >= min_compression_bars:
+            state["breakout_armed"] = True
+        if state.get("breakout_armed") and last_bar_close < sma:
+            state["breakout_armed"] = False
+        compression_satisfied = bool(state.get("breakout_armed"))
+
+        # A confirmed breakout = armed by prior compression AND a bar close above
+        # the upper band. This is the only behavioural entry gate now (+ cooldown).
+        is_breakout = compression_satisfied and last_bar_close > upper_band
+
+        # PRODUCTION DIAGNOSIS (once per completed bar): why this (rare) strategy
+        # is/ isn't entering - compression progress, arming, and the breakout gap.
+        if bar_completed:
+            upper_gap_pct = (
+                (last_bar_close - upper_band) / upper_band * 100 if upper_band > 0 else 0.0
+            )
+            logger.info(
+                f"Bot {bot.id}: VB no-trade diag - close=${last_bar_close:.2f} "
+                f"upper=${upper_band:.2f} gap_to_breakout={upper_gap_pct:+.3f}% "
+                f"width={bb_width:.5f} compressed={is_compressed} "
+                f"comp_bars={state['compression_bars']}/{min_compression_bars} "
+                f"armed={bool(state.get('breakout_armed'))} regime={volatility_regime_name} "
+                f"bars={len(state['bars'])}"
+            )
+
+        # Cooldown only gates an ACTUAL breakout entry (sparse trading) - it no
+        # longer blocks compression tracking.
+        if is_breakout and state["last_breakout_attempt"] is not None:
+            last_attempt = datetime.fromisoformat(state["last_breakout_attempt"])
+            hours_since = (datetime.utcnow() - last_attempt).total_seconds() / 3600
+            if hours_since < cooldown_hours:
+                self._volatility_breakout_states[bot.id] = state
+                return TradeSignal(
+                    action="hold",
+                    amount=0,
+                    reason=f"Volatility Breakout: Cooldown ({cooldown_hours - hours_since:.1f}h remaining)"
+                )
 
         # === BREAKOUT ENTRY CONDITION (LONG-ONLY, UPPER BAND) ===
-        # Requires: sufficient compression + breakout above upper BB
-        if compression_satisfied and last_bar_close > upper_band:
+        if is_breakout:
             # Volatility-adjusted position sizing: risk a fixed % of capital; the
             # ATR-based stop distance gives the COIN count, converted to a quote
             # notional. BUGFIX: the * current_price conversion was missing (same
@@ -3006,6 +3081,7 @@ class TradingEngine:
             state["entry_price"] = current_price
             state["entry_atr"] = atr  # LOCKED - trailing stop distance will always use this
             state["bars_since_entry"] = 0
+            state["breakout_armed"] = False  # consumed this setup
             state["last_breakout_attempt"] = datetime.utcnow().isoformat()
 
             self._volatility_breakout_states[bot.id] = state
@@ -5269,10 +5345,11 @@ class TradingEngine:
                 vwap_benchmark = total_pv / total_volume
 
         # Execute using market order (fallback when no volume data)
+        benchmark_str = f"${vwap_benchmark:.2f}" if vwap_benchmark is not None else "N/A"
         logger.info(
             f"Bot {bot.id}: VWAP execution - "
             f"Using market order (no real volume data available). "
-            f"Benchmark VWAP: ${vwap_benchmark:.2f if vwap_benchmark else 'N/A'}"
+            f"Benchmark VWAP: {benchmark_str}"
         )
 
         # Delegate to standard market execution
