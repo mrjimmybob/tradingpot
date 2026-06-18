@@ -46,6 +46,15 @@ logger = logging.getLogger(__name__)
 MIN_ORDER_USD = 10.0
 
 
+# Repeated-rejection circuit breaker. When the SAME executable trade is rejected
+# or fails for the SAME reason this many consecutive times, the bot is paused and
+# the reason surfaced in Decision Status, instead of retrying the doomed action
+# every tick forever (e.g. a sub-minimum order, or an un-settleable exit). This
+# is independent of the loop-level failure breaker (which counts raised
+# exceptions); a rejection is a clean None return, not an exception.
+MAX_CONSECUTIVE_REJECTIONS = 5
+
+
 # === STRATEGY STATE PERSISTENCE (C3/H1, M5) ===
 # Per-bot, in-memory strategy state attributes that must survive a restart so
 # resumed bots keep their risk state (trailing stops, locked entry ATR,
@@ -234,6 +243,40 @@ class TradingEngine:
             ticker_cache=self._shared_ticker_cache,
         )
 
+    async def _seed_sim_exchange(self, bot, exchange, session) -> None:
+        """Restore dry-run simulator balances and reconcile them with positions.
+
+        Runs whenever a simulated exchange is (re)created for a bot - on both
+        start and resume. It (1) re-imports the persisted ``_sim_state`` snapshot
+        so balances survive a restart, then (2) guarantees the simulator holds at
+        least as much of each base asset as the bot's OPEN positions, which are
+        the source of truth for dry-run holdings.
+
+        Without (2), a dry-run bot with an open position but a fresh/lagging
+        simulator could not sell: every stop-loss or exit hit "Insufficient
+        simulated balance", the position stayed open, and the exit retried every
+        tick forever (the Bot 1 stop-loss loop).
+        """
+        if not hasattr(exchange, "ensure_base_balance"):
+            return  # live exchange: real wallet, nothing to reconcile
+
+        sim_state = (getattr(bot, "strategy_state", None) or {}).get("_sim_state")
+        if sim_state:
+            exchange.import_state(sim_state)
+
+        positions = await self._get_bot_positions(bot.id, session)
+        held: Dict[str, float] = {}
+        for pos in positions:
+            try:
+                base = pos.trading_pair.split("/")[0]
+            except (AttributeError, IndexError):
+                continue
+            amount = getattr(pos, "amount", 0.0) or 0.0
+            if isinstance(amount, (int, float)) and amount > 0:
+                held[base] = held.get(base, 0.0) + float(amount)
+        for base, amount in held.items():
+            exchange.ensure_base_balance(base, amount)
+
     async def start_bot(self, bot_id: int) -> bool:
         """Start a trading bot.
 
@@ -262,6 +305,11 @@ class TradingEngine:
             # Create exchange service
             if bot.is_dry_run:
                 exchange = self._make_simulated_exchange(bot.budget)
+                # Restore persisted dry-run balances and reconcile them with any
+                # open positions so a bot started with an existing holding can
+                # actually sell it (otherwise sells fail "Insufficient simulated
+                # balance" and the exit loops forever).
+                await self._seed_sim_exchange(bot, exchange, session)
             else:
                 exchange = ExchangeService()
                 if not exchange.has_credentials():
@@ -874,30 +922,29 @@ class TradingEngine:
             # Use percentage of current balance
             buy_amount = bot.current_balance * amount_percent
 
-        # === MINIMUM ORDER CHECK (safety floor, not exchange-accurate) ===
-        # This is a placeholder minimum to prevent dust orders.
-        # Exchange-level minimum notional validation happens downstream.
-        # Do NOT rely on this for exchange-specific min-notional requirements.
-        min_notional_usd_placeholder = 1.0  # Safety floor: $1 minimum
-
-        if buy_amount < min_notional_usd_placeholder:
-            if bot.current_balance < min_notional_usd_placeholder:
-                # Infinite DCA has reached its natural end: balance exhausted
+        # === MINIMUM ORDER FLOOR (executable, shared $10 minimum) ===
+        # A DCA buy must clear the same MIN_ORDER_USD the execution layer enforces
+        # (_execute_trade STEP 6). Emitting a sub-minimum buy here would be
+        # rejected downstream every tick without ever recording an order, so the
+        # interval gate never advances and the same "$9.95 REJECTED" repeats
+        # forever. Floor up to the minimum when affordable; otherwise HOLD - the
+        # infinite accumulation has reached its natural end (budget exhausted).
+        if buy_amount < MIN_ORDER_USD:
+            if bot.current_balance >= MIN_ORDER_USD:
+                buy_amount = MIN_ORDER_USD
+            else:
                 logger.info(
                     f"Bot {bot.id}: DCA infinite accumulation complete - "
-                    f"Balance ${bot.current_balance:.2f} < minimum ${min_notional_usd_placeholder}"
+                    f"Balance ${bot.current_balance:.2f} < ${MIN_ORDER_USD:.0f} minimum order"
                 )
                 return TradeSignal(
                     action="hold",
                     amount=0,
-                    reason="DCA: Budget exhausted (infinite accumulation complete)"
+                    reason=(
+                        f"DCA: balance ${bot.current_balance:.2f} below "
+                        f"${MIN_ORDER_USD:.0f} minimum order (accumulation complete)"
+                    ),
                 )
-            # Calculated amount is too small (likely due to low amount_percent)
-            return TradeSignal(
-                action="hold",
-                amount=0,
-                reason=f"DCA: Calculated amount ${buy_amount:.2f} below minimum ${min_notional_usd_placeholder}"
-            )
 
         # Defensive: Cap at available balance (should already be handled above, but extra safety)
         if buy_amount > bot.current_balance:
@@ -4184,9 +4231,9 @@ class TradingEngine:
             )
             position = result.scalar_one_or_none()
             if not position:
-                logger.warning(
-                    f"Bot {bot.id}: Trade REJECTED - cannot sell without open position"
-                )
+                reason = "cannot sell without open position"
+                logger.warning(f"Bot {bot.id}: Trade REJECTED - {reason}")
+                await self._record_trade_outcome(bot, "sell_no_position", reason)
                 return None
 
             position_amount = getattr(position, "amount", None)
@@ -4211,9 +4258,10 @@ class TradingEngine:
         )
 
         if not portfolio_check.ok:
-            logger.warning(
-                f"Bot {bot.id}: Trade REJECTED by portfolio risk caps - "
-                f"{portfolio_check.violated_cap}: {portfolio_check.details}"
+            reason = f"portfolio risk cap {portfolio_check.violated_cap}: {portfolio_check.details}"
+            logger.warning(f"Bot {bot.id}: Trade REJECTED by {reason}")
+            await self._record_trade_outcome(
+                bot, f"portfolio_cap:{portfolio_check.violated_cap}", reason
             )
             return None
 
@@ -4236,10 +4284,9 @@ class TradingEngine:
             )
 
             if not capacity_check.ok:
-                logger.warning(
-                    f"Bot {bot.id}: Trade REJECTED by strategy capacity limits - "
-                    f"{capacity_check.reason}"
-                )
+                reason = f"strategy capacity limit: {capacity_check.reason}"
+                logger.warning(f"Bot {bot.id}: Trade REJECTED by {reason}")
+                await self._record_trade_outcome(bot, "strategy_capacity", reason)
                 return None
 
             # Apply strategy capacity resize if needed
@@ -4282,9 +4329,11 @@ class TradingEngine:
         # validated against the exchange's own min-notional in _preflight_order.
         min_order_size = MIN_ORDER_USD  # shared $10 minimum
         if signal.action == "buy" and signal.amount < min_order_size:
-            logger.warning(
-                f"Bot {bot.id}: Trade REJECTED - order size ${signal.amount:.2f} < ${min_order_size:.2f} minimum"
+            reason = (
+                f"order size ${signal.amount:.2f} < ${min_order_size:.2f} minimum"
             )
+            logger.warning(f"Bot {bot.id}: Trade REJECTED - {reason}")
+            await self._record_trade_outcome(bot, "buy_below_min", reason)
             return None
 
         # === STEP 7: EXECUTION LAYER ROUTING ===
@@ -4342,6 +4391,11 @@ class TradingEngine:
 
         if not exchange_order:
             logger.error(f"Bot {bot.id}: Failed to place order")
+            await self._record_trade_outcome(
+                bot,
+                f"place_order_failed:{signal.action}",
+                f"failed to place {signal.action} order (exchange rejected it)",
+            )
             return None
 
         # Map order type
@@ -4394,10 +4448,17 @@ class TradingEngine:
             if not finalized:
                 # Invariant validation failed; the transaction is already rolled
                 # back. The order is left unresolved for later reconciliation.
+                await self._record_trade_outcome(
+                    bot, "finalize_failed",
+                    "accounting invariant failed while finalizing the fill",
+                )
                 return None
 
         # Commit all changes (order, trade, ledger entries, tax lots, gains)
         await session.commit()
+
+        # Execution succeeded - reset the repeated-rejection breaker.
+        await self._record_trade_outcome(bot, None)
 
         # Export to CSV (async, best-effort - failures don't block trading)
         try:
@@ -4833,13 +4894,79 @@ class TradingEngine:
         finally:
             self._stop_flags[bot_id] = True
 
+    async def _record_trade_outcome(
+        self, bot, reason_key: Optional[str], reason_text: str = ""
+    ) -> None:
+        """Track consecutive identical trade rejections; break a stuck loop.
+
+        Every executable trade - from both the strategy-signal path and the
+        stop-loss path - funnels through ``_execute_trade``. A trade that is
+        rejected or fails for the SAME reason on every tick (a sub-minimum order,
+        an un-settleable exit, a portfolio cap, ...) would otherwise retry forever
+        without an exception ever being raised, so the loop-level failure breaker
+        never trips. This counts identical consecutive rejections and, on the
+        ``MAX_CONSECUTIVE_REJECTIONS`` threshold, pauses the bot with the reason
+        surfaced in Decision Status.
+
+        ``reason_key`` is ``None`` on a successful execution, which resets the
+        counter (a single transient rejection cannot accumulate to a pause).
+        """
+        tracker = self._state_store("_exec_rejections")
+        if reason_key is None:
+            tracker.pop(bot.id, None)
+            return
+        entry = tracker.get(bot.id)
+        if entry and entry.get("key") == reason_key:
+            entry["count"] += 1
+        else:
+            entry = {"key": reason_key, "count": 1}
+            tracker[bot.id] = entry
+        if entry["count"] >= MAX_CONSECUTIVE_REJECTIONS:
+            tracker.pop(bot.id, None)
+            await self._pause_bot_for_repeated_rejection(
+                bot.id, entry["count"], reason_text or reason_key
+            )
+
+    async def _pause_bot_for_repeated_rejection(
+        self, bot_id: int, count: int, reason_text: str
+    ) -> None:
+        """Pause a bot stuck rejecting the same trade every tick, and alert."""
+        reason = (
+            f"Paused after {count} consecutive identical trade rejections: "
+            f"{reason_text}. Resolve the cause, then resume."
+        )
+        logger.critical(f"Bot {bot_id}: {reason}")
+        decision_status_store.update(bot_id, DecisionState.PAUSED, reason=reason)
+        try:
+            async with async_session_maker() as session:
+                result = await session.execute(select(Bot).where(Bot.id == bot_id))
+                bot = result.scalar_one_or_none()
+                if bot:
+                    bot.status = BotStatus.PAUSED
+                    bot.paused_at = datetime.utcnow()
+                    bot.updated_at = datetime.utcnow()
+                    await session.commit()
+                    await self._emit_alert(
+                        session, bot_id, "repeated_rejection_breaker", reason,
+                        email_subject=(
+                            f"TradingBot: bot {bot_id} paused after repeated "
+                            "trade rejections"
+                        ),
+                    )
+        except Exception as e:
+            logger.error(
+                f"Bot {bot_id}: failed to pause via rejection breaker: {e}"
+            )
+        finally:
+            self._stop_flags[bot_id] = True
+
     def _cleanup_bot_state(self, bot_id: int) -> None:
         """Drop a bot's in-memory state to prevent unbounded growth (L4)."""
         state_dicts = (
             "_price_histories", "_funding_cache", "_funding_states", "_trend_states",
             "_grid_states", "_mean_reversion_states", "_volatility_breakout_states",
             "_twap_states", "_vwap_states", "_auto_states", "_last_pending_resolve",
-            "_bot_loggers",
+            "_bot_loggers", "_exec_rejections",
         )
         for attr in state_dicts:
             store = getattr(self, attr, None)
@@ -5567,9 +5694,9 @@ class TradingEngine:
                         # CR-2: restore persisted simulated balances so a dry run
                         # resumes from where it left off instead of resetting to
                         # the initial budget (which would desync DB vs simulator).
-                        sim_state = (bot.strategy_state or {}).get("_sim_state")
-                        if sim_state:
-                            exchange.import_state(sim_state)
+                        # Also reconciles base holdings up to the open positions so
+                        # a resumed exit can always settle.
+                        await self._seed_sim_exchange(bot, exchange, session)
                     else:
                         exchange = ExchangeService()
                         if not exchange.has_credentials():

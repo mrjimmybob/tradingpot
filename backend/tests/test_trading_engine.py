@@ -9,12 +9,19 @@ Tests focus on:
 """
 
 import pytest
+from contextlib import asynccontextmanager
 from datetime import datetime
 from decimal import Decimal
+from types import SimpleNamespace
 from unittest.mock import Mock, AsyncMock, patch, call
 from dataclasses import dataclass
 
-from app.services.trading_engine import TradingEngine, TradeSignal
+from app.services.trading_engine import (
+    TradingEngine,
+    TradeSignal,
+    MAX_CONSECUTIVE_REJECTIONS,
+)
+from app.services.exchange import SimulatedExchangeService, OrderSide
 from app.models import (
     Bot,
     BotStatus,
@@ -1810,6 +1817,9 @@ class TestBotStartSafety:
         session.commit = AsyncMock()
         result = Mock()
         result.scalar_one_or_none = Mock(return_value=bot)
+        # start_bot now reconciles the simulator against open positions
+        # (_seed_sim_exchange -> _get_bot_positions); no positions in these tests.
+        result.scalars = Mock(return_value=Mock(all=Mock(return_value=[])))
         session.execute = AsyncMock(return_value=result)
 
         ctx = AsyncMock()
@@ -1934,3 +1944,234 @@ class TestMarketRegimeDetection:
         regime = engine._detect_market_regime(history, None)
         assert regime["trend_state"] in ("up", "down", "flat")
         assert "volatility_state" in regime
+
+
+# ============================================================================
+# Test Class: Simulated-balance reconciliation (Bot 1 stop-loss desync)
+# ============================================================================
+
+
+class TestSimulatedSellSettlement:
+    """A dry-run bot's holdings live in the DB Position table; the simulator's
+    in-memory balance is only a model of the exchange wallet. When the two
+    desync (fresh simulator on Start, or a lagging snapshot), a sell hit
+    "Insufficient simulated balance" and the exit looped forever. These tests
+    cover the reconciliation that keeps the simulator able to settle any exit."""
+
+    @pytest.mark.asyncio
+    async def test_sell_fails_when_simulator_has_no_base_balance(self):
+        """Reproduce the desync: a fresh simulator cannot sell a coin it never
+        recorded buying — exactly the Bot 1 stop-loss rejection."""
+        sim = SimulatedExchangeService(initial_balance=1000.0)
+        # Stub the ticker so no network is needed.
+        sim.get_ticker = AsyncMock(
+            return_value=SimpleNamespace(last=50000.0, bid=50000.0, ask=50000.0)
+        )
+
+        order = await sim.place_market_order("BTC/USDT", OrderSide.SELL, 0.01)
+        assert order is None  # "Insufficient simulated balance"
+
+    @pytest.mark.asyncio
+    async def test_ensure_base_balance_lets_the_sell_settle(self):
+        """After reconciling the simulator up to the held position, the same
+        sell settles (the fix)."""
+        sim = SimulatedExchangeService(initial_balance=1000.0)
+        sim.get_ticker = AsyncMock(
+            return_value=SimpleNamespace(last=50000.0, bid=50000.0, ask=50000.0)
+        )
+
+        sim.ensure_base_balance("BTC", 0.01)
+        order = await sim.place_market_order("BTC/USDT", OrderSide.SELL, 0.01)
+        assert order is not None
+        assert order.amount == pytest.approx(0.01)
+
+    def test_ensure_base_balance_never_reduces_and_ignores_nonpositive(self):
+        sim = SimulatedExchangeService(initial_balance=1000.0)
+        sim._simulated_balance["BTC"] = 0.5
+        sim.ensure_base_balance("BTC", 0.2)   # smaller -> no change
+        assert sim._simulated_balance["BTC"] == 0.5
+        sim.ensure_base_balance("BTC", 0.0)   # non-positive -> ignored
+        sim.ensure_base_balance("BTC", -1.0)
+        assert sim._simulated_balance["BTC"] == 0.5
+        sim.ensure_base_balance("BTC", 0.9)   # larger -> raised
+        assert sim._simulated_balance["BTC"] == 0.9
+
+    @pytest.mark.asyncio
+    async def test_seed_sim_exchange_reconciles_from_open_positions(self):
+        """_seed_sim_exchange imports the saved snapshot AND tops the simulator
+        up to every open position so a resumed/started bot can always exit."""
+        engine = TradingEngine()
+        sim = SimulatedExchangeService(initial_balance=1000.0)
+        engine._get_bot_positions = AsyncMock(return_value=[
+            create_mock_position(symbol="BTC/USDT", quantity=0.03),
+            create_mock_position(symbol="BTC/USDT", quantity=0.01),  # same base sums
+        ])
+        bot = Mock(spec=Bot)
+        bot.id = 1
+        bot.strategy_state = {"_sim_state": {"balances": {"USDT": 250.0}, "order_counter": 7}}
+
+        await engine._seed_sim_exchange(bot, sim, mock_session_unused())
+
+        # Snapshot imported...
+        assert sim._simulated_balance["USDT"] == 250.0
+        assert sim._order_counter == 7
+        # ...and base reconciled up to the summed open positions (0.03 + 0.01).
+        assert sim._simulated_balance["BTC"] == pytest.approx(0.04)
+
+
+def mock_session_unused():
+    """A session object that is never actually queried (_get_bot_positions is
+    stubbed), but satisfies the parameter."""
+    return AsyncMock()
+
+
+# ============================================================================
+# Test Class: Repeated-rejection circuit breaker (loop elimination)
+# ============================================================================
+
+
+class TestRepeatedRejectionBreaker:
+    """Proves a trade rejected/failed for the SAME reason every tick cannot loop
+    forever: after MAX_CONSECUTIVE_REJECTIONS it pauses the bot. Covers both the
+    sub-minimum BUY loop (Bot 2) and the failed-exit loop (Bot 1)."""
+
+    @pytest.mark.asyncio
+    async def test_record_outcome_trips_only_at_threshold(self):
+        engine = TradingEngine()
+        engine._pause_bot_for_repeated_rejection = AsyncMock()
+        bot = Mock(spec=Bot)
+        bot.id = 1
+
+        for _ in range(MAX_CONSECUTIVE_REJECTIONS - 1):
+            await engine._record_trade_outcome(bot, "buy_below_min", "too small")
+        engine._pause_bot_for_repeated_rejection.assert_not_called()
+
+        # The threshold-th identical rejection pauses the bot exactly once.
+        await engine._record_trade_outcome(bot, "buy_below_min", "too small")
+        engine._pause_bot_for_repeated_rejection.assert_called_once()
+        assert engine._pause_bot_for_repeated_rejection.call_args.args[1] == (
+            MAX_CONSECUTIVE_REJECTIONS
+        )
+
+    @pytest.mark.asyncio
+    async def test_success_resets_the_counter(self):
+        engine = TradingEngine()
+        engine._pause_bot_for_repeated_rejection = AsyncMock()
+        bot = Mock(spec=Bot)
+        bot.id = 2
+
+        for _ in range(MAX_CONSECUTIVE_REJECTIONS - 1):
+            await engine._record_trade_outcome(bot, "place_order_failed:sell", "x")
+        await engine._record_trade_outcome(bot, None)  # a successful execution
+        for _ in range(MAX_CONSECUTIVE_REJECTIONS - 1):
+            await engine._record_trade_outcome(bot, "place_order_failed:sell", "x")
+        engine._pause_bot_for_repeated_rejection.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_changing_reason_resets_the_counter(self):
+        engine = TradingEngine()
+        engine._pause_bot_for_repeated_rejection = AsyncMock()
+        bot = Mock(spec=Bot)
+        bot.id = 3
+
+        for _ in range(MAX_CONSECUTIVE_REJECTIONS - 1):
+            await engine._record_trade_outcome(bot, "reason_a", "a")
+        await engine._record_trade_outcome(bot, "reason_b", "b")  # different reason
+        engine._pause_bot_for_repeated_rejection.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_repeated_subminimum_buy_pauses_the_bot(
+        self, mock_bot, mock_session, trading_engine, mock_services
+    ):
+        """A sub-$10 BUY rejected every tick (Bot 2) trips the breaker instead of
+        looping. No order is ever placed."""
+        trading_engine._pause_bot_for_repeated_rejection = AsyncMock()
+        mock_exchange = MockExchangeService()
+        signal = TradeSignal(action="buy", amount=5.0, order_type="market")
+
+        with patch(
+            "app.services.trading_engine.PortfolioRiskService",
+            return_value=mock_services["portfolio_risk"],
+        ), patch(
+            "app.services.trading_engine.StrategyCapacityService",
+            return_value=mock_services["strategy_capacity"],
+        ):
+            for _ in range(MAX_CONSECUTIVE_REJECTIONS):
+                # Fresh signal each tick (the engine may mutate signal.amount).
+                order = await trading_engine._execute_trade(
+                    mock_bot, mock_exchange,
+                    TradeSignal(action="buy", amount=5.0, order_type="market"),
+                    50000.0, mock_session,
+                )
+                assert order is None
+
+        assert len(mock_exchange.orders_placed) == 0
+        trading_engine._pause_bot_for_repeated_rejection.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_repeated_failed_exit_pauses_the_bot(
+        self, mock_bot, mock_session, trading_engine, mock_services
+    ):
+        """A stop-loss/exit SELL that keeps failing to place (Bot 1's
+        "Insufficient simulated balance" -> "Failed to place order") trips the
+        breaker instead of retrying the un-settleable exit forever."""
+        trading_engine._pause_bot_for_repeated_rejection = AsyncMock()
+        failing_exchange = MockExchangeService(should_fail=True)
+
+        position = create_mock_position(
+            bot_id=mock_bot.id, symbol="BTC/USDT", quantity=0.02,
+        )
+        position_result = Mock()
+        position_result.scalar_one_or_none = Mock(return_value=position)
+        mock_session.execute.return_value = position_result
+
+        with patch(
+            "app.services.trading_engine.PortfolioRiskService",
+            return_value=mock_services["portfolio_risk"],
+        ), patch(
+            "app.services.trading_engine.VirtualWalletService",
+            return_value=mock_services["wallet"],
+        ), patch("app.services.trading_engine.CSVExportService"):
+            for _ in range(MAX_CONSECUTIVE_REJECTIONS):
+                order = await trading_engine._execute_trade(
+                    mock_bot, failing_exchange,
+                    TradeSignal(action="sell", amount=1000.0, order_type="market"),
+                    50000.0, mock_session,
+                )
+                assert order is None
+
+        trading_engine._pause_bot_for_repeated_rejection.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_pause_for_repeated_rejection_sets_state_and_status(
+        self, trading_engine
+    ):
+        """The pause helper itself: flips the bot to PAUSED, sets the stop flag,
+        and surfaces the reason in Decision Status."""
+        from app.services.decision_status import decision_status_store, DecisionState
+
+        paused_bot = Mock(spec=Bot)
+        paused_bot.id = 99
+        session = AsyncMock()
+        result = Mock()
+        result.scalar_one_or_none = Mock(return_value=paused_bot)
+        session.execute = AsyncMock(return_value=result)
+        session.commit = AsyncMock()
+
+        @asynccontextmanager
+        async def fake_session_maker():
+            yield session
+
+        with patch(
+            "app.services.trading_engine.async_session_maker", fake_session_maker
+        ), patch.object(trading_engine, "_emit_alert", AsyncMock()):
+            await trading_engine._pause_bot_for_repeated_rejection(
+                99, MAX_CONSECUTIVE_REJECTIONS, "order size $5.00 < $10.00 minimum"
+            )
+
+        assert paused_bot.status == BotStatus.PAUSED
+        assert trading_engine._stop_flags.get(99) is True
+        status = decision_status_store.get(99)
+        assert status is not None
+        assert status.state == DecisionState.PAUSED
+        assert "minimum" in status.reason

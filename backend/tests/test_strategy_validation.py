@@ -316,6 +316,73 @@ async def test_adaptive_grid_full_cycle():
 
 
 # --------------------------------------------------------------------------- #
+# 4b. DCA min-order floor (Bot 2): never emit a sub-$10 executable buy
+# --------------------------------------------------------------------------- #
+@pytest.mark.asyncio
+async def test_dca_floors_subminimum_buy_to_minimum_when_affordable():
+    """A DCA buy that sizes below the minimum but is affordable is floored UP to
+    MIN_ORDER_USD, not emitted sub-minimum.
+
+    Bot 2's loop: DCA used a $1 placeholder floor, so a $9.95 buy passed the
+    strategy but was rejected by the execution layer's $10 minimum every tick
+    ("DCA buy #3 = $9.95 / REJECTED" forever). The strategy must respect the
+    same minimum the executor enforces."""
+    engine = fresh_engine()
+    # $99 balance * 10% default = $9.90 raw, below the $10 minimum but affordable.
+    bot = make_bot(
+        "dca_accumulator", balance=99.0, budget=99.0,
+        params={"regime_filter_enabled": False, "immediate_first_buy": True},
+    )
+    executor = engine._get_strategy_executor("dca_accumulator")
+    sig = await executor(bot, 50000.0, bot.strategy_params, SimpleNamespace())
+    assert_valid_signal(sig, context="dca sub-minimum floor")
+    assert sig.action == "buy", f"expected a floored BUY, got {sig.action} ({sig.reason})"
+    assert sig.amount >= MIN_ORDER_USD, (
+        f"DCA emitted a sub-minimum BUY ${sig.amount:.2f} (< ${MIN_ORDER_USD})"
+    )
+    assert sig.amount <= bot.current_balance + 1e-9
+
+
+@pytest.mark.asyncio
+async def test_dca_holds_when_balance_below_minimum():
+    """When the balance can no longer afford the minimum order, DCA HOLDs
+    (infinite accumulation complete) instead of emitting a doomed sub-min buy."""
+    engine = fresh_engine()
+    bot = make_bot(
+        "dca_accumulator", balance=5.0, budget=5.0,
+        params={"regime_filter_enabled": False, "immediate_first_buy": True},
+    )
+    executor = engine._get_strategy_executor("dca_accumulator")
+    sig = await executor(bot, 50000.0, bot.strategy_params, SimpleNamespace())
+    assert_valid_signal(sig, context="dca exhausted")
+    assert sig.action == "hold", f"expected HOLD, got {sig.action}"
+    assert sig.amount == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("strategy", CONCRETE_STRATEGIES)
+@pytest.mark.parametrize("balance", [50.0, 100.0, 1000.0])
+async def test_no_strategy_emits_executable_buy_below_minimum(strategy, balance):
+    """Cross-strategy guarantee: across a long oscillating series and several
+    account sizes, NO strategy may emit a BUY below MIN_ORDER_USD. A sub-minimum
+    buy is rejected by the executor every tick and is the root of the rejection
+    loops (Bot 2). Strategies must floor up or HOLD before signalling."""
+    engine = fresh_engine()
+    bot = make_bot(strategy, params=dict(SMOKE_PARAMS[strategy]),
+                   balance=balance, budget=balance)
+    executor = engine._get_strategy_executor(strategy)
+    session = SimpleNamespace()
+    for i, price in enumerate(oscillating_prices(300)):
+        sig = await executor(bot, price, bot.strategy_params, session)
+        assert_valid_signal(sig, context=f"{strategy} iter {i}")
+        if sig is not None and sig.action == "buy":
+            assert sig.amount >= MIN_ORDER_USD, (
+                f"{strategy} emitted BUY ${sig.amount:.4f} < ${MIN_ORDER_USD} "
+                f"minimum at iter {i} (balance ${balance}) — would loop on rejection"
+            )
+
+
+# --------------------------------------------------------------------------- #
 # 5. Auto Mode force-exit constructs a valid "sell all" signal (Bot 1)
 # --------------------------------------------------------------------------- #
 def test_auto_mode_force_exit_signal_is_valid():

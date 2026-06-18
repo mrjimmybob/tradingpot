@@ -925,3 +925,29 @@ class SimulatedExchangeService(ExchangeService):
         counter = state.get("order_counter")
         if isinstance(counter, int):
             self._order_counter = counter
+
+    def ensure_base_balance(self, asset: str, amount: float) -> None:
+        """Guarantee the simulator holds at least ``amount`` of ``asset``.
+
+        The database Position table is the source of truth for a dry-run bot's
+        holdings; this in-memory balance is only a simulation of the exchange
+        wallet. The two desync in two real, observed ways, both of which made a
+        stop-loss / sell exit fail with "Insufficient simulated balance" and then
+        retry the un-settleable exit every tick forever:
+
+          * Starting (not resuming) a dry-run bot builds a FRESH simulator
+            ({"USDT": budget}) that holds none of the base coin an already-open
+            position says the bot owns.
+          * A persisted ``_sim_state`` snapshot can lag the DB when the periodic
+            checkpoint lands between a buy and a crash, leaving less base than the
+            open position.
+
+        Reconciling the simulator up to the open position guarantees a full exit
+        can always settle. Never reduces a balance (so it cannot mask a real
+        overspend) and ignores non-positive amounts.
+        """
+        if amount <= 0:
+            return
+        current = self._simulated_balance.get(asset, 0.0)
+        if current < amount:
+            self._simulated_balance[asset] = amount
