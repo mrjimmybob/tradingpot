@@ -35,6 +35,15 @@ from .ledger_writer import LedgerWriterService
 from .accounting import TradeRecorderService, FIFOTaxEngine, CSVExportService
 from .ledger_invariants import LedgerInvariantService, ValidationError
 from .decision_status import decision_status_store, DecisionState
+from .diagnostics import (
+    diagnostics_store,
+    BLOCK_RISK_MANAGER,
+    BLOCK_MIN_ORDER_SIZE,
+    BLOCK_INSUFFICIENT_BALANCE,
+    BLOCK_POSITION_LIMITS,
+    BLOCK_OTHER,
+    DATA_UNAVAILABLE,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -392,6 +401,7 @@ class TradingEngine:
                 bot.paused_at = datetime.utcnow()
                 bot.updated_at = datetime.utcnow()
                 await session.commit()
+                diagnostics_store.record_pause(bot_id, "Manual pause by operator")
                 decision_status_store.update(
                     bot_id, DecisionState.PAUSED,
                     reason="Bot paused by operator", symbol=bot.trading_pair,
@@ -474,6 +484,10 @@ class TradingEngine:
         """
         logger.info(f"Bot {bot_id}: Starting execution loop")
 
+        # Observe-only: mark a fresh runtime so the diagnostics panel can show
+        # "evaluations during current runtime" and clear any stale pause reason.
+        diagnostics_store.start_runtime(bot_id)
+
         # M1/M2: consecutive-failure circuit breaker with exponential backoff.
         # Reset on every successful iteration; on the threshold, pause + alert
         # instead of spinning at 1 Hz forever.
@@ -507,6 +521,7 @@ class TradingEngine:
 
                     if risk_assessment.action == RiskAction.PAUSE_BOT:
                         logger.warning(f"Bot {bot_id}: Pausing due to {risk_assessment.reason}")
+                        diagnostics_store.record_pause(bot_id, risk_assessment.reason)
                         decision_status_store.update(
                             bot_id, DecisionState.RISK_LIMIT,
                             reason=risk_assessment.reason, symbol=bot.trading_pair,
@@ -556,6 +571,9 @@ class TradingEngine:
                         # outage pauses + alerts instead of looping silently.
                         consecutive_failures += 1
                         last_error = f"market data unavailable for {bot.trading_pair}"
+                        diagnostics_store.record_data_failure(
+                            bot_id, DATA_UNAVAILABLE, last_error
+                        )
                         decision_status_store.update(
                             bot_id, DecisionState.WAITING_FOR_DATA,
                             reason=last_error, symbol=bot.trading_pair,
@@ -585,6 +603,11 @@ class TradingEngine:
                     # cannot bubble to the failure circuit breaker below and pause an
                     # otherwise-healthy bot.
                     try:
+                        # Observe-only diagnostics: count this evaluation and the
+                        # signal/decision-reason it produced (store methods are
+                        # internally exception-safe; this can never pause a bot).
+                        diagnostics_store.record_evaluation(bot_id)
+                        diagnostics_store.record_signal(bot_id, signal)
                         changed = decision_status_store.update_from_signal(
                             bot_id, signal, symbol=bot.trading_pair
                         )
@@ -613,6 +636,9 @@ class TradingEngine:
                             validation = await wallet.validate_trade(bot_id, signal.amount)
                             proceed = validation.is_valid
                             if not proceed:
+                                diagnostics_store.record_blocked(
+                                    bot_id, BLOCK_INSUFFICIENT_BALANCE, validation.reason
+                                )
                                 logger.warning(
                                     f"Bot {bot_id}: Trade rejected - {validation.reason}"
                                 )
@@ -4309,6 +4335,7 @@ class TradingEngine:
             if not position:
                 reason = "cannot sell without open position"
                 logger.warning(f"Bot {bot.id}: Trade REJECTED - {reason}")
+                diagnostics_store.record_blocked(bot.id, BLOCK_OTHER, reason)
                 await self._record_trade_outcome(bot, "sell_no_position", reason)
                 return None
 
@@ -4336,6 +4363,7 @@ class TradingEngine:
         if not portfolio_check.ok:
             reason = f"portfolio risk cap {portfolio_check.violated_cap}: {portfolio_check.details}"
             logger.warning(f"Bot {bot.id}: Trade REJECTED by {reason}")
+            diagnostics_store.record_blocked(bot.id, BLOCK_RISK_MANAGER, reason)
             await self._record_trade_outcome(
                 bot, f"portfolio_cap:{portfolio_check.violated_cap}", reason
             )
@@ -4362,6 +4390,7 @@ class TradingEngine:
             if not capacity_check.ok:
                 reason = f"strategy capacity limit: {capacity_check.reason}"
                 logger.warning(f"Bot {bot.id}: Trade REJECTED by {reason}")
+                diagnostics_store.record_blocked(bot.id, BLOCK_POSITION_LIMITS, reason)
                 await self._record_trade_outcome(bot, "strategy_capacity", reason)
                 return None
 
@@ -4409,6 +4438,7 @@ class TradingEngine:
                 f"order size ${signal.amount:.2f} < ${min_order_size:.2f} minimum"
             )
             logger.warning(f"Bot {bot.id}: Trade REJECTED - {reason}")
+            diagnostics_store.record_blocked(bot.id, BLOCK_MIN_ORDER_SIZE, reason)
             await self._record_trade_outcome(bot, "buy_below_min", reason)
             return None
 
@@ -4467,6 +4497,10 @@ class TradingEngine:
 
         if not exchange_order:
             logger.error(f"Bot {bot.id}: Failed to place order")
+            diagnostics_store.record_execution(
+                bot.id, signal.action, success=False,
+                reason=f"failed to place {signal.action} order (exchange rejected it)",
+            )
             await self._record_trade_outcome(
                 bot,
                 f"place_order_failed:{signal.action}",
@@ -4524,6 +4558,10 @@ class TradingEngine:
             if not finalized:
                 # Invariant validation failed; the transaction is already rolled
                 # back. The order is left unresolved for later reconciliation.
+                diagnostics_store.record_execution(
+                    bot.id, signal.action, success=False,
+                    reason="accounting invariant failed while finalizing the fill",
+                )
                 await self._record_trade_outcome(
                     bot, "finalize_failed",
                     "accounting invariant failed while finalizing the fill",
@@ -4532,6 +4570,9 @@ class TradingEngine:
 
         # Commit all changes (order, trade, ledger entries, tax lots, gains)
         await session.commit()
+
+        # Observe-only: a successful execution (main market/limit path).
+        diagnostics_store.record_execution(bot.id, signal.action, success=True)
 
         # Execution succeeded - reset the repeated-rejection breaker.
         await self._record_trade_outcome(bot, None)
@@ -4951,6 +4992,7 @@ class TradingEngine:
             f"errors. Last error: {last_error}"
         )
         logger.critical(f"Bot {bot_id}: {reason}")
+        diagnostics_store.record_pause(bot_id, reason)
         decision_status_store.update(bot_id, DecisionState.RISK_LIMIT, reason=reason)
         try:
             async with async_session_maker() as session:
@@ -5012,6 +5054,7 @@ class TradingEngine:
             f"{reason_text}. Resolve the cause, then resume."
         )
         logger.critical(f"Bot {bot_id}: {reason}")
+        diagnostics_store.record_pause(bot_id, reason)
         decision_status_store.update(bot_id, DecisionState.PAUSED, reason=reason)
         try:
             async with async_session_maker() as session:

@@ -1,6 +1,7 @@
 import { apiFetch } from '../lib/api'
 import { useParams, Link, useNavigate } from 'react-router-dom'
 import { useState } from 'react'
+import type { ReactNode } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import {
   ArrowLeft,
@@ -81,6 +82,56 @@ interface DecisionStatus {
   updated_at: string | null
 }
 
+interface Diagnostics {
+  bot_id: number
+  status: string
+  current_activity: string
+  paused_reason: string | null
+  evaluations: {
+    total: number
+    runtime: number
+    last_24h: number
+    last_evaluation_at: string | null
+    runtime_started_at: string | null
+  }
+  signals: {
+    buy: number
+    sell: number
+    hold: number
+    last_action: string | null
+    last_reason: string | null
+    last_at: string | null
+  }
+  top_reasons: { reason: string; count: number }[]
+  blocked: {
+    risk_manager: number
+    min_order_size: number
+    insufficient_balance: number
+    cooldown: number
+    position_limits: number
+    exchange_validation: number
+    other: number
+    last_category: string | null
+    last_reason: string | null
+    last_at: string | null
+  }
+  execution: {
+    successful_buys: number
+    successful_sells: number
+    failed_buys: number
+    failed_sells: number
+    last_failure_reason: string | null
+    last_failure_at: string | null
+  }
+  market_data: {
+    ticker_failures: number
+    websocket_failures: number
+    data_unavailable: number
+    last_failure_reason: string | null
+    last_failure_at: string | null
+  }
+}
+
 async function fetchBot(id: string): Promise<Bot> {
   const res = await apiFetch(`/api/bots/${id}`)
   if (!res.ok) {
@@ -108,6 +159,12 @@ async function fetchDecisionStatus(id: string): Promise<DecisionStatus> {
   return res.json()
 }
 
+async function fetchDiagnostics(id: string): Promise<Diagnostics> {
+  const res = await apiFetch(`/api/bots/${id}/diagnostics`)
+  if (!res.ok) throw new Error('Failed to fetch diagnostics')
+  return res.json()
+}
+
 // Map a decision state to a Tailwind color class for the status pill. Falls
 // back to a neutral gray for unknown/idle states.
 function getDecisionStateColor(state: string | null): string {
@@ -129,6 +186,30 @@ function getDecisionStateColor(state: string | null): string {
     default:
       return 'bg-gray-700 text-gray-300 border-gray-600'
   }
+}
+
+// Small presentational helpers for the diagnostics panel.
+function fmtDiagTime(iso: string | null): string {
+  return iso ? new Date(iso).toLocaleTimeString() : '—'
+}
+
+function DiagRow({ label, value, danger }: { label: string; value: ReactNode; danger?: boolean }) {
+  return (
+    <div className="flex items-baseline justify-between gap-3">
+      <span className="text-gray-400">{label}</span>
+      <span className={`font-mono-numbers ${danger ? 'text-loss' : 'text-gray-100'}`}>{value}</span>
+    </div>
+  )
+}
+
+const BLOCKED_LABELS: Record<string, string> = {
+  risk_manager: 'Risk manager',
+  min_order_size: 'Min order size',
+  insufficient_balance: 'Insufficient balance',
+  cooldown: 'Cooldown',
+  position_limits: 'Position limits',
+  exchange_validation: 'Exchange validation',
+  other: 'Other',
 }
 
 function getStatusColor(status: string): string {
@@ -183,6 +264,16 @@ export default function BotDetail() {
   const { data: decisionStatus } = useQuery({
     queryKey: ['decision-status', id],
     queryFn: () => fetchDecisionStatus(id!),
+    enabled: isValidId,
+    refetchInterval: 3000,
+  })
+
+  // Poll observe-only strategy diagnostics (evaluations, signals, reasons,
+  // blocked trades, execution/data health, pause reason) for the diagnostics
+  // panel. Auto-refreshes so the panel reflects live activity without a refresh.
+  const { data: diagnostics } = useQuery({
+    queryKey: ['diagnostics', id],
+    queryFn: () => fetchDiagnostics(id!),
     enabled: isValidId,
     refetchInterval: 3000,
   })
@@ -672,6 +763,182 @@ export default function BotDetail() {
         ) : (
           <div className="text-center py-6 text-gray-400">
             <p>No decision data yet</p>
+          </div>
+        )}
+      </div>
+
+      {/* Strategy Diagnostics — observe-only operability: what the bot has been
+          doing, thinking, waiting for, blocked by, and why it's paused */}
+      <div className="bg-gray-800 rounded-lg p-6">
+        <div className="flex items-center gap-2 mb-4">
+          <Activity size={18} className="text-accent" />
+          <h3 className="text-lg font-semibold">Strategy Diagnostics</h3>
+        </div>
+        {diagnostics ? (
+          <div className="space-y-4">
+            {/* Current activity — the first thing visible */}
+            <div className="bg-gray-900 rounded-md p-4">
+              <p className="text-gray-400 text-xs uppercase tracking-wide mb-1">
+                Current Activity
+              </p>
+              <p className="text-sm text-gray-100">{diagnostics.current_activity}</p>
+            </div>
+
+            {/* Pause reason (only when paused) */}
+            {diagnostics.paused_reason && (
+              <div className="bg-loss/10 border border-loss/40 rounded-md p-4">
+                <p className="text-loss text-xs uppercase tracking-wide mb-1 font-semibold flex items-center gap-1">
+                  <AlertCircle size={14} /> Paused Because
+                </p>
+                <p className="text-sm text-gray-100">{diagnostics.paused_reason}</p>
+              </div>
+            )}
+
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+              {/* Evaluation statistics */}
+              <div className="bg-gray-900 rounded-md p-4">
+                <p className="text-gray-400 text-xs uppercase tracking-wide mb-2">
+                  Evaluation Statistics
+                </p>
+                <div className="space-y-1 text-sm">
+                  <DiagRow label="Total" value={diagnostics.evaluations.total} />
+                  <DiagRow label="This runtime" value={diagnostics.evaluations.runtime} />
+                  <DiagRow label="Last 24h" value={diagnostics.evaluations.last_24h} />
+                  <DiagRow
+                    label="Last evaluation"
+                    value={fmtDiagTime(diagnostics.evaluations.last_evaluation_at)}
+                  />
+                </div>
+              </div>
+
+              {/* Signal statistics */}
+              <div className="bg-gray-900 rounded-md p-4">
+                <p className="text-gray-400 text-xs uppercase tracking-wide mb-2">
+                  Signal Statistics
+                </p>
+                <div className="space-y-1 text-sm">
+                  <DiagRow label="Buy" value={diagnostics.signals.buy} />
+                  <DiagRow label="Sell" value={diagnostics.signals.sell} />
+                  <DiagRow label="Hold" value={diagnostics.signals.hold} />
+                  <DiagRow
+                    label="Last signal"
+                    value={`${diagnostics.signals.last_action ?? '—'} @ ${fmtDiagTime(
+                      diagnostics.signals.last_at
+                    )}`}
+                  />
+                </div>
+                {diagnostics.signals.last_reason && (
+                  <p className="text-xs text-gray-500 mt-2 break-words">
+                    {diagnostics.signals.last_reason}
+                  </p>
+                )}
+              </div>
+
+              {/* Execution statistics */}
+              <div className="bg-gray-900 rounded-md p-4">
+                <p className="text-gray-400 text-xs uppercase tracking-wide mb-2">
+                  Execution Statistics
+                </p>
+                <div className="space-y-1 text-sm">
+                  <DiagRow label="Successful buys" value={diagnostics.execution.successful_buys} />
+                  <DiagRow label="Successful sells" value={diagnostics.execution.successful_sells} />
+                  <DiagRow
+                    label="Failed buys"
+                    value={diagnostics.execution.failed_buys}
+                    danger={diagnostics.execution.failed_buys > 0}
+                  />
+                  <DiagRow
+                    label="Failed sells"
+                    value={diagnostics.execution.failed_sells}
+                    danger={diagnostics.execution.failed_sells > 0}
+                  />
+                </div>
+                {diagnostics.execution.last_failure_reason && (
+                  <p className="text-xs text-loss mt-2 break-words">
+                    Last failure: {diagnostics.execution.last_failure_reason} (
+                    {fmtDiagTime(diagnostics.execution.last_failure_at)})
+                  </p>
+                )}
+              </div>
+
+              {/* Market data health */}
+              <div className="bg-gray-900 rounded-md p-4">
+                <p className="text-gray-400 text-xs uppercase tracking-wide mb-2">
+                  Market Data Health
+                </p>
+                <div className="space-y-1 text-sm">
+                  <DiagRow
+                    label="Ticker failures"
+                    value={diagnostics.market_data.ticker_failures}
+                    danger={diagnostics.market_data.ticker_failures > 0}
+                  />
+                  <DiagRow
+                    label="Websocket failures"
+                    value={diagnostics.market_data.websocket_failures}
+                    danger={diagnostics.market_data.websocket_failures > 0}
+                  />
+                  <DiagRow
+                    label="Data unavailable"
+                    value={diagnostics.market_data.data_unavailable}
+                    danger={diagnostics.market_data.data_unavailable > 0}
+                  />
+                </div>
+                {diagnostics.market_data.last_failure_reason && (
+                  <p className="text-xs text-loss mt-2 break-words">
+                    Last: {diagnostics.market_data.last_failure_reason} (
+                    {fmtDiagTime(diagnostics.market_data.last_failure_at)})
+                  </p>
+                )}
+              </div>
+            </div>
+
+            {/* Top decision reasons — what the strategy is actually thinking */}
+            <div className="bg-gray-900 rounded-md p-4">
+              <p className="text-gray-400 text-xs uppercase tracking-wide mb-2">
+                Top Decision Reasons
+              </p>
+              {diagnostics.top_reasons.length > 0 ? (
+                <ul className="space-y-1 text-sm">
+                  {diagnostics.top_reasons.map((r) => (
+                    <li key={r.reason} className="flex items-baseline justify-between gap-3">
+                      <span className="text-gray-300 break-words">{r.reason}</span>
+                      <span className="font-mono-numbers text-gray-400">{r.count}</span>
+                    </li>
+                  ))}
+                </ul>
+              ) : (
+                <p className="text-sm text-gray-500">No signals recorded yet.</p>
+              )}
+            </div>
+
+            {/* Blocked trade statistics */}
+            <div className="bg-gray-900 rounded-md p-4">
+              <p className="text-gray-400 text-xs uppercase tracking-wide mb-2">
+                Blocked Trade Statistics
+              </p>
+              <div className="grid grid-cols-2 sm:grid-cols-3 gap-x-4 gap-y-1 text-sm">
+                {Object.entries(BLOCKED_LABELS).map(([key, label]) => (
+                  <DiagRow
+                    key={key}
+                    label={label}
+                    value={(diagnostics.blocked as unknown as Record<string, number>)[key] ?? 0}
+                    danger={
+                      ((diagnostics.blocked as unknown as Record<string, number>)[key] ?? 0) > 0
+                    }
+                  />
+                ))}
+              </div>
+              {diagnostics.blocked.last_reason && (
+                <p className="text-xs text-gray-500 mt-2 break-words">
+                  Last block ({diagnostics.blocked.last_category}):{' '}
+                  {diagnostics.blocked.last_reason} ({fmtDiagTime(diagnostics.blocked.last_at)})
+                </p>
+              )}
+            </div>
+          </div>
+        ) : (
+          <div className="text-center py-6 text-gray-400">
+            <p>No diagnostics yet</p>
           </div>
         )}
       </div>

@@ -13,6 +13,7 @@ from ..models import (
 from ..services import trading_engine
 from ..services.trading_engine import BotStartError, validate_funding_carry_params
 from ..services.decision_status import decision_status_store, DecisionState
+from ..services.diagnostics import diagnostics_store, BotDiagnostics
 from ..services.logging_service import ensure_bot_log_directory
 from .config import STRATEGIES
 
@@ -742,3 +743,61 @@ async def get_bot_decision_status(
     return DecisionStatusResponse(
         bot_id=bot_id, state=state, reason=reason, symbol=bot.trading_pair,
     )
+
+
+def _diagnostics_current_activity(bot, decision, diag) -> str:
+    """Build the one-line human-readable "what is this bot doing right now" line."""
+    if bot.status == BotStatus.PAUSED:
+        reason = (
+            (diag.pause_reason if diag else None)
+            or (decision.reason if decision else None)
+            or "reason not captured this runtime"
+        )
+        return f"Paused: {reason}"
+    if bot.status != BotStatus.RUNNING:
+        return "Bot is not running."
+    if decision is not None and decision.state:
+        if decision.reason:
+            return f"{decision.state} — {decision.reason}"
+        return decision.state
+    return "Starting evaluation."
+
+
+@router.get("/{bot_id}/diagnostics")
+async def get_bot_diagnostics(
+    bot_id: int,
+    session: AsyncSession = Depends(get_session),
+):
+    """Return accumulated observe-only strategy diagnostics for the bot.
+
+    Answers, without reading logs: what the bot has been doing (evaluations,
+    signals), what the strategy is thinking (top decision reasons), why it is not
+    trading (blocked-trade counters), whether execution or the data feed is
+    failing, and — if paused — exactly why. Purely a read of in-memory
+    observability state; it never affects trading.
+    """
+    result = await session.execute(select(Bot).where(Bot.id == bot_id))
+    bot = result.scalar_one_or_none()
+    if not bot:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Bot with id {bot_id} not found"
+        )
+
+    diag = diagnostics_store.get(bot_id)
+    decision = decision_status_store.get(bot_id)
+
+    # Zero-filled structure when the engine has never observed this bot, so the
+    # UI always renders a consistent shape.
+    data = (diag or BotDiagnostics(bot_id=bot_id)).to_dict()
+    data["status"] = bot.status.value
+    data["current_activity"] = _diagnostics_current_activity(bot, decision, diag)
+    data["paused_reason"] = (
+        data["pause"]["reason"] if bot.status == BotStatus.PAUSED else None
+    )
+    if bot.status == BotStatus.PAUSED and not data["paused_reason"]:
+        data["paused_reason"] = (
+            (decision.reason if decision else None)
+            or "Paused (reason not captured this runtime — check alerts/logs)"
+        )
+    return data
