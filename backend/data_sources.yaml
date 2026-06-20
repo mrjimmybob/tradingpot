@@ -33,4 +33,3 @@ sources:
     enabled: false
     refresh_interval_seconds: 900
     settings: {}
-
