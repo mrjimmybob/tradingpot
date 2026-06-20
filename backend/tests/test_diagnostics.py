@@ -395,3 +395,69 @@ async def test_diagnostics_endpoint_paused_without_recorded_reason(client, test_
     resp = await client.get(f"/api/bots/{bot.id}/diagnostics")
     body = resp.json()
     assert body["paused_reason"]  # non-empty fallback
+
+
+# --------------------------------------------------------------------------- #
+# P1: lifecycle state vs decision state must never collide on the UI surfaces.
+# Reproduces the TestBot8-FC report (RUNNING bot, funding-carry regime HOLD).
+# --------------------------------------------------------------------------- #
+from app.services.decision_status import decision_status_store, DecisionState
+
+
+@pytest.mark.asyncio
+async def test_running_regime_hold_is_not_displayed_as_paused(client, test_db):
+    """A RUNNING bot holding on a regime filter must show a DECISION of
+    'Waiting for market regime' and a Current Activity that NEVER begins with
+    'Paused'. (The exact bug: lifecycle RUNNING but UI said PAUSED.)"""
+    bot = await _create_bot(test_db, strategy="funding_carry", status=BotStatus.RUNNING)
+    diagnostics_store.clear(bot.id)
+    decision_status_store.clear(bot.id)
+
+    # Exactly the production signal funding_carry emits on a regime miss.
+    sig = _sig("hold", "Funding Carry: regime trend_flat not in ['trend_up']")
+    decision_status_store.update_from_signal(bot.id, sig, symbol="BTC/USDT")
+    diagnostics_store.record_signal(bot.id, sig)
+
+    # Decision-status endpoint: state is the regime decision, NOT lifecycle Paused.
+    ds = (await client.get(f"/api/bots/{bot.id}/decision-status")).json()
+    assert ds["state"] == DecisionState.WAITING_FOR_REGIME
+    assert ds["state"] != DecisionState.PAUSED
+
+    # Diagnostics endpoint: lifecycle stays running; activity must not say Paused.
+    diag = (await client.get(f"/api/bots/{bot.id}/diagnostics")).json()
+    assert diag["status"] == "running"
+    assert diag["paused_reason"] is None
+    assert not diag["current_activity"].startswith("Paused")
+    assert "Waiting for market regime" in diag["current_activity"]
+
+
+@pytest.mark.asyncio
+async def test_lifecycle_and_decision_are_independent(client, test_db):
+    """When the bot IS paused, lifecycle shows paused and Current Activity leads
+    with 'Paused:' — proving the two concepts render independently and correctly
+    in both directions."""
+    bot = await _create_bot(test_db, strategy="funding_carry", status=BotStatus.PAUSED)
+    diagnostics_store.clear(bot.id)
+    decision_status_store.clear(bot.id)
+    diagnostics_store.record_pause(bot.id, "Risk limit reached")
+
+    diag = (await client.get(f"/api/bots/{bot.id}/diagnostics")).json()
+    assert diag["status"] == "paused"
+    assert diag["paused_reason"] == "Risk limit reached"
+    assert diag["current_activity"].startswith("Paused:")
+
+
+@pytest.mark.asyncio
+async def test_current_activity_never_leads_with_paused_while_running(client, test_db):
+    """Defense-in-depth: even if a decision state somehow carried the lifecycle
+    'Paused' label, a RUNNING bot's Current Activity must not begin with
+    'Paused'."""
+    bot = await _create_bot(test_db, status=BotStatus.RUNNING)
+    diagnostics_store.clear(bot.id)
+    decision_status_store.clear(bot.id)
+    # Force the (now-impossible via mapping) lifecycle label onto the decision.
+    decision_status_store.update(bot.id, DecisionState.PAUSED, reason="should be coerced")
+
+    diag = (await client.get(f"/api/bots/{bot.id}/diagnostics")).json()
+    assert diag["status"] == "running"
+    assert not diag["current_activity"].startswith("Paused")

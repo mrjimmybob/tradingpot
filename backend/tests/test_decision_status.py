@@ -88,9 +88,11 @@ def test_derive_none_is_evaluating():
     # Cooldown / risk.
     ("Grid: Cooldown after kill (30min remaining)", DecisionState.COOLDOWN),
     ("Grid: Kill switch (drawdown 16.0%)", DecisionState.RISK_LIMIT),
-    # Paused by regime filter.
-    ("DCA: Paused (regime=trend_down)", DecisionState.PAUSED),
-    ("Mean Reversion: Waiting for suitable regime (current: trend_up)", DecisionState.PAUSED),
+    # Waiting on the market regime — a HOLD decision, NOT a paused bot. Even when
+    # the strategy's own reason text contains the word "Paused", the decision
+    # state must be WAITING_FOR_REGIME (never the lifecycle label PAUSED).
+    ("DCA: Paused (regime=trend_down)", DecisionState.WAITING_FOR_REGIME),
+    ("Mean Reversion: Waiting for suitable regime (current: trend_up)", DecisionState.WAITING_FOR_REGIME),
     # Working and holding — waiting for an entry condition, NOT warming up.
     ("DCA: Next buy in 12.0 min", DecisionState.HOLD),
     ("Trend Following: Waiting for EMA crossover (short <= long)", DecisionState.HOLD),
@@ -108,16 +110,32 @@ def test_five_required_categories_are_distinct():
         derive_state_from_signal(TradeSignal("hold", 0, reason="Waiting for EMA crossover")),
         derive_state_from_signal(TradeSignal("hold", 0, reason="Collecting bars (1/20)")),
         derive_state_from_signal(TradeSignal("hold", 0, reason="funding data unavailable")),
-        derive_state_from_signal(TradeSignal("hold", 0, reason="Paused (regime=trend_down)")),
+        derive_state_from_signal(TradeSignal("hold", 0, reason="regime trend_flat not in ['trend_up']")),
         derive_state_from_signal(TradeSignal("hold", 0, reason="Kill switch (drawdown)")),
     }
     assert states == {
         DecisionState.HOLD,
         DecisionState.WARMING_UP,
         DecisionState.WAITING_FOR_DATA,
-        DecisionState.PAUSED,
+        DecisionState.WAITING_FOR_REGIME,
         DecisionState.RISK_LIMIT,
     }
+    # None of these HOLD decisions may ever be the lifecycle "Paused" label.
+    assert DecisionState.PAUSED not in states
+
+
+@pytest.mark.parametrize("reason", [
+    "Funding Carry: regime trend_flat not in ['trend_up']",
+    "DCA: Paused (regime=trend_down)",
+    "Grid: Paused (regime=trend_up, need flat/normal markets)",
+    "Mean Reversion: Waiting for suitable regime (current: trend_up)",
+])
+def test_regime_hold_never_maps_to_lifecycle_paused(reason):
+    """P1 regression: a HOLD whose reason mentions the regime must surface as the
+    WAITING_FOR_REGIME decision state, never the lifecycle 'Paused' label."""
+    state = derive_state_from_signal(TradeSignal(action="hold", amount=0, reason=reason))
+    assert state == DecisionState.WAITING_FOR_REGIME
+    assert state != DecisionState.PAUSED
 
 
 def test_update_from_signal_carries_score_and_threshold():

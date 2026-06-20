@@ -746,7 +746,14 @@ async def get_bot_decision_status(
 
 
 def _diagnostics_current_activity(bot, decision, diag) -> str:
-    """Build the one-line human-readable "what is this bot doing right now" line."""
+    """Build the one-line human-readable "what is this bot doing right now" line.
+
+    The "Paused" wording is reserved for the LIFECYCLE state: it appears here
+    ONLY when bot.status == PAUSED. For a RUNNING bot this returns its trading
+    DECISION (e.g. "Waiting for market regime — ...", "Hold — ...") and never
+    begins with "Paused", so a waiting/holding bot is not mistaken for a stopped
+    one.
+    """
     if bot.status == BotStatus.PAUSED:
         reason = (
             (diag.pause_reason if diag else None)
@@ -757,9 +764,14 @@ def _diagnostics_current_activity(bot, decision, diag) -> str:
     if bot.status != BotStatus.RUNNING:
         return "Bot is not running."
     if decision is not None and decision.state:
+        # Defensive: a decision must never surface the lifecycle "Paused" label on
+        # a non-paused bot. If it ever does, present it as a HOLD instead.
+        state = decision.state
+        if state == DecisionState.PAUSED:
+            state = DecisionState.HOLD
         if decision.reason:
-            return f"{decision.state} — {decision.reason}"
-        return decision.state
+            return f"{state} — {decision.reason}"
+        return state
     return "Starting evaluation."
 
 

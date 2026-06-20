@@ -163,7 +163,16 @@
       "Bash(cp app/models/bot.py /tmp/bot.bak)",
       "Bash(python3 -)",
       "Bash(cp /tmp/sp.bak app/models/strategy_performance.py)",
-      "Bash(cp /tmp/bot.bak app/models/bot.py)"
+      "Bash(cp /tmp/bot.bak app/models/bot.py)",
+      "Bash(.venv-check/bin/python *)",
+      "Bash(cp src/pages/BotList.tsx /tmp/botlist_fixed.tsx)",
+      "Bash(node -e ' *)",
+      "Bash(echo \"tsc EXIT=$?\")",
+      "Bash(python3 -c \"import ast; ast.parse\\(open\\('app/services/trading_engine.py'\\).read\\(\\)\\); print\\('parses OK'\\)\")",
+      "Bash(awk -F: '$1>4180 && $1<4480')",
+      "Bash(sed -i '/from app.models import OrderSide/d' tests/test_trading_engine.py)",
+      "Bash(echo \"exit:$?\")",
+      "Bash(git --no-pager show --stat --oneline HEAD)"
     ]
   }
 }

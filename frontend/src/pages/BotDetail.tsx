@@ -167,24 +167,28 @@ async function fetchDiagnostics(id: string): Promise<Diagnostics> {
 
 // Map a decision state to a Tailwind color class for the status pill. Falls
 // back to a neutral gray for unknown/idle states.
+// Decision-state palette. DELIBERATELY uses a different colour family from the
+// lifecycle badge (getStatusColor: running/paused/stopped) so a trading decision
+// can never be mistaken for an operational lifecycle state. Rendered as an
+// OUTLINED chip (see the Current Decision card), not a filled lifecycle pill.
 function getDecisionStateColor(state: string | null): string {
   switch (state) {
     case 'Buy signal detected':
     case 'Entering position':
-      return 'bg-running/20 text-running border-running'
+      return 'bg-emerald-500/10 text-emerald-300 border-emerald-500/40'
     case 'Sell signal detected':
     case 'Exiting position':
-      return 'bg-accent/20 text-accent border-accent'
+      return 'bg-rose-500/10 text-rose-300 border-rose-500/40'
     case 'Risk limit reached':
-      return 'bg-loss/20 text-loss border-loss'
-    case 'Paused':
+      return 'bg-orange-500/10 text-orange-300 border-orange-500/40'
     case 'Cooldown active':
-      return 'bg-paused/20 text-paused border-paused'
+    case 'Waiting for market regime':
     case 'Waiting for data':
     case 'Warming up indicators':
-      return 'bg-yellow-500/20 text-yellow-500 border-yellow-500'
+      return 'bg-sky-500/10 text-sky-300 border-sky-500/40'
     default:
-      return 'bg-gray-700 text-gray-300 border-gray-600'
+      // Hold / Evaluating / anything else: neutral, clearly secondary.
+      return 'bg-slate-500/10 text-slate-300 border-slate-500/40'
   }
 }
 
@@ -462,6 +466,7 @@ export default function BotDetail() {
           <div>
             <div className="flex items-center gap-3">
               <h2 className="text-2xl font-bold">{bot.name}</h2>
+              <span className="text-xs uppercase tracking-wide text-gray-500">Status</span>
               <span
                 className={`px-3 py-1 rounded-full text-sm capitalize border ${getStatusColor(
                   bot.status
@@ -716,17 +721,21 @@ export default function BotDetail() {
         </div>
       </div>
 
-      {/* Decision Status — what the strategy is currently thinking */}
+      {/* Current Decision — the strategy's trading decision (NOT the bot's
+          lifecycle state). Styled as a secondary OUTLINED chip with its own
+          colour family so it is never mistaken for the lifecycle badge above. */}
       <div className="bg-gray-800 rounded-lg p-6">
         <div className="flex items-center gap-2 mb-4">
           <Activity size={18} className="text-accent" />
-          <h3 className="text-lg font-semibold">Decision Status</h3>
+          <h3 className="text-lg font-semibold">Current Decision</h3>
+          <span className="text-xs text-gray-500">(trading decision — lifecycle status is shown next to the bot name)</span>
         </div>
         {decisionStatus ? (
           <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
             <div className="flex items-center gap-3">
+              <span className="text-xs uppercase tracking-wide text-gray-500">Decision</span>
               <span
-                className={`px-3 py-1 rounded-full text-sm border ${getDecisionStateColor(
+                className={`px-2.5 py-0.5 rounded-md text-sm border font-medium ${getDecisionStateColor(
                   decisionStatus.state
                 )}`}
               >

@@ -31,6 +31,7 @@ class DecisionState:
     EVALUATING = "Evaluating market"
     WAITING_FOR_DATA = "Waiting for data"
     WARMING_UP = "Warming up indicators"
+    WAITING_FOR_REGIME = "Waiting for market regime"
     HOLD = "Hold"
     BUY_SIGNAL = "Buy signal detected"
     SELL_SIGNAL = "Sell signal detected"
@@ -38,6 +39,10 @@ class DecisionState:
     EXITING_POSITION = "Exiting position"
     COOLDOWN = "Cooldown active"
     RISK_LIMIT = "Risk limit reached"
+    # Lifecycle label. NOTE: this is a *lifecycle* state, never a HOLD decision.
+    # It is only ever set explicitly at a real pause site (risk/circuit-breaker/
+    # operator) where bot.status is set to PAUSED. A HOLD signal must NEVER be
+    # mapped to PAUSED - a bot waiting for market conditions is still RUNNING.
     PAUSED = "Paused"
 
 
@@ -65,8 +70,16 @@ class DecisionStatus:
         }
 
 
-# Hold-reason keyword → state mapping. Ordered: the first substring found wins,
-# so more specific conditions are listed before generic ones.
+# Hold-reason keyword → DECISION state mapping. Ordered: the first substring
+# found wins, so more specific conditions are listed before generic ones.
+#
+# These map a HOLD signal to a *decision* state describing WHY the strategy is
+# holding. They must NEVER map to DecisionState.PAUSED: "Paused" is a lifecycle
+# state (bot.status == PAUSED), not a trading decision. A bot waiting on market
+# conditions (regime/cooldown/warmup) is RUNNING and merely HOLDING - rendering
+# that as "Paused" made operators think the bot had stopped. So a regime HOLD is
+# WAITING_FOR_REGIME, and a reason that merely contains the word "paused" stays a
+# plain HOLD rather than borrowing the lifecycle label.
 _HOLD_REASON_STATES = (
     ("cooldown", DecisionState.COOLDOWN),
     ("kill switch", DecisionState.RISK_LIMIT),
@@ -76,8 +89,7 @@ _HOLD_REASON_STATES = (
     ("warming", DecisionState.WARMING_UP),
     ("insufficient data", DecisionState.WARMING_UP),
     ("starting new bar", DecisionState.WARMING_UP),
-    ("paused", DecisionState.PAUSED),
-    ("regime", DecisionState.PAUSED),
+    ("regime", DecisionState.WAITING_FOR_REGIME),
 )
 
 
