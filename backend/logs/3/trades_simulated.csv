@@ -1,0 +1,4 @@
+trade_id,executed_at,side,trading_pair,base_amount,quote_amount,price,fee_amount,modeled_cost,total_cost,strategy_used
+15,2026-06-19T05:48:19.466231,buy,BTC/USDT,0.0015913179732349246,99.80101844350287,62715.95,0.09980101844350286,0.0,99.90081946194637,volatility_breakout
+16,2026-06-19T05:50:20.179627,sell,BTC/USDT,0.0015913179732349246,99.77504813417967,62699.63,0.09977504813417967,0.0,99.87482318231385,volatility_breakout
+2026-06-19T05:50:20.236741,3,TestBot4-VB,16,market_sell,BTC/USDT,0.00159132,62699.63000000,0.09977505,filled,volatility_breakout,99.80,True,

@@ -35,15 +35,6 @@ from .ledger_writer import LedgerWriterService
 from .accounting import TradeRecorderService, FIFOTaxEngine, CSVExportService
 from .ledger_invariants import LedgerInvariantService, ValidationError
 from .decision_status import decision_status_store, DecisionState
-from .diagnostics import (
-    diagnostics_store,
-    BLOCK_RISK_MANAGER,
-    BLOCK_MIN_ORDER_SIZE,
-    BLOCK_INSUFFICIENT_BALANCE,
-    BLOCK_POSITION_LIMITS,
-    BLOCK_OTHER,
-    DATA_UNAVAILABLE,
-)
 
 logger = logging.getLogger(__name__)
 
@@ -53,14 +44,6 @@ logger = logging.getLogger(__name__)
 # reason) rather than emit a doomed sub-minimum order that gets rejected every
 # loop. Single source of truth shared by strategy sizing and _execute_trade.
 MIN_ORDER_USD = 10.0
-
-# Maximum fraction of current_balance a strategy may commit to a single BUY.
-# Reserves 0.2 % for the simulated exchange fee (0.1 %) plus a bid/ask spread
-# buffer so that cost + fee never exceeds the available balance.  Constraint:
-#   balance * _BUY_BALANCE_FRACTION * (1 + sim_fee_rate) <= balance
-#   → fraction <= 1 / 1.001 ≈ 0.999001
-# 0.998 comfortably covers 0.1 % fee + up to ~0.1 % spread.
-_BUY_BALANCE_FRACTION = 0.998
 
 
 # Repeated-rejection circuit breaker. When the SAME executable trade is rejected
@@ -409,7 +392,6 @@ class TradingEngine:
                 bot.paused_at = datetime.utcnow()
                 bot.updated_at = datetime.utcnow()
                 await session.commit()
-                diagnostics_store.record_pause(bot_id, "Manual pause by operator")
                 decision_status_store.update(
                     bot_id, DecisionState.PAUSED,
                     reason="Bot paused by operator", symbol=bot.trading_pair,
@@ -492,10 +474,6 @@ class TradingEngine:
         """
         logger.info(f"Bot {bot_id}: Starting execution loop")
 
-        # Observe-only: mark a fresh runtime so the diagnostics panel can show
-        # "evaluations during current runtime" and clear any stale pause reason.
-        diagnostics_store.start_runtime(bot_id)
-
         # M1/M2: consecutive-failure circuit breaker with exponential backoff.
         # Reset on every successful iteration; on the threshold, pause + alert
         # instead of spinning at 1 Hz forever.
@@ -529,7 +507,6 @@ class TradingEngine:
 
                     if risk_assessment.action == RiskAction.PAUSE_BOT:
                         logger.warning(f"Bot {bot_id}: Pausing due to {risk_assessment.reason}")
-                        diagnostics_store.record_pause(bot_id, risk_assessment.reason)
                         decision_status_store.update(
                             bot_id, DecisionState.RISK_LIMIT,
                             reason=risk_assessment.reason, symbol=bot.trading_pair,
@@ -579,9 +556,6 @@ class TradingEngine:
                         # outage pauses + alerts instead of looping silently.
                         consecutive_failures += 1
                         last_error = f"market data unavailable for {bot.trading_pair}"
-                        diagnostics_store.record_data_failure(
-                            bot_id, DATA_UNAVAILABLE, last_error
-                        )
                         decision_status_store.update(
                             bot_id, DecisionState.WAITING_FOR_DATA,
                             reason=last_error, symbol=bot.trading_pair,
@@ -611,11 +585,6 @@ class TradingEngine:
                     # cannot bubble to the failure circuit breaker below and pause an
                     # otherwise-healthy bot.
                     try:
-                        # Observe-only diagnostics: count this evaluation and the
-                        # signal/decision-reason it produced (store methods are
-                        # internally exception-safe; this can never pause a bot).
-                        diagnostics_store.record_evaluation(bot_id)
-                        diagnostics_store.record_signal(bot_id, signal)
                         changed = decision_status_store.update_from_signal(
                             bot_id, signal, symbol=bot.trading_pair
                         )
@@ -644,9 +613,6 @@ class TradingEngine:
                             validation = await wallet.validate_trade(bot_id, signal.amount)
                             proceed = validation.is_valid
                             if not proceed:
-                                diagnostics_store.record_blocked(
-                                    bot_id, BLOCK_INSUFFICIENT_BALANCE, validation.reason
-                                )
                                 logger.warning(
                                     f"Bot {bot_id}: Trade rejected - {validation.reason}"
                                 )
@@ -949,13 +915,9 @@ class TradingEngine:
                 )
 
         # === AMOUNT CALCULATION ===
-        # Cap is _BUY_BALANCE_FRACTION of balance (not the full balance) so the
-        # simulated exchange fee (cost * 0.1 %) + bid/ask spread cannot push the
-        # total deduction over the available funds.
-        max_buy = bot.current_balance * _BUY_BALANCE_FRACTION
         if amount_usd and amount_usd > 0:
             # Use fixed USD amount
-            buy_amount = min(amount_usd, max_buy)
+            buy_amount = min(amount_usd, bot.current_balance)
         else:
             # Use percentage of current balance
             buy_amount = bot.current_balance * amount_percent
@@ -984,10 +946,9 @@ class TradingEngine:
                     ),
                 )
 
-        # Defensive: Cap at fee-adjusted balance ceiling so cost + fee cannot
-        # exceed available funds regardless of the amount_percent path above.
-        if buy_amount > max_buy:
-            buy_amount = max_buy
+        # Defensive: Cap at available balance (should already be handled above, but extra safety)
+        if buy_amount > bot.current_balance:
+            buy_amount = bot.current_balance
 
         # === EXECUTE BUY (infinite accumulation continues) ===
         logger.info(
@@ -1392,10 +1353,7 @@ class TradingEngine:
         # Depth-aware sizing: larger orders at deeper discounts (convex payoff)
         # Example: depth=1 → 1.0x, depth=2 → 1.5x, depth=3 → 2.25x, etc.
         size_multiplier = depth_multiplier ** (depth - 1)
-        order_size_usd = min(
-            initial_capital * base_order_size_pct * size_multiplier,
-            bot.current_balance * _BUY_BALANCE_FRACTION,  # never exceed real funds
-        )
+        order_size_usd = initial_capital * base_order_size_pct * size_multiplier
 
         if level_data["side"] == "buy":
             # === BUY ORDER (accumulate crypto) ===
@@ -1907,13 +1865,10 @@ class TradingEngine:
 
         # Entry condition: bar close <= lower Bollinger Band
         if last_bar_close <= lower_band:
-            # Fixed percentage position sizing, capped at _BUY_BALANCE_FRACTION
-            # of balance so the simulated exchange fee cannot push cost + fee
-            # over available funds, then floored to the executable minimum.
-            buy_amount = min(
-                bot.current_balance * order_size_percent,
-                bot.current_balance * _BUY_BALANCE_FRACTION,
-            )
+            # Fixed percentage position sizing, floored to the executable
+            # minimum (a sub-minimum buy would be rejected by the engine every
+            # loop). Below the minimum and unaffordable -> HOLD with a reason.
+            buy_amount = bot.current_balance * order_size_percent
 
             if buy_amount < MIN_ORDER_USD:
                 if bot.current_balance >= MIN_ORDER_USD:
@@ -2236,10 +2191,8 @@ class TradingEngine:
                     # rather than dividing by ~0.
                     position_size = risk_amount
 
-                # Never deploy more than the available balance, less the
-                # execution cost buffer (fee + spread) so the simulated exchange
-                # cannot reject the order for insufficient funds.
-                buy_amount = min(position_size, bot.current_balance * _BUY_BALANCE_FRACTION)
+                # Never deploy more than the available balance.
+                buy_amount = min(position_size, bot.current_balance)
 
                 # Minimum-order floor: a risk-based size below the exchange
                 # minimum cannot execute. Floor to the minimum when the balance
@@ -2581,7 +2534,7 @@ class TradingEngine:
                     ),
                 )
 
-            buy_amount = min(bot.current_balance * max_alloc, bot.current_balance * _BUY_BALANCE_FRACTION)
+            buy_amount = min(bot.current_balance * max_alloc, bot.current_balance)
             if buy_amount < 1:
                 return TradeSignal(
                     action="hold",
@@ -3089,9 +3042,8 @@ class TradingEngine:
             else:
                 position_size = risk_amount
 
-            # Cap at available balance less execution cost buffer (fee + spread)
-            # so the simulated exchange cannot reject for insufficient funds.
-            buy_amount = min(position_size, bot.current_balance * _BUY_BALANCE_FRACTION)
+            # Cap at available balance.
+            buy_amount = min(position_size, bot.current_balance)
 
             # Floor to the executable minimum (a sub-minimum buy is rejected by
             # the engine every loop); HOLD if the balance cannot afford it.
@@ -4357,7 +4309,6 @@ class TradingEngine:
             if not position:
                 reason = "cannot sell without open position"
                 logger.warning(f"Bot {bot.id}: Trade REJECTED - {reason}")
-                diagnostics_store.record_blocked(bot.id, BLOCK_OTHER, reason)
                 await self._record_trade_outcome(bot, "sell_no_position", reason)
                 return None
 
@@ -4385,7 +4336,6 @@ class TradingEngine:
         if not portfolio_check.ok:
             reason = f"portfolio risk cap {portfolio_check.violated_cap}: {portfolio_check.details}"
             logger.warning(f"Bot {bot.id}: Trade REJECTED by {reason}")
-            diagnostics_store.record_blocked(bot.id, BLOCK_RISK_MANAGER, reason)
             await self._record_trade_outcome(
                 bot, f"portfolio_cap:{portfolio_check.violated_cap}", reason
             )
@@ -4412,7 +4362,6 @@ class TradingEngine:
             if not capacity_check.ok:
                 reason = f"strategy capacity limit: {capacity_check.reason}"
                 logger.warning(f"Bot {bot.id}: Trade REJECTED by {reason}")
-                diagnostics_store.record_blocked(bot.id, BLOCK_POSITION_LIMITS, reason)
                 await self._record_trade_outcome(bot, "strategy_capacity", reason)
                 return None
 
@@ -4460,7 +4409,6 @@ class TradingEngine:
                 f"order size ${signal.amount:.2f} < ${min_order_size:.2f} minimum"
             )
             logger.warning(f"Bot {bot.id}: Trade REJECTED - {reason}")
-            diagnostics_store.record_blocked(bot.id, BLOCK_MIN_ORDER_SIZE, reason)
             await self._record_trade_outcome(bot, "buy_below_min", reason)
             return None
 
@@ -4518,19 +4466,11 @@ class TradingEngine:
             )
 
         if not exchange_order:
-            # Retrieve the specific rejection reason the exchange set before
-            # returning None; fall back to a generic message if unavailable.
-            rejection = getattr(exchange, "last_order_error", None) or "exchange rejected it"
-            reason_text = f"failed to place {signal.action} order: {rejection}"
-            logger.error(f"Bot {bot.id}: {reason_text}")
-            diagnostics_store.record_execution(
-                bot.id, signal.action, success=False,
-                reason=reason_text,
-            )
+            logger.error(f"Bot {bot.id}: Failed to place order")
             await self._record_trade_outcome(
                 bot,
                 f"place_order_failed:{signal.action}",
-                reason_text,
+                f"failed to place {signal.action} order (exchange rejected it)",
             )
             return None
 
@@ -4584,10 +4524,6 @@ class TradingEngine:
             if not finalized:
                 # Invariant validation failed; the transaction is already rolled
                 # back. The order is left unresolved for later reconciliation.
-                diagnostics_store.record_execution(
-                    bot.id, signal.action, success=False,
-                    reason="accounting invariant failed while finalizing the fill",
-                )
                 await self._record_trade_outcome(
                     bot, "finalize_failed",
                     "accounting invariant failed while finalizing the fill",
@@ -4596,9 +4532,6 @@ class TradingEngine:
 
         # Commit all changes (order, trade, ledger entries, tax lots, gains)
         await session.commit()
-
-        # Observe-only: a successful execution (main market/limit path).
-        diagnostics_store.record_execution(bot.id, signal.action, success=True)
 
         # Execution succeeded - reset the repeated-rejection breaker.
         await self._record_trade_outcome(bot, None)
@@ -5018,7 +4951,6 @@ class TradingEngine:
             f"errors. Last error: {last_error}"
         )
         logger.critical(f"Bot {bot_id}: {reason}")
-        diagnostics_store.record_pause(bot_id, reason)
         decision_status_store.update(bot_id, DecisionState.RISK_LIMIT, reason=reason)
         try:
             async with async_session_maker() as session:
@@ -5080,7 +5012,6 @@ class TradingEngine:
             f"{reason_text}. Resolve the cause, then resume."
         )
         logger.critical(f"Bot {bot_id}: {reason}")
-        diagnostics_store.record_pause(bot_id, reason)
         decision_status_store.update(bot_id, DecisionState.PAUSED, reason=reason)
         try:
             async with async_session_maker() as session:

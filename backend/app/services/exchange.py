@@ -112,6 +112,9 @@ class ExchangeService:
         self._retry_delay = 1.0
         self._rate_limit_remaining = 1200
         self._last_request_time = 0
+        # Set by place_market_order / place_limit_order before returning None so
+        # callers can surface the real rejection reason rather than a generic string.
+        self.last_order_error: Optional[str] = None
 
     async def connect(self) -> bool:
         """Connect to the exchange.
@@ -533,7 +536,9 @@ class ExchangeService:
         Returns:
             Order result or None if failed
         """
+        self.last_order_error = None
         if not self.is_connected():
+            self.last_order_error = "not connected to exchange"
             logger.error("Not connected to exchange")
             return None
 
@@ -543,6 +548,7 @@ class ExchangeService:
             estimate_price = ticker.last if ticker else 0
             amount = self._preflight_order(symbol, amount, estimate_price)
             if amount is None:
+                self.last_order_error = f"pre-flight check failed for {symbol}"
                 return None
 
             order = await self._execute_with_retry(
@@ -557,6 +563,7 @@ class ExchangeService:
             logger.debug(f"Raw exchange response for market {side.value} {symbol}: {order}")
             return self._parse_order(order)
         except Exception as e:
+            self.last_order_error = str(e)
             logger.error(f"Failed to place market {side.value} order for {symbol}: {e}")
             return None
 
@@ -578,7 +585,9 @@ class ExchangeService:
         Returns:
             Order result or None if failed
         """
+        self.last_order_error = None
         if not self.is_connected():
+            self.last_order_error = "not connected to exchange"
             logger.error("Not connected to exchange")
             return None
 
@@ -590,6 +599,7 @@ class ExchangeService:
                 logger.warning(f"Could not apply price precision for {symbol}: {e}")
             amount = self._preflight_order(symbol, amount, price)
             if amount is None:
+                self.last_order_error = f"pre-flight check failed for {symbol}"
                 return None
 
             order = await self._execute_with_retry(
@@ -605,6 +615,7 @@ class ExchangeService:
             logger.debug(f"Raw exchange response for limit {side.value} {symbol}: {order}")
             return self._parse_order(order)
         except Exception as e:
+            self.last_order_error = str(e)
             logger.error(f"Failed to place limit {side.value} order for {symbol}: {e}")
             return None
 
@@ -822,8 +833,10 @@ class SimulatedExchangeService(ExchangeService):
         amount: float,
     ) -> Optional[ExchangeOrder]:
         """Place simulated market order."""
+        self.last_order_error = None
         ticker = await self.get_ticker(symbol)
         if not ticker:
+            self.last_order_error = f"market data unavailable for {symbol}"
             return None
 
         price = ticker.ask if side == OrderSide.BUY else ticker.bid
@@ -833,14 +846,25 @@ class SimulatedExchangeService(ExchangeService):
         # Update simulated balance
         base, quote = symbol.split("/")
         if side == OrderSide.BUY:
-            if self._simulated_balance.get(quote, 0) < cost + fee:
-                logger.error("Insufficient simulated balance")
+            available = self._simulated_balance.get(quote, 0)
+            if available < cost + fee:
+                self.last_order_error = (
+                    f"Insufficient simulated balance: "
+                    f"need ${cost + fee:.4f} ({quote} cost ${cost:.4f} + fee ${fee:.4f}), "
+                    f"have ${available:.4f}"
+                )
+                logger.error(self.last_order_error)
                 return None
-            self._simulated_balance[quote] = self._simulated_balance.get(quote, 0) - cost - fee
+            self._simulated_balance[quote] = available - cost - fee
             self._simulated_balance[base] = self._simulated_balance.get(base, 0) + amount
         else:
             if self._simulated_balance.get(base, 0) < amount:
-                logger.error("Insufficient simulated balance")
+                self.last_order_error = (
+                    f"Insufficient simulated balance: "
+                    f"need {amount:.8f} {base}, "
+                    f"have {self._simulated_balance.get(base, 0):.8f}"
+                )
+                logger.error(self.last_order_error)
                 return None
             self._simulated_balance[base] = self._simulated_balance.get(base, 0) - amount
             self._simulated_balance[quote] = self._simulated_balance.get(quote, 0) + cost - fee

@@ -1,0 +1,6 @@
+2026-06-16T22:11:20.676190 [INFO] [DRY RUN] Bot started with strategy 'volatility_breakout' on BTC/USDT
+2026-06-16T23:04:47.814259 [INFO] [DRY RUN] Bot resumed after server restart
+2026-06-18T19:37:01.053283 [INFO] [DRY RUN] Bot resumed after server restart
+2026-06-18T21:58:45.263247 [INFO] [DRY RUN] Bot resumed after server restart
+2026-06-18T22:54:10.386701 [INFO] [DRY RUN] Bot started with strategy 'mean_reversion' on BTC/USDT
+2026-06-20T12:25:18.427326 [INFO] [DRY RUN] Bot started with strategy 'mean_reversion' on BTC/USDT

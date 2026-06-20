@@ -1,0 +1,2 @@
+sale_date,trading_pair,token,buy_date,buy_price,sale_price,amount,proceeds,cost_basis,gain_loss,holding_period_days,short_term,is_simulated
+2026-06-18,BTC/USDT,BTC,2026-06-16,65672.68000000,62390.84000000,0.00015227,9.50,10.00,-0.51,1,True,True

@@ -1,0 +1,3 @@
+2026-06-18T19:45:19.771543 [INFO] [DRY RUN] Bot started with strategy 'mean_reversion' on BTC/USDT
+2026-06-18T22:49:29.048909 [INFO] [DRY RUN] Bot started with strategy 'funding_carry' on BTC/USDT
+2026-06-20T17:39:26.415889 [INFO] [DRY RUN] Bot started with strategy 'dca_accumulator' on BTC/USDT

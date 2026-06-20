@@ -1,0 +1,19 @@
+# External Data Sources Configuration
+
+coinmarketcap:
+  api_key: "YOUR_CMC_API_KEY"
+  priority: 1
+  enabled: false
+
+coingecko:
+  api_key: "YOUR_COINGECKO_API_KEY"  # Optional for free tier
+  priority: 2
+  enabled: true
+
+# Poll frequency in seconds
+poll_frequency: 300  # 5 minutes
+
+# Extreme market condition thresholds
+extreme_conditions:
+  crash_threshold_percent: -15  # Pause bots if market drops this much in 24h
+  enabled: true
