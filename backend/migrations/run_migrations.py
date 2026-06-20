@@ -85,6 +85,32 @@ async def create_tables_from_models():
     logger.info("Tables created successfully")
 
 
+async def repair_corrupted_strategies():
+    """Restore bots whose configured strategy was corrupted by risk rotation."""
+    from app.services.risk_management import RiskManagementService
+
+    logger.info("Repairing any strategy-corrupted bots...")
+    try:
+        async with async_session_maker() as session:
+            repairs = await RiskManagementService(session).repair_corrupted_strategies()
+    except Exception as e:
+        # Best-effort data repair: on a partial / legacy schema (e.g. a bots
+        # table predating current columns) there is nothing meaningful to repair.
+        # Never fail the schema migration over it - log and move on.
+        logger.warning(f"Strategy repair skipped (schema not ready or no data): {e}")
+        return
+
+    if repairs:
+        for r in repairs:
+            logger.warning(
+                f"  Bot {r['bot_id']} ({r['name']}): '{r['from']}' -> '{r['to']}' "
+                f"({r['rotations_cleared']} rotation row(s) cleared)"
+            )
+        logger.info(f"Strategy repair complete: {len(repairs)} bot(s) restored")
+    else:
+        logger.info("Strategy repair: no corrupted bots found")
+
+
 async def verify_migration():
     """Verify that migration was applied successfully."""
     logger.info("Verifying migration...")
@@ -143,6 +169,11 @@ async def main():
                 await apply_sql_migration(migration_file)
         else:
             logger.info("No SQL migration files found (ORM baseline already ensured)")
+
+        # P0 data-integrity repair: restore any bot whose configured strategy was
+        # corrupted by the old risk-driven rotation (now removed). Safe/idempotent
+        # - it only touches bots that have strategy_rotations rows.
+        await repair_corrupted_strategies()
 
         # Verify migration (check accounting tables)
         success = await verify_migration()

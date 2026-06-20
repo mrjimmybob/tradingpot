@@ -307,34 +307,37 @@ class RiskManagementService:
         consecutive_losses = await self._count_consecutive_losses(bot_id)
 
         if consecutive_losses >= threshold:
-            # Check if we can rotate strategy
-            rotation_count = await self._count_strategy_rotations(bot_id)
+            # P0 FIX: risk-driven strategy rotation is REMOVED. A bot's configured
+            # strategy is immutable (see rotate_strategy) - the old code rotated
+            # fixed-strategy bots through _ALPHA_STRATEGIES on a losing streak,
+            # silently corrupting their identity (e.g. a DCA bot became Trend
+            # Following) and pausing them at "Max strategy rotations reached".
+            #
+            # auto_mode selects strategies in-memory and governs itself, so this
+            # check leaves it to continue. Every other (fixed-strategy) bot is
+            # PAUSED to stop the bleed without ever touching Bot.strategy or the
+            # rotation count.
+            if bot.strategy == "auto_mode":
+                return consecutive_losses, RiskAssessment(
+                    action=RiskAction.CONTINUE,
+                    reason="auto_mode self-manages strategy selection on losses",
+                    details={
+                        "consecutive_losses": consecutive_losses,
+                        "strategy": "auto_mode",
+                    },
+                )
 
-            if rotation_count >= bot.max_strategy_rotations:
-                await self._log_alert(
-                    bot_id,
-                    "max_rotations",
-                    f"Max strategy rotations ({bot.max_strategy_rotations}) reached after consecutive losses"
-                )
-                return consecutive_losses, RiskAssessment(
-                    action=RiskAction.PAUSE_BOT,
-                    reason=f"Max strategy rotations reached ({rotation_count})",
-                    details={
-                        "consecutive_losses": consecutive_losses,
-                        "rotation_count": rotation_count,
-                        "max_rotations": bot.max_strategy_rotations,
-                    },
-                )
-            else:
-                return consecutive_losses, RiskAssessment(
-                    action=RiskAction.ROTATE_STRATEGY,
-                    reason=f"{consecutive_losses} consecutive losses - strategy rotation recommended",
-                    details={
-                        "consecutive_losses": consecutive_losses,
-                        "rotation_count": rotation_count,
-                        "max_rotations": bot.max_strategy_rotations,
-                    },
-                )
+            return consecutive_losses, RiskAssessment(
+                action=RiskAction.PAUSE_BOT,
+                reason=(
+                    f"{consecutive_losses} consecutive losses - pausing "
+                    f"(fixed-strategy bot; strategy rotation disabled)"
+                ),
+                details={
+                    "consecutive_losses": consecutive_losses,
+                    "strategy": bot.strategy,
+                },
+            )
 
         return consecutive_losses, RiskAssessment(
             action=RiskAction.CONTINUE,
@@ -351,20 +354,29 @@ class RiskManagementService:
         new_strategy: str,
         reason: str = "Consecutive losses",
     ) -> Tuple[bool, str]:
-        """Rotate bot to a different strategy.
+        """Reject any attempt to overwrite a bot's configured strategy.
 
-        IMPORTANT: This method NEVER modifies Bot.strategy for auto_mode bots.
-        Auto_mode is a meta-strategy (policy engine) that governs itself.
-        Risk events can only pause trading or reduce activity, but cannot
-        override auto_mode's strategy selection policy.
+        P0 FIX (data-integrity): this method used to overwrite Bot.strategy for
+        every non-auto_mode bot, which is exactly how fixed-strategy bots had
+        their identity corrupted (a DCA bot rotated into Trend Following, etc.).
+        Strategy identity is now IMMUTABLE:
+
+          * auto_mode bots select strategies in-memory; risk events may never
+            override that policy.
+          * Fixed-strategy bots have a permanent configured strategy. Any caller
+            asking to rotate one is a bug - it is logged as an ERROR, rejected,
+            and Bot.strategy is left untouched (no rotation row recorded).
+
+        This is the hard guard that makes the corruption class impossible
+        regardless of upstream logic. No code path writes Bot.strategy here.
 
         Args:
             bot_id: The bot ID
-            new_strategy: The new strategy name
-            reason: Reason for rotation
+            new_strategy: The requested (rejected) new strategy name
+            reason: Reason the rotation was requested
 
         Returns:
-            Tuple of (success, message)
+            Tuple of (success, message) - success is always False.
         """
         result = await self.session.execute(select(Bot).where(Bot.id == bot_id))
         bot = result.scalar_one_or_none()
@@ -374,8 +386,7 @@ class RiskManagementService:
 
         old_strategy = bot.strategy
 
-        # CRITICAL: Do NOT rotate auto_mode bots
-        # Auto_mode is a policy engine that manages its own strategy selection
+        # auto_mode is a policy engine that manages its own strategy selection.
         if old_strategy == "auto_mode":
             logger.warning(
                 f"Bot {bot_id}: Risk-based strategy rotation blocked - "
@@ -390,23 +401,89 @@ class RiskManagementService:
             )
             return False, "Cannot rotate auto_mode - it is a policy engine that governs itself"
 
-        # Record rotation
-        rotation = StrategyRotation(
-            bot_id=bot_id,
-            from_strategy=old_strategy,
-            to_strategy=new_strategy,
-            reason=reason,
+        # Fixed-strategy bot: configured strategy is IMMUTABLE. Reaching here is a
+        # bug - reject loudly and never mutate Bot.strategy or record a rotation.
+        logger.error(
+            f"Bot {bot_id}: REJECTED illegal strategy rotation of fixed-strategy "
+            f"bot '{old_strategy}' -> '{new_strategy}'. Configured strategy is "
+            f"immutable; only auto_mode selects strategies (in-memory). "
+            f"Reason: {reason}"
         )
-        self.session.add(rotation)
+        await self._log_alert(
+            bot_id,
+            "rotation_blocked",
+            f"Illegal rotation rejected for fixed-strategy bot '{old_strategy}' "
+            f"(configured strategy is immutable). Reason: {reason}"
+        )
+        return False, (
+            f"Cannot rotate fixed-strategy bot '{old_strategy}' - "
+            f"configured strategy is immutable"
+        )
 
-        # Update bot strategy (only for non-auto_mode bots)
-        bot.strategy = new_strategy
-        bot.updated_at = datetime.utcnow()
+    async def repair_corrupted_strategies(self) -> list:
+        """Repair bots whose configured strategy was corrupted by the old
+        risk-driven rotation, and reset their rotation history.
 
-        await self.session.commit()
+        IDENTIFICATION: every ``strategy_rotations`` row is proof of corruption -
+        rotation was only ever (illegally) applied to fixed-strategy bots, and
+        each row overwrote a configured strategy. A non-auto_mode bot with one or
+        more rotation rows is therefore corrupted.
 
-        logger.info(f"Bot {bot_id}: Rotated strategy from {old_strategy} to {new_strategy}")
-        return True, f"Strategy rotated from {old_strategy} to {new_strategy}"
+        REPAIR: the bot's ORIGINAL configured strategy is the EARLIEST rotation's
+        ``from_strategy`` (the value before the first overwrite). Restore it and
+        delete the bot's rotation rows so its rotation count resets to 0.
+
+        Idempotent: once a bot's rotation rows are cleared it is no longer
+        selected, so re-running performs no further changes.
+
+        Returns:
+            A list of dicts describing each repair:
+            ``{"bot_id", "name", "from", "to", "rotations_cleared"}``.
+        """
+        repairs = []
+
+        result = await self.session.execute(
+            select(Bot).where(Bot.strategy != "auto_mode")
+        )
+        bots = result.scalars().all()
+
+        for bot in bots:
+            rot_result = await self.session.execute(
+                select(StrategyRotation)
+                .where(StrategyRotation.bot_id == bot.id)
+                .order_by(StrategyRotation.created_at.asc(), StrategyRotation.id.asc())
+            )
+            rotations = rot_result.scalars().all()
+            if not rotations:
+                continue
+
+            original = rotations[0].from_strategy
+            corrupted = bot.strategy
+
+            if original and original != corrupted:
+                bot.strategy = original
+                bot.updated_at = datetime.utcnow()
+
+            for r in rotations:
+                await self.session.delete(r)
+
+            repairs.append({
+                "bot_id": bot.id,
+                "name": bot.name,
+                "from": corrupted,
+                "to": original,
+                "rotations_cleared": len(rotations),
+            })
+            logger.warning(
+                f"Bot {bot.id} ({bot.name}): repaired corrupted strategy "
+                f"'{corrupted}' -> '{original}', cleared {len(rotations)} "
+                f"rotation row(s)"
+            )
+
+        if repairs:
+            await self.session.commit()
+
+        return repairs
 
     async def check_running_time(self, bot_id: int) -> RiskAssessment:
         """Check if bot has exceeded its running time limit.

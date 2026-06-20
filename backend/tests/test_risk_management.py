@@ -658,12 +658,16 @@ class TestConsecutiveLosses:
     """Tests for consecutive loss detection."""
 
     @pytest.mark.asyncio
-    async def test_consecutive_losses_triggers_rotation(
+    async def test_consecutive_losses_pauses_fixed_strategy_bot(
         self, risk_service, mock_session
     ):
-        """Test consecutive losses trigger strategy rotation."""
+        """Consecutive losses PAUSE a fixed-strategy bot (P0: rotation removed).
+
+        Previously this returned ROTATE_STRATEGY, which corrupted the bot's
+        configured strategy. Fixed-strategy bots are now paused instead, and the
+        rotation count is never consulted."""
         # Arrange
-        bot = create_mock_bot(max_strategy_rotations=3)
+        bot = create_mock_bot(max_strategy_rotations=3, strategy="dca_accumulator")
         mock_bot_result = AsyncMock()
         mock_bot_result.scalar_one_or_none = Mock(return_value=bot)
 
@@ -678,14 +682,10 @@ class TestConsecutiveLosses:
         mock_orders_result = AsyncMock()
         mock_orders_result.scalars = Mock(return_value=Mock(all=Mock(return_value=orders)))
 
-        # Mock rotation count = 0
-        mock_rotation_result = AsyncMock()
-        mock_rotation_result.scalar = Mock(return_value=0)
-
+        # Only bot + orders are queried now (no rotation-count query).
         mock_session.execute.side_effect = [
             mock_bot_result,
             mock_orders_result,
-            mock_rotation_result,
         ]
 
         # Act
@@ -695,8 +695,38 @@ class TestConsecutiveLosses:
 
         # Assert
         assert count == 3
-        assert result.action == RiskAction.ROTATE_STRATEGY
+        assert result.action == RiskAction.PAUSE_BOT
         assert "consecutive losses" in result.reason
+        # Strategy must be untouched by the risk check.
+        assert bot.strategy == "dca_accumulator"
+
+    @pytest.mark.asyncio
+    async def test_consecutive_losses_auto_mode_continues(
+        self, risk_service, mock_session
+    ):
+        """auto_mode self-manages strategy selection, so a losing streak leaves
+        it to CONTINUE (it is not paused or rotated by this check)."""
+        bot = create_mock_bot(strategy="auto_mode")
+        mock_bot_result = AsyncMock()
+        mock_bot_result.scalar_one_or_none = Mock(return_value=bot)
+
+        orders = [
+            create_mock_order(running_balance_after=9700.0),
+            create_mock_order(running_balance_after=9800.0),
+            create_mock_order(running_balance_after=9900.0),
+            create_mock_order(running_balance_after=10000.0),
+        ]
+        mock_orders_result = AsyncMock()
+        mock_orders_result.scalars = Mock(return_value=Mock(all=Mock(return_value=orders)))
+        mock_session.execute.side_effect = [mock_bot_result, mock_orders_result]
+
+        count, result = await risk_service.check_consecutive_losses(
+            bot_id=1, threshold=3
+        )
+
+        assert count == 3
+        assert result.action == RiskAction.CONTINUE
+        assert bot.strategy == "auto_mode"
 
     @pytest.mark.asyncio
     async def test_consecutive_losses_below_threshold(
@@ -731,12 +761,15 @@ class TestConsecutiveLosses:
         assert "Within consecutive loss threshold" in result.reason
 
     @pytest.mark.asyncio
-    async def test_consecutive_losses_max_rotations_reached(
+    async def test_consecutive_losses_pause_does_not_consult_rotations(
         self, risk_service, mock_session
     ):
-        """Test consecutive losses pause bot when max rotations reached."""
+        """A fixed-strategy bot pauses on consecutive losses WITHOUT ever
+        querying or referencing the rotation count (the rotation machinery is
+        gone for fixed bots, so the old "Max strategy rotations reached" path no
+        longer exists)."""
         # Arrange
-        bot = create_mock_bot(max_strategy_rotations=3)
+        bot = create_mock_bot(max_strategy_rotations=3, strategy="mean_reversion")
         mock_bot_result = AsyncMock()
         mock_bot_result.scalar_one_or_none = Mock(return_value=bot)
 
@@ -750,14 +783,10 @@ class TestConsecutiveLosses:
         mock_orders_result = AsyncMock()
         mock_orders_result.scalars = Mock(return_value=Mock(all=Mock(return_value=orders)))
 
-        # Mock rotation count = 3 (at max)
-        mock_rotation_result = AsyncMock()
-        mock_rotation_result.scalar = Mock(return_value=3)
-
+        # Exactly two queries: bot, then orders. No third (rotation-count) query.
         mock_session.execute.side_effect = [
             mock_bot_result,
             mock_orders_result,
-            mock_rotation_result,
         ]
 
         # Act
@@ -768,7 +797,8 @@ class TestConsecutiveLosses:
         # Assert
         assert count == 3
         assert result.action == RiskAction.PAUSE_BOT
-        assert "Max strategy rotations reached" in result.reason
+        assert "Max strategy rotations reached" not in result.reason
+        assert mock_session.execute.call_count == 2  # no rotation-count query
 
     @pytest.mark.asyncio
     async def test_consecutive_losses_bot_not_found(self, risk_service, mock_session):
@@ -830,10 +860,13 @@ class TestStrategyRotation:
     """Tests for strategy rotation logic."""
 
     @pytest.mark.asyncio
-    async def test_rotate_strategy_success(self, risk_service, mock_session):
-        """Test successful strategy rotation."""
+    async def test_rotate_strategy_rejected_for_fixed_strategy_bot(
+        self, risk_service, mock_session
+    ):
+        """P0: rotating a fixed-strategy bot is REJECTED - the configured strategy
+        is immutable. Strategy is left untouched and no rotation row is added."""
         # Arrange
-        bot = create_mock_bot(strategy="momentum")
+        bot = create_mock_bot(strategy="dca_accumulator")
         mock_result = AsyncMock()
         mock_result.scalar_one_or_none = Mock(return_value=bot)
         mock_session.execute.return_value = mock_result
@@ -844,12 +877,12 @@ class TestStrategyRotation:
         )
 
         # Assert
-        assert success is True
-        assert "momentum" in message
-        assert "mean_reversion" in message
-        assert bot.strategy == "mean_reversion"
-        mock_session.add.assert_called_once()
-        mock_session.commit.assert_called_once()
+        assert success is False
+        assert "immutable" in message.lower()
+        assert bot.strategy == "dca_accumulator"  # unchanged
+        # An alert may be logged, but NO StrategyRotation row may be recorded.
+        added = [c.args[0] for c in mock_session.add.call_args_list]
+        assert not any(type(o).__name__ == "StrategyRotation" for o in added)
 
     @pytest.mark.asyncio
     async def test_rotate_strategy_bot_not_found(self, risk_service, mock_session):
@@ -890,26 +923,26 @@ class TestStrategyRotation:
         assert bot.strategy == "auto_mode"  # Strategy unchanged
 
     @pytest.mark.asyncio
-    async def test_rotate_strategy_records_rotation(self, risk_service, mock_session):
-        """Test strategy rotation records the rotation in database."""
+    async def test_rotate_strategy_never_records_rotation(self, risk_service, mock_session):
+        """P0: a rejected rotation must NOT write a StrategyRotation row or commit
+        a strategy change (this is what produced the corrupting history before)."""
         # Arrange
-        bot = create_mock_bot(strategy="momentum")
+        bot = create_mock_bot(strategy="trend_following")
         mock_result = AsyncMock()
         mock_result.scalar_one_or_none = Mock(return_value=bot)
         mock_session.execute.return_value = mock_result
 
         # Act
-        await risk_service.rotate_strategy(
+        success, _ = await risk_service.rotate_strategy(
             bot_id=1, new_strategy="mean_reversion", reason="Test"
         )
 
         # Assert
-        mock_session.add.assert_called_once()
-        rotation = mock_session.add.call_args[0][0]
-        assert rotation.bot_id == 1
-        assert rotation.from_strategy == "momentum"
-        assert rotation.to_strategy == "mean_reversion"
-        assert rotation.reason == "Test"
+        assert success is False
+        # No StrategyRotation row recorded (an alert may be, which is fine).
+        added = [c.args[0] for c in mock_session.add.call_args_list]
+        assert not any(type(o).__name__ == "StrategyRotation" for o in added)
+        assert bot.strategy == "trend_following"
 
 
 # ============================================================================
