@@ -10,6 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, and_, func
 
 from ..models import Bot, BotStatus, Order, OrderStatus, Alert, StrategyRotation
+from ..models.tax_lot import RealizedGain
 
 logger = logging.getLogger(__name__)
 
@@ -625,44 +626,30 @@ class RiskManagementService:
         return total_loss
 
     async def _count_consecutive_losses(self, bot_id: int) -> int:
-        """Count consecutive losing trades.
+        """Count consecutive losing completed round-trips using realized P&L.
 
-        Args:
-            bot_id: The bot ID
-
-        Returns:
-            Number of consecutive losses
+        A loss is defined as a RealizedGain record whose gain_loss < 0.
+        Only completed exits produce RealizedGain rows, so:
+        - BUY-only strategies (DCA) never increment the counter.
+        - Open positions are invisible until they are closed.
+        - running_balance_after snapshot timing is irrelevant.
+        - A profitable exit (gain_loss >= 0) immediately resets the streak.
         """
-        # Get recent filled orders ordered by time
-        query = select(Order).where(
-            and_(
-                Order.bot_id == bot_id,
-                Order.status == OrderStatus.FILLED,
-            )
-        ).order_by(Order.filled_at.desc()).limit(20)
-
+        query = (
+            select(RealizedGain)
+            .where(RealizedGain.owner_id == str(bot_id))
+            .order_by(RealizedGain.sell_date.desc())
+            .limit(20)
+        )
         result = await self.session.execute(query)
-        orders = result.scalars().all()
+        gains = result.scalars().all()
 
-        # Count consecutive losses
-        # For simplicity, we check if running_balance decreased
         consecutive_losses = 0
-        prev_balance = None
-
-        for order in orders:
-            if order.running_balance_after is None:
-                continue
-
-            if prev_balance is not None:
-                if order.running_balance_after > prev_balance:
-                    # This was a loss (balance decreased after this trade)
-                    consecutive_losses += 1
-                else:
-                    # Win - reset counter
-                    break
-
-            prev_balance = order.running_balance_after
-
+        for gain in gains:
+            if gain.gain_loss < 0:
+                consecutive_losses += 1
+            else:
+                break
         return consecutive_losses
 
     async def _count_strategy_rotations(self, bot_id: int) -> int:

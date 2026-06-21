@@ -27,6 +27,7 @@ from datetime import datetime, timedelta
 from app.models import Bot, BotStatus, Order
 from app.models.order import OrderType, OrderStatus
 from app.models.strategy_rotation import StrategyRotation
+from app.models.tax_lot import RealizedGain
 from app.services.risk_management import RiskManagementService, RiskAction
 from app.services.trading_engine import TradingEngine, _ALPHA_STRATEGIES
 
@@ -47,20 +48,47 @@ async def _make_bot(session, strategy, name="bot", max_rotations=3):
     return bot
 
 
-async def _add_losing_orders(session, bot_id, count=4):
-    """Insert ``count`` FILLED orders whose running balance steadily DECREASES
-    (newest is lowest) so _count_consecutive_losses reports count-1 losses."""
+async def _add_losing_realized_gains(session, bot_id, count=3, gain_loss=-10.0):
+    """Insert ``count`` RealizedGain rows with negative gain_loss so that
+    _count_consecutive_losses reports ``count`` consecutive losses."""
     base = datetime.utcnow()
-    # Oldest first so filled_at increases with balance decreasing.
     for i in range(count):
-        # i=0 oldest highest balance, last newest lowest
-        session.add(Order(
-            bot_id=bot_id, order_type=OrderType.MARKET_SELL,
-            trading_pair="BTC/USDT", amount=0.001, price=50000.0,
-            status=OrderStatus.FILLED, strategy_used="x",
-            running_balance_after=10000.0 - i * 100.0,
-            filled_at=base + timedelta(seconds=i),
+        session.add(RealizedGain(
+            owner_id=str(bot_id),
+            asset="BTC",
+            quantity=0.001,
+            proceeds=9.99,
+            cost_basis=10.02,
+            gain_loss=gain_loss,
+            holding_period_days=0,
+            is_long_term=False,
+            purchase_trade_id=i + 1,
+            sell_trade_id=i + 1000,
+            tax_lot_id=i + 1,
+            purchase_date=base + timedelta(seconds=i),
+            sell_date=base + timedelta(seconds=i + 1),
         ))
+    await session.commit()
+
+
+async def _add_profitable_realized_gain(session, bot_id, gain_loss=5.0):
+    """Insert one RealizedGain row with positive gain_loss (a winning trade)."""
+    base = datetime.utcnow()
+    session.add(RealizedGain(
+        owner_id=str(bot_id),
+        asset="BTC",
+        quantity=0.001,
+        proceeds=10.05,
+        cost_basis=10.00,
+        gain_loss=gain_loss,
+        holding_period_days=0,
+        is_long_term=False,
+        purchase_trade_id=9001,
+        sell_trade_id=9002,
+        tax_lot_id=9001,
+        purchase_date=base,
+        sell_date=base + timedelta(seconds=1),
+    ))
     await session.commit()
 
 
@@ -89,7 +117,7 @@ async def _rotation_count(session, bot_id):
 @pytest.mark.asyncio
 async def test_consecutive_losses_pauses_without_corrupting_fixed_bot(test_db):
     bot = await _make_bot(test_db, "dca_accumulator")
-    await _add_losing_orders(test_db, bot.id, count=4)
+    await _add_losing_realized_gains(test_db, bot.id, count=3)
 
     svc = RiskManagementService(test_db)
     count, result = await svc.check_consecutive_losses(bot.id, threshold=3)
@@ -144,7 +172,7 @@ async def test_auto_mode_internal_switch_does_not_touch_bot_strategy(test_db):
 @pytest.mark.asyncio
 async def test_auto_mode_losing_streak_continues_not_paused(test_db):
     bot = await _make_bot(test_db, "auto_mode")
-    await _add_losing_orders(test_db, bot.id, count=4)
+    await _add_losing_realized_gains(test_db, bot.id, count=3)
     svc = RiskManagementService(test_db)
     count, result = await svc.check_consecutive_losses(bot.id, threshold=3)
     assert count == 3
@@ -277,3 +305,94 @@ async def test_bot_api_reports_configured_strategy(client, test_db):
     resp = await client.get(f"/api/bots/{bot.id}")
     assert resp.status_code == 200
     assert resp.json()["strategy"] == "mean_reversion"
+
+
+# --------------------------------------------------------------------------- #
+# 8: Consecutive loss classification uses realized P&L, not balance snapshots
+# --------------------------------------------------------------------------- #
+
+@pytest.mark.asyncio
+async def test_dca_buy_only_never_increments_consecutive_losses(test_db):
+    """DCA with only BUY orders must never trigger the consecutive loss counter.
+
+    Previously, each BUY deducted only the fee from running_balance_after, creating
+    a monotonically decreasing sequence that the old algorithm classified as losses.
+    The new algorithm reads realized_gains, which only contains SELL exits, so
+    BUY-only strategies produce zero consecutive losses regardless of how many
+    buys have executed."""
+    bot = await _make_bot(test_db, "dca_accumulator")
+    # No realized gains — DCA has accumulated BTC but never sold.
+    svc = RiskManagementService(test_db)
+    count, result = await svc.check_consecutive_losses(bot.id, threshold=3)
+    assert count == 0
+    assert result.action == RiskAction.CONTINUE
+
+
+@pytest.mark.asyncio
+async def test_profitable_round_trip_resets_consecutive_loss_counter(test_db):
+    """A profitable exit (gain_loss >= 0) resets the streak to 0.
+
+    Two prior losses followed by one profitable exit must leave the counter at 0
+    so the bot is not paused after the winning trade."""
+    bot = await _make_bot(test_db, "mean_reversion")
+    # Insert two losses first (oldest), then one win (newest).
+    base = datetime.utcnow()
+    for i, gl in enumerate([-5.0, -3.0, +8.0]):
+        test_db.add(RealizedGain(
+            owner_id=str(bot.id), asset="BTC",
+            quantity=0.001, proceeds=10.0 + gl, cost_basis=10.0, gain_loss=gl,
+            holding_period_days=0, is_long_term=False,
+            purchase_trade_id=i + 1, sell_trade_id=i + 100, tax_lot_id=i + 1,
+            purchase_date=base + timedelta(seconds=i),
+            sell_date=base + timedelta(seconds=i + 1),
+        ))
+    await test_db.commit()
+
+    svc = RiskManagementService(test_db)
+    count, result = await svc.check_consecutive_losses(bot.id, threshold=3)
+    assert count == 0
+    assert result.action == RiskAction.CONTINUE
+
+
+@pytest.mark.asyncio
+async def test_losing_round_trip_increments_consecutive_loss_counter(test_db):
+    """A losing exit (gain_loss < 0) increments the consecutive loss counter."""
+    bot = await _make_bot(test_db, "trend_following")
+    await _add_losing_realized_gains(test_db, bot.id, count=2)
+
+    svc = RiskManagementService(test_db)
+    count, result = await svc.check_consecutive_losses(bot.id, threshold=3)
+    assert count == 2
+    assert result.action == RiskAction.CONTINUE  # below threshold
+
+
+@pytest.mark.asyncio
+async def test_profitable_sell_never_classified_as_loss(test_db):
+    """A SELL with gain_loss > 0 must never be counted as a loss, regardless of
+    fee magnitude or running_balance_after snapshot timing.
+
+    This guards the specific failure mode found in production: the old algorithm
+    captured running_balance_after before crediting realized P&L, making even
+    profitable SELLs appear as balance decreases."""
+    bot = await _make_bot(test_db, "mean_reversion")
+    # A profitable realized gain — price moved enough to overcome buy fee.
+    await _add_profitable_realized_gain(test_db, bot.id, gain_loss=0.50)
+
+    svc = RiskManagementService(test_db)
+    count, result = await svc.check_consecutive_losses(bot.id, threshold=3)
+    assert count == 0
+    assert result.action == RiskAction.CONTINUE
+
+
+@pytest.mark.asyncio
+async def test_three_genuine_consecutive_losses_pause_fixed_bot(test_db):
+    """Three consecutive realized losses at or above threshold pauses the bot."""
+    bot = await _make_bot(test_db, "trend_following")
+    await _add_losing_realized_gains(test_db, bot.id, count=3, gain_loss=-15.0)
+
+    svc = RiskManagementService(test_db)
+    count, result = await svc.check_consecutive_losses(bot.id, threshold=3)
+    assert count == 3
+    assert result.action == RiskAction.PAUSE_BOT
+    assert "consecutive losses" in result.reason
+    assert "fixed-strategy" in result.reason

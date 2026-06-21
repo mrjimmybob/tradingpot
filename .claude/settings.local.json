@@ -175,7 +175,9 @@
       "Bash(git --no-pager show --stat --oneline HEAD)",
       "Bash(python3 -m pytest tests/test_fee_headroom_regression.py -v)",
       "Bash(/opt/tradingbot/venv/bin/pytest tests/test_fee_headroom_regression.py -v)",
-      "Bash(/opt/tradingbot/venv/bin/pytest *)"
+      "Bash(/opt/tradingbot/venv/bin/pytest *)",
+      "Bash(python3 -c \"import sqlite3; print\\('python sqlite3 available'\\)\")",
+      "Bash(python3 *)"
     ]
   }
 }

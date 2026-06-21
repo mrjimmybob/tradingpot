@@ -86,6 +86,15 @@ def create_mock_order(
     return order
 
 
+def create_mock_realized_gain(gain_loss: float, sell_date=None):
+    """Helper to create a mock RealizedGain for consecutive-loss tests."""
+    from app.models.tax_lot import RealizedGain
+    gain = Mock(spec=RealizedGain)
+    gain.gain_loss = gain_loss
+    gain.sell_date = sell_date or datetime.utcnow()
+    return gain
+
+
 # ============================================================================
 # Test Class: Stop Loss
 # ============================================================================
@@ -671,21 +680,19 @@ class TestConsecutiveLosses:
         mock_bot_result = AsyncMock()
         mock_bot_result.scalar_one_or_none = Mock(return_value=bot)
 
-        # Mock 3 consecutive losing orders (balance decreasing from 10000 -> 9700)
-        # Need 4 orders to get 3 consecutive losses (comparisons between adjacent pairs)
-        orders = [
-            create_mock_order(running_balance_after=9700.0),  # Most recent (lowest)
-            create_mock_order(running_balance_after=9800.0),
-            create_mock_order(running_balance_after=9900.0),
-            create_mock_order(running_balance_after=10000.0),  # Oldest (highest)
+        # 3 realized losses (gain_loss < 0), newest first.
+        gains = [
+            create_mock_realized_gain(gain_loss=-30.0),
+            create_mock_realized_gain(gain_loss=-20.0),
+            create_mock_realized_gain(gain_loss=-10.0),
         ]
-        mock_orders_result = AsyncMock()
-        mock_orders_result.scalars = Mock(return_value=Mock(all=Mock(return_value=orders)))
+        mock_gains_result = AsyncMock()
+        mock_gains_result.scalars = Mock(return_value=Mock(all=Mock(return_value=gains)))
 
-        # Only bot + orders are queried now (no rotation-count query).
+        # Only bot + realized_gains are queried (no rotation-count query).
         mock_session.execute.side_effect = [
             mock_bot_result,
-            mock_orders_result,
+            mock_gains_result,
         ]
 
         # Act
@@ -710,15 +717,14 @@ class TestConsecutiveLosses:
         mock_bot_result = AsyncMock()
         mock_bot_result.scalar_one_or_none = Mock(return_value=bot)
 
-        orders = [
-            create_mock_order(running_balance_after=9700.0),
-            create_mock_order(running_balance_after=9800.0),
-            create_mock_order(running_balance_after=9900.0),
-            create_mock_order(running_balance_after=10000.0),
+        gains = [
+            create_mock_realized_gain(gain_loss=-30.0),
+            create_mock_realized_gain(gain_loss=-20.0),
+            create_mock_realized_gain(gain_loss=-10.0),
         ]
-        mock_orders_result = AsyncMock()
-        mock_orders_result.scalars = Mock(return_value=Mock(all=Mock(return_value=orders)))
-        mock_session.execute.side_effect = [mock_bot_result, mock_orders_result]
+        mock_gains_result = AsyncMock()
+        mock_gains_result.scalars = Mock(return_value=Mock(all=Mock(return_value=gains)))
+        mock_session.execute.side_effect = [mock_bot_result, mock_gains_result]
 
         count, result = await risk_service.check_consecutive_losses(
             bot_id=1, threshold=3
@@ -738,17 +744,15 @@ class TestConsecutiveLosses:
         mock_bot_result = AsyncMock()
         mock_bot_result.scalar_one_or_none = Mock(return_value=bot)
 
-        # Mock 2 consecutive losses (below threshold of 3)
-        # Need 3 orders to get 2 consecutive losses
-        orders = [
-            create_mock_order(running_balance_after=9800.0),  # Most recent
-            create_mock_order(running_balance_after=9900.0),
-            create_mock_order(running_balance_after=10000.0),  # Oldest
+        # 2 consecutive losses (below threshold of 3)
+        gains = [
+            create_mock_realized_gain(gain_loss=-20.0),
+            create_mock_realized_gain(gain_loss=-10.0),
         ]
-        mock_orders_result = AsyncMock()
-        mock_orders_result.scalars = Mock(return_value=Mock(all=Mock(return_value=orders)))
+        mock_gains_result = AsyncMock()
+        mock_gains_result.scalars = Mock(return_value=Mock(all=Mock(return_value=gains)))
 
-        mock_session.execute.side_effect = [mock_bot_result, mock_orders_result]
+        mock_session.execute.side_effect = [mock_bot_result, mock_gains_result]
 
         # Act
         count, result = await risk_service.check_consecutive_losses(
@@ -773,20 +777,19 @@ class TestConsecutiveLosses:
         mock_bot_result = AsyncMock()
         mock_bot_result.scalar_one_or_none = Mock(return_value=bot)
 
-        # Mock 3 consecutive losses (4 orders for 3 comparisons)
-        orders = [
-            create_mock_order(running_balance_after=9700.0),
-            create_mock_order(running_balance_after=9800.0),
-            create_mock_order(running_balance_after=9900.0),
-            create_mock_order(running_balance_after=10000.0),
+        # 3 realized losses.
+        gains = [
+            create_mock_realized_gain(gain_loss=-30.0),
+            create_mock_realized_gain(gain_loss=-20.0),
+            create_mock_realized_gain(gain_loss=-10.0),
         ]
-        mock_orders_result = AsyncMock()
-        mock_orders_result.scalars = Mock(return_value=Mock(all=Mock(return_value=orders)))
+        mock_gains_result = AsyncMock()
+        mock_gains_result.scalars = Mock(return_value=Mock(all=Mock(return_value=gains)))
 
-        # Exactly two queries: bot, then orders. No third (rotation-count) query.
+        # Exactly two queries: bot, then realized_gains. No third (rotation-count) query.
         mock_session.execute.side_effect = [
             mock_bot_result,
-            mock_orders_result,
+            mock_gains_result,
         ]
 
         # Act
@@ -826,22 +829,17 @@ class TestConsecutiveLosses:
         mock_bot_result = AsyncMock()
         mock_bot_result.scalar_one_or_none = Mock(return_value=bot)
 
-        # Orders DESC (most recent first):
-        # Most recent: 10100 (win compared to 10000)
-        # Then: 10000
-        # Then: 9900 (loss compared to 10000)
-        # Oldest: 10000
-        # Should count 0 losses because most recent trade was a win
-        orders = [
-            create_mock_order(running_balance_after=10100.0),  # Most recent - WIN
-            create_mock_order(running_balance_after=10000.0),
-            create_mock_order(running_balance_after=9900.0),
-            create_mock_order(running_balance_after=10000.0),
+        # Most recent exit was a win (gain_loss > 0); previous two were losses.
+        # Counter must be 0 because the streak breaks immediately at the newest gain.
+        gains = [
+            create_mock_realized_gain(gain_loss=15.0),   # Most recent - WIN
+            create_mock_realized_gain(gain_loss=-20.0),  # Loss before it
+            create_mock_realized_gain(gain_loss=-10.0),  # Loss before that
         ]
-        mock_orders_result = AsyncMock()
-        mock_orders_result.scalars = Mock(return_value=Mock(all=Mock(return_value=orders)))
+        mock_gains_result = AsyncMock()
+        mock_gains_result.scalars = Mock(return_value=Mock(all=Mock(return_value=gains)))
 
-        mock_session.execute.side_effect = [mock_bot_result, mock_orders_result]
+        mock_session.execute.side_effect = [mock_bot_result, mock_gains_result]
 
         # Act
         count, result = await risk_service.check_consecutive_losses(bot_id=1)
@@ -1218,24 +1216,23 @@ class TestEdgeCases:
         assert "percent" in result.reason.lower()
 
     @pytest.mark.asyncio
-    async def test_consecutive_losses_ignores_orders_without_balance(
+    async def test_consecutive_losses_zero_when_no_realized_gains(
         self, risk_service, mock_session
     ):
-        """Test consecutive losses ignores orders without running_balance_after."""
+        """No realized gains (e.g. BUY-only strategy) → 0 consecutive losses.
+
+        This replaces the old test that checked orders without running_balance_after.
+        The new algorithm reads realized_gains; an empty result set means the bot
+        has never closed a position, so the counter stays at 0."""
         # Arrange
         bot = create_mock_bot()
         mock_bot_result = AsyncMock()
         mock_bot_result.scalar_one_or_none = Mock(return_value=bot)
 
-        # Orders without balance tracking
-        orders = [
-            create_mock_order(running_balance_after=None),
-            create_mock_order(running_balance_after=None),
-        ]
-        mock_orders_result = AsyncMock()
-        mock_orders_result.scalars = Mock(return_value=Mock(all=Mock(return_value=orders)))
+        mock_gains_result = AsyncMock()
+        mock_gains_result.scalars = Mock(return_value=Mock(all=Mock(return_value=[])))
 
-        mock_session.execute.side_effect = [mock_bot_result, mock_orders_result]
+        mock_session.execute.side_effect = [mock_bot_result, mock_gains_result]
 
         # Act
         count, result = await risk_service.check_consecutive_losses(bot_id=1)
