@@ -1026,9 +1026,9 @@ class TradingEngine:
 
         RISK CONTROLS:
         1. Max drawdown kill switch (% of initial capital)
-        2. ATR distance kill switch (price escapes grid range)
+        2. ATR distance kill switch (price escapes grid range — hard stop)
         3. Regime gating (only operates in trend_flat + volatility_normal)
-        4. Re-centering logic when price escapes range
+        4. Soft re-centering when price drifts >50% of grid half-range (no cooldown)
 
         CRITICAL: All logic operates on AGGREGATED PSEUDO-BARS, not tick data.
         Bar interval defines time granularity (default: 60 seconds per bar).
@@ -1036,22 +1036,24 @@ class TradingEngine:
         Parameters:
             bar_interval_seconds: Seconds per bar for aggregation (default: 60)
             grid_count: Total grid levels (default: 10, long-biased split: 7 buy / 3 sell)
-            grid_spacing_percent: Spacing between adjacent levels % (default: 1.0)
-            range_percent: Total grid range % from center (default: 10)
+            atr_range_multiplier: Total grid span = ATR × this value (default: 8.0).
+                Spacing is derived as (ATR × multiplier) / grid_count so the grid
+                automatically widens in high volatility and narrows when calm.
+            atr_warmup_spacing_pct: Fixed % spacing used before ATR warms up (default: 0.5)
             base_order_size_percent: Base order size % of budget (default: 5)
             depth_multiplier: Multiplier for deeper levels (default: 1.5, convex sizing)
             max_drawdown_percent: Max drawdown % before kill (default: 15)
-            kill_atr_multiplier: ATR distance for kill switch (default: 3.0)
-            atr_period: ATR period for kill switch (default: 14 bars)
+            kill_atr_multiplier: ATR distance multiplier for hard kill switch (default: 3.0)
+            atr_period: ATR period for spacing and kill switch (default: 14 bars)
             regime_filter_enabled: Enable regime gating (default: True)
-            allowed_regimes: Allowed regimes (default: ["trend_flat", "volatility_normal"])
-            cooldown_after_kill_hours: Hours to wait after kill switch (default: 2)
+            allowed_regimes: Allowed regimes (default: ["trend_flat", "volatility_medium"])
+            cooldown_after_kill_hours: Hours to wait after hard kill switch (default: 2)
         """
         # === PARAMETER EXTRACTION ===
         bar_interval_seconds = params.get("bar_interval_seconds", 60)
         grid_count = params.get("grid_count", 10)
-        grid_spacing_pct = params.get("grid_spacing_percent", 0.3) / 100
-        range_pct = params.get("range_percent", 10) / 100
+        atr_range_multiplier = params.get("atr_range_multiplier", 8.0)
+        atr_warmup_spacing_pct = params.get("atr_warmup_spacing_pct", 0.5) / 100
         base_order_size_pct = params.get("base_order_size_percent", 5) / 100
         depth_multiplier = params.get("depth_multiplier", 1.5)
         max_drawdown_pct = params.get("max_drawdown_percent", 15) / 100
@@ -1097,6 +1099,11 @@ class TradingEngine:
                 "kill_switch_count": 0,  # Number of times kill switch has fired
                 # ATR LOCKING (refreshed on recenter)
                 "atr_at_recenter": None,  # ATR value captured at last recenter
+                # DYNAMIC SPACING DIAGNOSTICS
+                "current_atr": None,
+                "current_grid_range": None,
+                "current_grid_spacing": None,
+                "atr_spacing": None,  # spacing value used to build current grid levels
             })
             logger.info(
                 f"Bot {bot.id}: Adaptive Grid initialized - "
@@ -1212,10 +1219,45 @@ class TradingEngine:
                     reason=f"Grid: Paused (regime={regime_names}, need flat/normal markets)"
                 )
 
-        # === CALCULATE ATR (for kill switch) ===
+        # === CALCULATE ATR (drives both spacing and kill switch) ===
         atr = None
         if len(completed_bars) >= atr_period:
             atr = self.calculate_atr_proxy(completed_bars, atr_period)
+
+        # === DYNAMIC GRID SPACING (ATR-based, recomputed every bar) ===
+        center_price = state["center_price"]
+        if atr is not None and atr > 0:
+            grid_range = atr * atr_range_multiplier      # total span ($)
+            grid_spacing = grid_range / grid_count        # $ between adjacent levels
+        else:
+            # Warmup: not enough bars for ATR yet — use fixed % fallback
+            grid_spacing = center_price * atr_warmup_spacing_pct
+            grid_range = grid_spacing * grid_count
+
+        grid_half_range = grid_range / 2.0  # each side extends this far from center
+
+        # Update diagnostic state every bar
+        state["current_atr"] = atr
+        state["current_grid_range"] = grid_range
+        state["current_grid_spacing"] = grid_spacing
+
+        # === SOFT RECENTER (no cooldown — gentle drift correction) ===
+        # When price moves more than 50% of the half-range from center, shift
+        # the grid to the new price. This fires before the hard kill switch so
+        # normal trending sessions don't trigger unnecessary cooldowns.
+        distance_from_center = abs(bar_close_price - center_price)
+        if distance_from_center > grid_half_range * 0.5:
+            old_center = center_price
+            state["center_price"] = bar_close_price
+            center_price = bar_close_price
+            state["grid_levels"] = {}  # cleared so grid is rebuilt below
+            state["last_recenter_time"] = now
+            logger.info(
+                f"Bot {bot.id}: Grid SOFT RECENTER - price ${bar_close_price:.2f} "
+                f"drifted {distance_from_center:.2f} from center ${old_center:.2f} "
+                f"(threshold {grid_half_range * 0.5:.2f} = 50% half-range). "
+                f"ATR={f'{atr:.2f}' if atr else 'n/a'}, spacing=${grid_spacing:.2f}"
+            )
 
         # === TELEMETRY METRICS (track portfolio performance) ===
         # Calculate current portfolio value (virtual wallet concept)
@@ -1266,8 +1308,9 @@ class TradingEngine:
                 reason=f"Grid: Kill switch (drawdown {drawdown*100:.1f}%), {cooldown_after_kill_hours}h cooldown"
             )
 
-        # === KILL SWITCH 2: ATR DISTANCE (range escape with re-centering) ===
-        center_price = state["center_price"]
+        # === KILL SWITCH 2: ATR DISTANCE (hard stop — soft recenter fires first) ===
+        # After a soft recenter, distance_from_center resets to 0, so this kill
+        # only fires when price moves faster than the soft recenter can react.
         if atr is not None:
             atr_distance = abs(bar_close_price - center_price)
             kill_distance = atr * kill_atr_mult
@@ -1307,23 +1350,30 @@ class TradingEngine:
                 reason="Grid: Already traded this bar (one order per bar limit)"
             )
 
-        # === CALCULATE GRID LEVELS (if not set or needs refresh) ===
-        if not state["grid_levels"]:
+        # === CALCULATE GRID LEVELS (ATR-based; rebuild when spacing changes >10%) ===
+        stored_spacing = state.get("atr_spacing")
+        spacing_changed = (
+            stored_spacing is not None
+            and stored_spacing > 0
+            and abs(grid_spacing - stored_spacing) / stored_spacing > 0.10
+        )
+
+        if not state["grid_levels"] or spacing_changed:
             grid_levels = {}
 
             # Create buy levels (below center, long-biased)
             for i in range(1, buy_levels + 1):
-                level_price = center_price * (1 - grid_spacing_pct * i)
+                level_price = center_price - grid_spacing * i
                 grid_levels[-i] = {
                     "price": level_price,
                     "side": "buy",
                     "filled": False,
-                    "depth": i,  # Track depth for sizing
+                    "depth": i,
                 }
 
             # Create sell levels (above center)
             for i in range(1, sell_levels + 1):
-                level_price = center_price * (1 + grid_spacing_pct * i)
+                level_price = center_price + grid_spacing * i
                 grid_levels[i] = {
                     "price": level_price,
                     "side": "sell",
@@ -1332,11 +1382,23 @@ class TradingEngine:
                 }
 
             state["grid_levels"] = grid_levels
-            logger.info(
-                f"Bot {bot.id}: Grid levels created - "
-                f"{buy_levels} buy levels below ${center_price:.2f}, "
-                f"{sell_levels} sell levels above"
-            )
+            state["atr_spacing"] = grid_spacing
+
+            if spacing_changed:
+                logger.info(
+                    f"Bot {bot.id}: Grid RECOMPUTED — ATR spacing changed "
+                    f"${stored_spacing:.2f} → ${grid_spacing:.2f} "
+                    f"({(grid_spacing - stored_spacing) / stored_spacing * 100:+.1f}%). "
+                    f"New: {buy_levels} buy / {sell_levels} sell levels at "
+                    f"center ${center_price:.2f}, ATR ${f'{atr:.2f}' if atr else 'warmup'}"
+                )
+            else:
+                logger.info(
+                    f"Bot {bot.id}: Grid levels created (ATR-based) — "
+                    f"center=${center_price:.2f}, ATR=${f'{atr:.2f}' if atr else 'warmup'}, "
+                    f"range=${grid_range:.2f}, spacing=${grid_spacing:.2f}, "
+                    f"{buy_levels} buy / {sell_levels} sell levels"
+                )
 
         # === FIND NEAREST UNFILLED LEVEL ===
         grid_levels = state["grid_levels"]
@@ -1373,16 +1435,24 @@ class TradingEngine:
             buy_gap = (
                 f"{(bar_close_price - nearest_buy)/bar_close_price*100:+.2f}%"
                 if nearest_buy else "n/a")
+            atr_str = f"${atr:.2f}" if atr else "warmup"
             logger.info(
                 f"Bot {bot.id}: Grid no-trade diag - close=${bar_close_price:.2f} "
-                f"center=${center_price:.2f} nearest_buy=${nearest_buy or 0:.2f} "
-                f"(price {buy_gap} vs nearest buy) virtual_cash=${state['virtual_cash']:.2f} "
+                f"center=${center_price:.2f} spacing=${grid_spacing:.2f} "
+                f"ATR={atr_str} range=${grid_range:.2f} "
+                f"nearest_buy=${nearest_buy or 0:.2f} (price {buy_gap} vs nearest buy) "
+                f"virtual_cash=${state['virtual_cash']:.2f} "
                 f"virtual_crypto={state['virtual_crypto']:.6f}"
             )
+            nearest_buy_str = f"${nearest_buy:.2f}" if nearest_buy else "none"
             return TradeSignal(
                 action="hold",
                 amount=0,
-                reason="Grid: No levels triggered this bar"
+                reason=(
+                    f"Grid: No levels triggered "
+                    f"(spacing=${grid_spacing:.2f}, ATR={atr_str}, "
+                    f"nearest_buy={nearest_buy_str})"
+                )
             )
 
         # === EXECUTE ORDER AT NEAREST LEVEL ===
@@ -1396,6 +1466,16 @@ class TradingEngine:
             initial_capital * base_order_size_pct * size_multiplier,
             bot.current_balance * _BUY_BALANCE_FRACTION,  # never exceed real funds
         )
+
+        if order_size_usd < MIN_ORDER_USD:
+            return TradeSignal(
+                action="hold",
+                amount=0,
+                reason=(
+                    f"Grid: Order ${order_size_usd:.2f} below minimum ${MIN_ORDER_USD} "
+                    f"(increase budget or base_order_size_percent)"
+                )
+            )
 
         if level_data["side"] == "buy":
             # === BUY ORDER (accumulate crypto) ===

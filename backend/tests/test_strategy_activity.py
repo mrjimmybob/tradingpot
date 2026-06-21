@@ -208,14 +208,13 @@ class TestFundingCarryRegimeDefault:
 # ---------------------------------------------------------------------------
 
 class TestAdaptiveGridSpacing:
-    """With default grid_spacing_percent=0.3, a 0.3% move from center must
-    trigger a level crossing and produce a buy or sell signal."""
+    """ATR-based adaptive grid: spacing = (ATR × atr_range_multiplier) / grid_count.
+    A move that crosses the first level must produce a buy/sell signal."""
 
-    def test_default_grid_spacing_is_0_3_percent(self):
-        # The default value is read via params.get("grid_spacing_percent", 0.3)
+    def test_default_atr_range_multiplier_is_8(self):
         params: dict = {}
-        spacing = params.get("grid_spacing_percent", 0.3)
-        assert spacing == 0.3
+        multiplier = params.get("atr_range_multiplier", 8.0)
+        assert multiplier == 8.0
 
     @pytest.mark.asyncio
     async def test_sell_level_triggered_after_small_upward_move(self):
@@ -295,15 +294,18 @@ class TestAdaptiveGridSpacing:
 
     @pytest.mark.asyncio
     async def test_buy_level_triggered_after_small_downward_move(self):
-        """A bar closing 0.35% below center must cross the first buy level."""
+        """A bar closing below the ATR-derived L1 buy level must produce a buy.
+
+        Budget is $2000 so that 5% base order size ($100) clears the $10 minimum.
+        """
         engine = _engine()
 
         bot = MagicMock()
         bot.id = 78
         bot.strategy = "adaptive_grid"
         bot.trading_pair = "BTC/USDT"
-        bot.current_balance = 100.0
-        bot.budget = 100.0
+        bot.current_balance = 2000.0
+        bot.budget = 2000.0
 
         session = AsyncMock()
         session.execute = AsyncMock(return_value=MagicMock(
@@ -323,8 +325,8 @@ class TestAdaptiveGridSpacing:
             bot.id: {
                 "initialized": True,
                 "center_price": center_price,
-                "initial_capital": 100.0,
-                "virtual_cash": 100.0,
+                "initial_capital": 2000.0,
+                "virtual_cash": 2000.0,
                 "virtual_crypto": 0.0,
                 "grid_levels": {},
                 "last_bar_close_time": None,
