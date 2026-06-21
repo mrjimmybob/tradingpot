@@ -73,6 +73,9 @@ def make_engine(bot, rates, positions=None, history=None):
 
 
 FLAT_HISTORY = [100.0] * 60
+# Steep downtrend (−1 per tick × 60 ticks): clearly below the −0.5% EMA slope
+# threshold that _detect_market_regime uses for trend_down.
+DOWN_HISTORY = [100.0 - i for i in range(250)]
 
 
 # ============================================================================
@@ -173,7 +176,27 @@ class TestSignals:
         assert "outside favourable band" in signal.reason
 
     @pytest.mark.asyncio
-    async def test_no_entry_when_trend_unfavourable(self):
+    async def test_no_entry_when_trend_downtrend(self):
+        """Funding Carry must still block entry during a downtrend.
+
+        The default allowed_regimes is now ["trend_up", "trend_flat"] so flat
+        markets allow participation.  A downtrend (trend_down) must still be
+        blocked because it is not in the allowed list.
+        """
+        bot = make_bot()
+        engine = make_engine(
+            bot, rates=[0.0001, 0.0001, 0.0001], history=DOWN_HISTORY
+        )
+
+        signal = await engine._strategy_funding_carry(bot, DOWN_HISTORY[-1], bot.strategy_params, None)
+
+        assert signal.action == "hold"
+        assert "regime" in signal.reason
+
+    @pytest.mark.asyncio
+    async def test_entry_allowed_in_flat_regime_with_favourable_funding(self):
+        """trend_flat is now included in the default allowed_regimes so the
+        strategy can participate during sideways BTC markets with good funding."""
         bot = make_bot()
         engine = make_engine(
             bot, rates=[0.0001, 0.0001, 0.0001], history=FLAT_HISTORY
@@ -181,8 +204,9 @@ class TestSignals:
 
         signal = await engine._strategy_funding_carry(bot, 100.0, bot.strategy_params, None)
 
-        assert signal.action == "hold"
-        assert "regime" in signal.reason
+        assert signal.action == "buy", (
+            f"Expected buy in flat regime with favourable funding; got: {signal.reason}"
+        )
 
     @pytest.mark.asyncio
     async def test_hold_when_funding_data_unavailable(self):

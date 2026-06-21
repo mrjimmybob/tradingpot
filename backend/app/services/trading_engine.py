@@ -1050,7 +1050,7 @@ class TradingEngine:
         # === PARAMETER EXTRACTION ===
         bar_interval_seconds = params.get("bar_interval_seconds", 60)
         grid_count = params.get("grid_count", 10)
-        grid_spacing_pct = params.get("grid_spacing_percent", 1.0) / 100
+        grid_spacing_pct = params.get("grid_spacing_percent", 0.3) / 100
         range_pct = params.get("range_percent", 10) / 100
         base_order_size_pct = params.get("base_order_size_percent", 5) / 100
         depth_multiplier = params.get("depth_multiplier", 1.5)
@@ -1555,7 +1555,7 @@ class TradingEngine:
         # Get parameters
         bar_interval_seconds = params.get("bar_interval_seconds", 60)
         period = params.get("bollinger_period", 20)
-        std_mult = params.get("bollinger_std", 2.0)
+        std_mult = params.get("bollinger_std", 1.8)
         atr_period = params.get("atr_period", 14)
         atr_stop_mult = params.get("atr_stop_multiplier", 2.0)
         max_hold_bars = params.get("max_hold_bars", 10)
@@ -2088,7 +2088,7 @@ class TradingEngine:
             cooldown_seconds: Seconds to wait after exit before re-entry (default: 300)
         """
         short_period = params.get("short_period", 50)
-        long_period = params.get("long_period", 200)
+        long_period = params.get("long_period", 100)
         atr_period = params.get("atr_period", 14)
         atr_multiplier = params.get("atr_multiplier", 2.0)
         risk_percent = params.get("risk_percent", 1.0) / 100
@@ -2493,7 +2493,7 @@ class TradingEngine:
         min_funding = params.get("min_funding_rate", -0.0005)
         max_funding = params.get("max_funding_rate", 0.0005)
         lookback = int(params.get("funding_lookback_periods", 3))
-        allowed_regimes = params.get("allowed_regimes", ["trend_up"])
+        allowed_regimes = params.get("allowed_regimes", ["trend_up", "trend_flat"])
         max_alloc = params.get("max_allocation_percent", 20.0) / 100.0
         cooldown_seconds = params.get("cooldown_seconds", 300)
         refresh_seconds = params.get("funding_refresh_seconds", 300)
@@ -2681,10 +2681,10 @@ class TradingEngine:
         compression_method = params.get("compression_method", "bb_width")
         compression_percentile = params.get("compression_percentile", 20)
         atr_threshold_mult = params.get("atr_threshold_multiplier", 0.8)
-        min_compression_bars = params.get("min_compression_bars", 20)  # SPARSE: was 5
+        min_compression_bars = params.get("min_compression_bars", 5)
         atr_stop_mult = params.get("atr_stop_multiplier", 2.0)
         risk_percent = params.get("risk_percent", 1.0) / 100
-        cooldown_hours = params.get("cooldown_hours", 72)  # SPARSE: was 24
+        cooldown_hours = params.get("cooldown_hours", 24)
         failed_breakout_bars = params.get("failed_breakout_bars", 3)
         regime_filter_enabled = params.get("regime_filter_enabled", True)
         allowed_regimes = params.get("allowed_regimes", ["volatility_expanding"])
@@ -3446,6 +3446,11 @@ class TradingEngine:
             auto_state["current_strategy"] = selected_strategy
             auto_state["last_switch_time"] = now.isoformat()
             current_strategy = selected_strategy
+            # Record activation time so inactivity penalty has a baseline
+            if current_strategy not in strategy_metrics:
+                strategy_metrics[current_strategy] = {}
+            strategy_metrics[current_strategy]["activated_at"] = now.isoformat()
+            auto_state["strategy_metrics"] = strategy_metrics
         else:
             logger.debug(f"Bot {bot.id}: Auto Mode HOLDING {current_strategy} ({switch_reason})")
 
@@ -3487,6 +3492,14 @@ class TradingEngine:
             # Add auto mode context to reason
             regime_str = f"{current_regime['trend_state']}/{current_regime['volatility_state']}/{current_regime['liquidity_state']}"
             signal.reason = f"[Auto:{current_strategy}|{regime_str}] {signal.reason}"
+
+            # Record last trade time for inactivity penalty tracking
+            if signal.action in ("buy", "sell"):
+                if current_strategy not in strategy_metrics:
+                    strategy_metrics[current_strategy] = {}
+                strategy_metrics[current_strategy]["last_trade_time"] = now.isoformat()
+                auto_state["strategy_metrics"] = strategy_metrics
+                self._save_auto_state(bot.id, auto_state)
 
         return signal
 
@@ -3812,6 +3825,24 @@ class TradingEngine:
                     risk_penalty += 3.0  # Heavy penalty if exited < 1h ago
                 elif hours_since_exit < 6:
                     risk_penalty += 1.0  # Moderate penalty if exited < 6h ago
+            except (ValueError, TypeError):
+                pass
+
+        # Inactivity penalty: a strategy that produces no trades while selected
+        # loses score at 0.15 priority/hour after a 2-hour grace period (capped
+        # at -4.0). This prevents auto mode from parking indefinitely on an
+        # eligible but non-participating strategy. last_trade_time is set each
+        # time the sub-strategy returns a buy/sell; activated_at is set on
+        # strategy switch. The baseline is the more recent of the two.
+        last_trade_str = strategy_metrics.get("last_trade_time")
+        activated_str = strategy_metrics.get("activated_at")
+        baseline_str = last_trade_str or activated_str
+        if baseline_str:
+            try:
+                baseline_dt = datetime.fromisoformat(baseline_str)
+                hours_inactive = (datetime.utcnow() - baseline_dt).total_seconds() / 3600
+                if hours_inactive > 2.0:
+                    risk_penalty += min((hours_inactive - 2.0) * 0.15, 4.0)
             except (ValueError, TypeError):
                 pass
 
