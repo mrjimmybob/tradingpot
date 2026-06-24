@@ -15,6 +15,7 @@ class BotStatus(str, Enum):
     RUNNING = "running"
     PAUSED = "paused"
     STOPPED = "stopped"
+    RECOVERY_MODE = "recovery_mode"  # paper-trading after consecutive losses
 
 
 class Bot(Base):

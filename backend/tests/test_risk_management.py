@@ -667,14 +667,13 @@ class TestConsecutiveLosses:
     """Tests for consecutive loss detection."""
 
     @pytest.mark.asyncio
-    async def test_consecutive_losses_pauses_fixed_strategy_bot(
+    async def test_consecutive_losses_enters_recovery_mode(
         self, risk_service, mock_session
     ):
-        """Consecutive losses PAUSE a fixed-strategy bot (P0: rotation removed).
+        """Consecutive losses trigger RECOVERY_MODE (not PAUSE) for fixed-strategy bots.
 
-        Previously this returned ROTATE_STRATEGY, which corrupted the bot's
-        configured strategy. Fixed-strategy bots are now paused instead, and the
-        rotation count is never consulted."""
+        The bot continues running and paper-trades until recovery criteria are met.
+        The rotation count is never consulted and the strategy is never mutated."""
         # Arrange
         bot = create_mock_bot(max_strategy_rotations=3, strategy="dca_accumulator")
         mock_bot_result = AsyncMock()
@@ -702,8 +701,9 @@ class TestConsecutiveLosses:
 
         # Assert
         assert count == 3
-        assert result.action == RiskAction.PAUSE_BOT
+        assert result.action == RiskAction.ENTER_RECOVERY_MODE
         assert "consecutive losses" in result.reason
+        assert "recovery mode" in result.reason.lower()
         # Strategy must be untouched by the risk check.
         assert bot.strategy == "dca_accumulator"
 
@@ -765,10 +765,10 @@ class TestConsecutiveLosses:
         assert "Within consecutive loss threshold" in result.reason
 
     @pytest.mark.asyncio
-    async def test_consecutive_losses_pause_does_not_consult_rotations(
+    async def test_consecutive_losses_recovery_does_not_consult_rotations(
         self, risk_service, mock_session
     ):
-        """A fixed-strategy bot pauses on consecutive losses WITHOUT ever
+        """A fixed-strategy bot enters RECOVERY_MODE on consecutive losses WITHOUT ever
         querying or referencing the rotation count (the rotation machinery is
         gone for fixed bots, so the old "Max strategy rotations reached" path no
         longer exists)."""
@@ -799,7 +799,7 @@ class TestConsecutiveLosses:
 
         # Assert
         assert count == 3
-        assert result.action == RiskAction.PAUSE_BOT
+        assert result.action == RiskAction.ENTER_RECOVERY_MODE
         assert "Max strategy rotations reached" not in result.reason
         assert mock_session.execute.call_count == 2  # no rotation-count query
 
@@ -847,6 +847,97 @@ class TestConsecutiveLosses:
         # Assert
         assert count == 0  # Win breaks the streak immediately
         assert result.action == RiskAction.CONTINUE
+
+
+# ============================================================================
+# Test Class: Recovery Mode Exit Criteria
+# ============================================================================
+
+
+class TestRecoveryExitCriteria:
+    """Unit tests for RiskManagementService.check_recovery_exit."""
+
+    def _trade(self, gain_loss_usd: float) -> dict:
+        return {"gain_loss_usd": gain_loss_usd, "win": gain_loss_usd > 0}
+
+    def test_two_consecutive_wins_exit(self):
+        """2 consecutive paper wins immediately trigger exit."""
+        trades = [self._trade(-10), self._trade(5), self._trade(8)]
+        ok, reason = RiskManagementService.check_recovery_exit(
+            paper_trades=trades, consecutive_paper_wins=2
+        )
+        assert ok
+        assert "consecutive" in reason
+
+    def test_one_consecutive_win_not_enough(self):
+        """1 consecutive win is insufficient when last-5 criteria also not met."""
+        trades = [self._trade(-10), self._trade(-8), self._trade(5)]
+        ok, _ = RiskManagementService.check_recovery_exit(
+            paper_trades=trades, consecutive_paper_wins=1
+        )
+        assert not ok
+
+    def test_win_rate_60pct_over_last_5(self):
+        """3-of-5 wins (60%) over last 5 trades triggers exit."""
+        trades = [
+            self._trade(-5),
+            self._trade(3),
+            self._trade(4),
+            self._trade(-2),
+            self._trade(6),
+        ]
+        ok, reason = RiskManagementService.check_recovery_exit(
+            paper_trades=trades, consecutive_paper_wins=1
+        )
+        assert ok
+        assert "win rate" in reason
+
+    def test_win_rate_below_60pct_no_exit(self):
+        """2-of-5 wins (40%) does not trigger the win-rate criterion."""
+        trades = [
+            self._trade(-5),
+            self._trade(-3),
+            self._trade(4),
+            self._trade(-2),
+            self._trade(6),
+        ]
+        ok, _ = RiskManagementService.check_recovery_exit(
+            paper_trades=trades, consecutive_paper_wins=1
+        )
+        # Check whether cumulative P&L is also negative to confirm no exit.
+        pnl = sum(t["gain_loss_usd"] for t in trades)
+        if pnl <= 0:
+            assert not ok
+
+    def test_positive_pnl_over_last_5(self):
+        """Positive cumulative P&L over last 5 trades triggers exit."""
+        trades = [
+            self._trade(-2),
+            self._trade(-1),
+            self._trade(8),
+            self._trade(-3),
+            self._trade(5),
+        ]
+        ok, reason = RiskManagementService.check_recovery_exit(
+            paper_trades=trades, consecutive_paper_wins=0
+        )
+        assert ok
+        assert "P&L" in reason
+
+    def test_fewer_than_5_trades_waits(self):
+        """Fewer than 5 paper trades with no consecutive-win streak → no exit."""
+        trades = [self._trade(5), self._trade(8), self._trade(3)]
+        ok, _ = RiskManagementService.check_recovery_exit(
+            paper_trades=trades, consecutive_paper_wins=0
+        )
+        assert not ok
+
+    def test_empty_trades_no_exit(self):
+        """No paper trades yet → no exit."""
+        ok, _ = RiskManagementService.check_recovery_exit(
+            paper_trades=[], consecutive_paper_wins=0
+        )
+        assert not ok
 
 
 # ============================================================================

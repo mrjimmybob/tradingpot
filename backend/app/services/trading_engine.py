@@ -232,6 +232,35 @@ def validate_funding_carry_params(params: dict) -> list:
     return errors
 
 
+class _VirtualPosition:
+    """Lightweight duck-type substitute for a real Position row.
+
+    Used by RECOVERY_MODE so strategies see an open position and produce
+    sensible exit signals instead of triggering infinite BUY loops.
+    """
+
+    def __init__(
+        self,
+        bot_id: int,
+        trading_pair: str,
+        entry_price: float,
+        amount_usd: float,
+    ) -> None:
+        from ..models.position import PositionSide
+        self.id = None
+        self.bot_id = bot_id
+        self.trading_pair = trading_pair
+        self.side = PositionSide.LONG
+        self.entry_price = entry_price
+        # amount in base asset (e.g. BTC), not USD
+        self.amount = amount_usd / entry_price if entry_price > 0 else 0.0
+        self.current_price = entry_price
+        self.unrealized_pnl = 0.0
+
+    def calculate_unrealized_pnl(self) -> float:
+        return (self.current_price - self.entry_price) * self.amount
+
+
 class TradingEngine:
     """Engine for executing trading bots."""
 
@@ -249,6 +278,9 @@ class TradingEngine:
         # Shared ticker cache for dry-run bots: dedupes identical-symbol public
         # API polls across bots in this process (L-C).
         self._shared_ticker_cache: Dict[str, tuple] = {}
+        # Recovery mode state per bot (paper trades, consecutive wins, etc.).
+        # Persisted to bot.strategy_state["recovery_mode"] so it survives restarts.
+        self._recovery_states: Dict[int, dict] = {}
 
     def _make_simulated_exchange(self, budget: float) -> SimulatedExchangeService:
         """Construct a dry-run exchange wired to the shared ticker cache (L-C)."""
@@ -516,9 +548,23 @@ class TradingEngine:
                     result = await session.execute(select(Bot).where(Bot.id == bot_id))
                     bot = result.scalar_one_or_none()
 
-                    if not bot or bot.status != BotStatus.RUNNING:
+                    if not bot or bot.status not in (
+                        BotStatus.RUNNING, BotStatus.RECOVERY_MODE
+                    ):
                         logger.info(f"Bot {bot_id}: No longer running, stopping loop")
                         break
+
+                    # Restore recovery state from persisted storage on first loop
+                    # iteration after a restart (in-memory dict is empty at boot).
+                    if bot.id not in self._recovery_states and bot.status == BotStatus.RECOVERY_MODE:
+                        ss = bot.strategy_state or {}
+                        rm = ss.get("recovery_mode")
+                        if rm and rm.get("active"):
+                            self._recovery_states[bot.id] = rm
+                            logger.info(
+                                f"Bot {bot_id}: Restored RECOVERY_MODE from persisted state "
+                                f"(entered {rm.get('entered_at', 'unknown')})"
+                            )
 
                     # Initialize services
                     wallet = VirtualWalletService(session)
@@ -564,6 +610,32 @@ class TradingEngine:
                         # Get next available strategy
                         new_strategy = await self._get_next_strategy(bot.strategy)
                         await risk_mgr.rotate_strategy(bot_id, new_strategy, risk_assessment.reason)
+
+                    if risk_assessment.action == RiskAction.ENTER_RECOVERY_MODE:
+                        if bot.status != BotStatus.RECOVERY_MODE:
+                            await self._enter_recovery_mode(bot, bot_id, risk_assessment.reason, session)
+                        # Don't break — fall through to paper-trade the strategy signal.
+
+                    # 7-day stale recovery warning (periodic, not every tick)
+                    if bot.status == BotStatus.RECOVERY_MODE:
+                        recovery = self._recovery_states.get(bot.id)
+                        if recovery:
+                            try:
+                                entered_at = datetime.fromisoformat(recovery["entered_at"])
+                                days_stuck = (datetime.utcnow() - entered_at).days
+                                if days_stuck >= 7:
+                                    # Warn roughly once per hour (3600 ticks ≈ 1 hour at 1 Hz)
+                                    ticks_since_entry = int(
+                                        (datetime.utcnow() - entered_at).total_seconds()
+                                    )
+                                    if ticks_since_entry % 3600 < 2:
+                                        logger.warning(
+                                            f"Bot {bot_id}: RECOVERY_MODE has persisted "
+                                            f"for {days_stuck} days — market conditions "
+                                            "may not be recovering. Monitoring continues."
+                                        )
+                            except (KeyError, ValueError):
+                                pass
 
                     # Get exchange service
                     exchange = self._exchange_services.get(bot_id)
@@ -639,8 +711,10 @@ class TradingEngine:
                         # deployment). Sells reduce exposure and must never be
                         # blocked by the budget; they are validated against the
                         # open position inside _execute_trade.
+                        # In RECOVERY_MODE no real capital is spent, so validation
+                        # is bypassed — the paper trade sets its own paper amount.
                         proceed = True
-                        if signal.action == "buy":
+                        if signal.action == "buy" and bot.status != BotStatus.RECOVERY_MODE:
                             validation = await wallet.validate_trade(bot_id, signal.amount)
                             proceed = validation.is_valid
                             if not proceed:
@@ -663,10 +737,17 @@ class TradingEngine:
                                 score=signal.score,
                                 threshold=signal.threshold,
                             )
-                            # Execute trade
-                            await self._execute_trade(
-                                bot, exchange, signal, ticker.last, session
-                            )
+                            if bot.status == BotStatus.RECOVERY_MODE:
+                                # Paper-trade: simulate the order without touching
+                                # the real exchange or committing real capital.
+                                await self._process_paper_trade(
+                                    bot, bot_id, signal, ticker.last, session
+                                )
+                            else:
+                                # Execute trade
+                                await self._execute_trade(
+                                    bot, exchange, signal, ticker.last, session
+                                )
 
                     # C1: Enforce per-position stop-loss on EVERY iteration, not
                     # only after a trade. While the strategy holds, the price-based
@@ -5496,6 +5577,165 @@ class TradingEngine:
         finally:
             self._stop_flags[bot_id] = True
 
+    # ------------------------------------------------------------------
+    # Recovery mode helpers
+    # ------------------------------------------------------------------
+
+    async def _enter_recovery_mode(
+        self, bot, bot_id: int, reason: str, session
+    ) -> None:
+        """Transition a bot into RECOVERY_MODE after consecutive losses.
+
+        Stores recovery state in both the in-memory dict (fast path) and
+        bot.strategy_state (survives a restart).  Does NOT stop the loop.
+        """
+        recovery_state = {
+            "active": True,
+            "entered_at": datetime.utcnow().isoformat(),
+            "trigger_reason": reason,
+            "paper_position": None,
+            "paper_trades": [],
+            "consecutive_paper_wins": 0,
+        }
+        self._recovery_states[bot_id] = recovery_state
+
+        ss = dict(bot.strategy_state or {})
+        ss["recovery_mode"] = recovery_state
+        bot.strategy_state = ss
+        bot.status = BotStatus.RECOVERY_MODE
+        await session.commit()
+
+        logger.warning(
+            f"Bot {bot_id}: Entered RECOVERY_MODE — {reason}. "
+            "All order signals will be paper-traded until recovery criteria are met."
+        )
+        email_service.send_bot_paused_alert(
+            bot_id=bot_id,
+            bot_name=bot.name,
+            reason=f"[RECOVERY MODE] {reason} — paper trading until recovery criteria met",
+            pnl=bot.total_pnl,
+            trading_pair=bot.trading_pair,
+        )
+
+    async def _exit_recovery_mode(
+        self, bot, bot_id: int, reason: str, session
+    ) -> None:
+        """Transition a bot out of RECOVERY_MODE and resume real trading."""
+        self._recovery_states.pop(bot_id, None)
+
+        ss = dict(bot.strategy_state or {})
+        ss.pop("recovery_mode", None)
+        bot.strategy_state = ss
+        bot.status = BotStatus.RUNNING
+        await session.commit()
+
+        logger.info(
+            f"Bot {bot_id}: Exited RECOVERY_MODE — {reason}. Resuming real trading."
+        )
+
+    def _check_recovery_exit(self, recovery_state: dict) -> tuple:
+        """Evaluate recovery exit criteria.  Returns (should_exit, reason_str)."""
+        from .risk_management import RiskManagementService
+        return RiskManagementService.check_recovery_exit(
+            paper_trades=recovery_state.get("paper_trades", []),
+            consecutive_paper_wins=recovery_state.get("consecutive_paper_wins", 0),
+        )
+
+    async def _process_paper_trade(
+        self, bot, bot_id: int, signal, current_price: float, session
+    ) -> None:
+        """Simulate a trade signal as a paper (virtual) trade during RECOVERY_MODE.
+
+        BUY → open paper position (records entry price + amount).
+        SELL → close paper position, compute P&L, evaluate recovery exit criteria.
+        """
+        recovery = self._recovery_states.get(bot_id)
+        if not recovery:
+            logger.warning(f"Bot {bot_id}: _process_paper_trade called but no recovery state")
+            return
+
+        taker_fee_rate = 0.001  # 0.1% per side
+
+        if signal.action == "buy":
+            if recovery.get("paper_position") is None:
+                amount_usd = signal.amount or (bot.current_balance * 0.10)
+                recovery["paper_position"] = {
+                    "entry_price": current_price,
+                    "amount_usd": amount_usd,
+                    "trading_pair": bot.trading_pair,
+                    "entered_at": datetime.utcnow().isoformat(),
+                }
+                logger.info(
+                    f"Bot {bot_id}: [PAPER] BUY @ {current_price:.4f} "
+                    f"(notional ${amount_usd:.2f})"
+                )
+            # Already in a paper position — ignore duplicate buy signals.
+
+        elif signal.action == "sell":
+            pp = recovery.get("paper_position")
+            if pp is None:
+                return  # No open paper position to close.
+
+            entry_price = pp["entry_price"]
+            amount_usd = pp["amount_usd"]
+            gross_return_pct = (current_price / entry_price - 1.0)
+            fees = amount_usd * taker_fee_rate * 2  # entry + exit
+            gain_loss_usd = amount_usd * gross_return_pct - fees
+            win = gain_loss_usd > 0
+
+            trade_record = {
+                "gain_loss_usd": gain_loss_usd,
+                "win": win,
+                "entry_price": entry_price,
+                "exit_price": current_price,
+                "timestamp": datetime.utcnow().isoformat(),
+            }
+            recovery["paper_trades"].append(trade_record)
+
+            if win:
+                recovery["consecutive_paper_wins"] = recovery.get("consecutive_paper_wins", 0) + 1
+            else:
+                recovery["consecutive_paper_wins"] = 0
+
+            recovery["paper_position"] = None
+
+            logger.info(
+                f"Bot {bot_id}: [PAPER] SELL @ {current_price:.4f} "
+                f"(P&L ${gain_loss_usd:+.2f}, win={win}, "
+                f"consecutive_wins={recovery['consecutive_paper_wins']})"
+            )
+
+            # Persist updated state before potentially exiting recovery.
+            ss = dict(bot.strategy_state or {})
+            ss["recovery_mode"] = recovery
+            bot.strategy_state = ss
+            await session.commit()
+
+            # Evaluate exit criteria.
+            should_exit, exit_reason = self._check_recovery_exit(recovery)
+            if should_exit:
+                await self._exit_recovery_mode(bot, bot_id, exit_reason, session)
+                return
+
+            # Warn if stuck > 7 days.
+            try:
+                entered_at = datetime.fromisoformat(recovery["entered_at"])
+                days_stuck = (datetime.utcnow() - entered_at).days
+                if days_stuck >= 7:
+                    logger.warning(
+                        f"Bot {bot_id}: RECOVERY_MODE for {days_stuck} days — "
+                        f"still monitoring. Criteria: {exit_reason}"
+                    )
+            except (KeyError, ValueError):
+                pass
+            return
+
+        # Persist state for buy path too.
+        ss = dict(bot.strategy_state or {})
+        ss["recovery_mode"] = recovery
+        bot.strategy_state = ss
+        await session.commit()
+
     async def _record_trade_outcome(
         self, bot, reason_key: Optional[str], reason_text: str = ""
     ) -> None:
@@ -6143,11 +6383,37 @@ class TradingEngine:
         bot_id: int,
         session: AsyncSession,
     ) -> list:
-        """Get all positions for a bot."""
+        """Get all positions for a bot.
+
+        In RECOVERY_MODE, if the paper-trade state holds an open position, a
+        lightweight virtual Position substitute is prepended so strategies see a
+        held position and produce sensible exit signals (otherwise they would
+        issue an infinite stream of BUY signals against an empty position list).
+        """
         result = await session.execute(
             select(Position).where(Position.bot_id == bot_id)
         )
-        return result.scalars().all()
+        real_positions = list(result.scalars().all())
+
+        recovery = self._recovery_states.get(bot_id)
+        if recovery and recovery.get("active") and recovery.get("paper_position"):
+            pp = recovery["paper_position"]
+            # Retrieve the bot's trading pair from the first real position if
+            # available, otherwise fall back to recovery state or skip.
+            trading_pair = pp.get("trading_pair", "")
+            if not trading_pair and real_positions:
+                trading_pair = real_positions[0].trading_pair
+
+            if trading_pair:
+                virt = _VirtualPosition(
+                    bot_id=bot_id,
+                    trading_pair=trading_pair,
+                    entry_price=pp["entry_price"],
+                    amount_usd=pp["amount_usd"],
+                )
+                return [virt] + real_positions
+
+        return real_positions
 
     async def _get_last_order(
         self,

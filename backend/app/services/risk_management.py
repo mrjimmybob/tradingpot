@@ -22,6 +22,7 @@ class RiskAction(str, Enum):
     ROTATE_STRATEGY = "rotate_strategy"
     PAUSE_BOT = "pause_bot"
     STOP_BOT = "stop_bot"
+    ENTER_RECOVERY_MODE = "enter_recovery_mode"  # paper-trade until conditions improve
 
 
 @dataclass
@@ -287,9 +288,17 @@ class RiskManagementService:
     ) -> Tuple[int, RiskAssessment]:
         """Check for consecutive losses and determine action.
 
+        When consecutive losses reach the threshold, fixed-strategy bots enter
+        RECOVERY_MODE rather than being paused. Recovery mode keeps the bot
+        running but converts all orders to paper trades until the strategy
+        demonstrates it has recovered (see _check_recovery_exit in TradingEngine).
+
+        auto_mode self-manages its own strategy rotation, so it is left to
+        CONTINUE regardless.
+
         Args:
             bot_id: The bot ID
-            threshold: Number of consecutive losses to trigger action
+            threshold: Number of consecutive losses to trigger recovery
 
         Returns:
             Tuple of (consecutive_loss_count, RiskAssessment)
@@ -304,20 +313,10 @@ class RiskManagementService:
                 details={},
             )
 
-        # Get recent orders to count consecutive losses
         consecutive_losses = await self._count_consecutive_losses(bot_id)
 
         if consecutive_losses >= threshold:
-            # P0 FIX: risk-driven strategy rotation is REMOVED. A bot's configured
-            # strategy is immutable (see rotate_strategy) - the old code rotated
-            # fixed-strategy bots through _ALPHA_STRATEGIES on a losing streak,
-            # silently corrupting their identity (e.g. a DCA bot became Trend
-            # Following) and pausing them at "Max strategy rotations reached".
-            #
-            # auto_mode selects strategies in-memory and governs itself, so this
-            # check leaves it to continue. Every other (fixed-strategy) bot is
-            # PAUSED to stop the bleed without ever touching Bot.strategy or the
-            # rotation count.
+            # auto_mode self-manages strategy selection — no intervention needed.
             if bot.strategy == "auto_mode":
                 return consecutive_losses, RiskAssessment(
                     action=RiskAction.CONTINUE,
@@ -328,15 +327,19 @@ class RiskManagementService:
                     },
                 )
 
+            # Fixed-strategy bot: enter recovery mode. The bot keeps running and
+            # evaluating its strategy, but all order signals become paper trades.
+            # A permanent pause is never issued for consecutive losses alone.
             return consecutive_losses, RiskAssessment(
-                action=RiskAction.PAUSE_BOT,
+                action=RiskAction.ENTER_RECOVERY_MODE,
                 reason=(
-                    f"{consecutive_losses} consecutive losses - pausing "
-                    f"(fixed-strategy bot; strategy rotation disabled)"
+                    f"{consecutive_losses} consecutive losses — entering recovery mode "
+                    f"(paper trading until recovery criteria met)"
                 ),
                 details={
                     "consecutive_losses": consecutive_losses,
                     "strategy": bot.strategy,
+                    "threshold": threshold,
                 },
             )
 
@@ -347,6 +350,42 @@ class RiskManagementService:
                 "consecutive_losses": consecutive_losses,
                 "threshold": threshold,
             },
+        )
+
+    @staticmethod
+    def check_recovery_exit(paper_trades: list, consecutive_paper_wins: int) -> Tuple[bool, str]:
+        """Evaluate whether a bot in RECOVERY_MODE should resume real trading.
+
+        Exit criteria (any one is sufficient):
+          1. 2 consecutive profitable paper trades.
+          2. Paper win rate >= 60% over the last 5 paper trades.
+          3. Cumulative paper P&L > 0 over the last 5 paper trades.
+
+        Args:
+            paper_trades: List of dicts with keys "gain_loss_usd" and "win".
+            consecutive_paper_wins: Count of consecutive paper wins so far.
+
+        Returns:
+            (should_exit: bool, reason: str)
+        """
+        if consecutive_paper_wins >= 2:
+            return True, f"{consecutive_paper_wins} consecutive profitable paper trades"
+
+        last5 = paper_trades[-5:]
+        if len(last5) < 5:
+            return False, f"only {len(last5)}/5 paper trades completed"
+
+        wins = sum(1 for t in last5 if t.get("win", False))
+        win_rate = wins / 5
+        if win_rate >= 0.60:
+            return True, f"paper win rate {win_rate:.0%} over last 5 trades"
+
+        pnl_sum = sum(t.get("gain_loss_usd", 0.0) for t in last5)
+        if pnl_sum > 0:
+            return True, f"paper P&L +${pnl_sum:.2f} over last 5 trades"
+
+        return False, (
+            f"recovery not yet met: {wins}/5 wins, P&L ${pnl_sum:+.2f}"
         )
 
     async def rotate_strategy(

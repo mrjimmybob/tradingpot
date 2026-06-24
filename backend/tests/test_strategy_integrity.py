@@ -115,7 +115,9 @@ async def _rotation_count(session, bot_id):
 # 1 & 2: Fixed-strategy bots never change strategy / never increment rotations
 # --------------------------------------------------------------------------- #
 @pytest.mark.asyncio
-async def test_consecutive_losses_pauses_without_corrupting_fixed_bot(test_db):
+async def test_consecutive_losses_enters_recovery_without_corrupting_fixed_bot(test_db):
+    """Three consecutive losses enter RECOVERY_MODE (not PAUSE) without
+    corrupting Bot.strategy or creating rotation rows."""
     bot = await _make_bot(test_db, "dca_accumulator")
     await _add_losing_realized_gains(test_db, bot.id, count=3)
 
@@ -123,7 +125,8 @@ async def test_consecutive_losses_pauses_without_corrupting_fixed_bot(test_db):
     count, result = await svc.check_consecutive_losses(bot.id, threshold=3)
 
     assert count == 3
-    assert result.action == RiskAction.PAUSE_BOT
+    assert result.action == RiskAction.ENTER_RECOVERY_MODE
+    assert "recovery mode" in result.reason.lower()
     # Strategy untouched, and NO rotation row created.
     await test_db.refresh(bot)
     assert bot.strategy == "dca_accumulator"
@@ -385,14 +388,14 @@ async def test_profitable_sell_never_classified_as_loss(test_db):
 
 
 @pytest.mark.asyncio
-async def test_three_genuine_consecutive_losses_pause_fixed_bot(test_db):
-    """Three consecutive realized losses at or above threshold pauses the bot."""
+async def test_three_genuine_consecutive_losses_enter_recovery_mode(test_db):
+    """Three consecutive realized losses trigger RECOVERY_MODE (not PAUSE)."""
     bot = await _make_bot(test_db, "trend_following")
     await _add_losing_realized_gains(test_db, bot.id, count=3, gain_loss=-15.0)
 
     svc = RiskManagementService(test_db)
     count, result = await svc.check_consecutive_losses(bot.id, threshold=3)
     assert count == 3
-    assert result.action == RiskAction.PAUSE_BOT
+    assert result.action == RiskAction.ENTER_RECOVERY_MODE
     assert "consecutive losses" in result.reason
-    assert "fixed-strategy" in result.reason
+    assert "recovery mode" in result.reason.lower()
