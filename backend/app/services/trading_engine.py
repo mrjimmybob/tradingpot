@@ -3988,42 +3988,75 @@ class TradingEngine:
     ) -> None:
         """Update per-strategy performance metrics on bar close.
 
-        Groups the last 50 filled orders by strategy name (extracted from the
-        [Auto:strategy|regime] reason prefix).  For each strategy computes:
-        - total_trades, winning_trades, losing_trades  (from consecutive balance Δ)
-        - win_rate, profit_factor, realized_pnl_usd
-        - recent_pnl_pct (rolling window %)
-        - max_drawdown_pct (worst ever, monotonically increasing)
-        - last_trade_time
+        Source: realized_gains table — FIFO-matched P&L written by the
+        accounting system on every SELL trade.  This is the only authoritative
+        source for closed-trade profit/loss; running_balance_after snapshots are
+        NOT used because they conflate cash-flow direction (buy = cash out) with
+        actual gain/loss.
 
-        All of these flow into _score_strategy for priority calculation.
+        For each sub-strategy computes from the last ``performance_window``
+        closed sell cycles:
+          - total_trades    count of closed sell events
+          - winning_trades  count where gain_loss > 0
+          - losing_trades   count where gain_loss < 0
+          - realized_pnl_usd  sum of gain_loss USD
+          - profit_factor   gross_profit / gross_loss  (0.0 if no losses yet)
+          - win_rate        winning_trades / (winning_trades + losing_trades)
+          - recent_pnl_pct  realized_pnl_usd / total_cost_basis × 100
+          - max_drawdown_pct  worst rolling drawdown seen so far (monotonic)
+          - last_trade_time   sell_date of most recent closed cycle
+
+        Strategy attribution for auto_mode bots:
+          1. Parse "[Auto:strategy_name|regime]" prefix in orders.reason.
+          2. Fall back to Trade.strategy_used if no [Auto:] prefix.
         """
-        query = select(Order).where(
-            Order.bot_id == bot_id,
-            Order.status == OrderStatus.FILLED
-        ).order_by(Order.filled_at.asc()).limit(50)
+        from ..models import RealizedGain
+
+        # Fetch the last N×3 closed sell cycles for this bot, oldest first.
+        # The 3× headroom ensures enough rows per sub-strategy.
+        fetch_limit = performance_window * 3
+
+        query = (
+            select(RealizedGain, Trade.strategy_used, Order.reason, RealizedGain.sell_date)
+            .join(Trade, RealizedGain.sell_trade_id == Trade.id)
+            .outerjoin(Order, Trade.order_id == Order.id)
+            .where(Trade.bot_id == bot_id)
+            .order_by(RealizedGain.sell_date.asc())
+            .limit(fetch_limit)
+        )
 
         result = await session.execute(query)
-        orders = result.scalars().all()
+        rows = result.all()
 
-        if not orders:
+        if not rows:
             return
 
-        # Group orders by strategy; keep chronological order (ascending fill time)
-        strategy_orders: dict = {}
-        for order in orders:
-            reason = order.reason or ""
-            if not reason.startswith("[Auto:"):
+        # Group closed-cycle records by sub-strategy
+        strategy_cycles: dict = {}
+
+        for rg, strategy_used, reason, sell_date in rows:
+            # Attribute to sub-strategy
+            sub_strategy = strategy_used or ""
+            if reason and reason.startswith("[Auto:"):
+                # "[Auto:mean_reversion|flat/medium/high] ..."
+                try:
+                    sub_strategy = reason.split("|")[0].replace("[Auto:", "").strip()
+                except Exception:
+                    pass
+
+            if not sub_strategy:
                 continue
-            strategy_part = reason.split("|")[0].replace("[Auto:", "").strip()
-            if strategy_part not in strategy_orders:
-                strategy_orders[strategy_part] = []
-            if order.running_balance_after is not None:
-                strategy_orders[strategy_part].append(order)
+            if sub_strategy not in strategy_cycles:
+                strategy_cycles[sub_strategy] = []
+            strategy_cycles[sub_strategy].append({
+                "gain_loss": rg.gain_loss,
+                "cost_basis": rg.cost_basis,
+                "sell_date": sell_date,
+            })
 
         strategy_metrics = auto_state.get("strategy_metrics", {})
 
-        for strategy_name, orders_list in strategy_orders.items():
+        for strategy_name, cycles in strategy_cycles.items():
             if strategy_name not in strategy_metrics:
                 strategy_metrics[strategy_name] = {
                     "recent_pnl_pct": 0.0,
@@ -4041,58 +4074,53 @@ class TradingEngine:
                 }
 
             metrics = strategy_metrics[strategy_name]
-            window = orders_list[-performance_window:]
+            window = cycles[-performance_window:]
 
-            # --- last trade time ---
-            if window:
-                last_filled = window[-1].filled_at
-                if last_filled:
-                    metrics["last_trade_time"] = last_filled.isoformat()
+            # Last trade time
+            last_sell = window[-1]["sell_date"]
+            if last_sell:
+                ts = last_sell.isoformat() if hasattr(last_sell, "isoformat") else str(last_sell)
+                metrics["last_trade_time"] = ts
 
-            # --- trade count ---
             metrics["total_trades"] = len(window)
 
-            # --- win / loss from consecutive balance changes ---
-            # Each consecutive pair (order[i-1], order[i]) represents one "round":
-            # balance increased → win; decreased → loss.
             gross_profit = 0.0
             gross_loss = 0.0
             wins = 0
             losses = 0
+            total_cost_basis = 0.0
             realized_pnl = 0.0
 
-            for i in range(1, len(window)):
-                prev_bal = window[i - 1].running_balance_after
-                curr_bal = window[i].running_balance_after
-                if prev_bal is None or curr_bal is None or prev_bal <= 0:
-                    continue
-                delta = curr_bal - prev_bal
-                realized_pnl += delta
-                if delta > 0:
+            for cycle in window:
+                gl = cycle["gain_loss"]
+                cb = cycle["cost_basis"] or 0.0
+                realized_pnl += gl
+                total_cost_basis += cb
+                if gl > 0:
                     wins += 1
-                    gross_profit += delta
-                elif delta < 0:
+                    gross_profit += gl
+                elif gl < 0:
                     losses += 1
-                    gross_loss += abs(delta)
+                    gross_loss += abs(gl)
 
             metrics["winning_trades"] = wins
             metrics["losing_trades"] = losses
             metrics["realized_pnl_usd"] = realized_pnl
-            metrics["profit_factor"] = (gross_profit / gross_loss) if gross_loss > 0 else (1.0 if gross_profit > 0 else 0.0)
+            metrics["profit_factor"] = (
+                gross_profit / gross_loss if gross_loss > 0
+                else (1.0 if gross_profit > 0 else 0.0)
+            )
             completed = wins + losses
             metrics["win_rate"] = (wins / completed) if completed > 0 else 0.0
 
-            # --- rolling PnL % over performance_window ---
-            if len(window) >= 2:
-                start_bal = window[0].running_balance_after
-                end_bal = window[-1].running_balance_after
-                if start_bal and start_bal > 0:
-                    pnl_pct = ((end_bal - start_bal) / start_bal) * 100
-                    metrics["recent_pnl_pct"] = pnl_pct
-                    if pnl_pct < 0:
-                        metrics["max_drawdown_pct"] = max(
-                            metrics.get("max_drawdown_pct", 0.0), abs(pnl_pct)
-                        )
+            # PnL % = realized_pnl / total_cost_basis deployed (avoids balance snapshot bias)
+            if total_cost_basis > 0:
+                pnl_pct = (realized_pnl / total_cost_basis) * 100
+                metrics["recent_pnl_pct"] = pnl_pct
+                if pnl_pct < 0:
+                    metrics["max_drawdown_pct"] = max(
+                        metrics.get("max_drawdown_pct", 0.0), abs(pnl_pct)
+                    )
 
         auto_state["strategy_metrics"] = strategy_metrics
 
