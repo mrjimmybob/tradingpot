@@ -44,78 +44,96 @@ def _metrics(**kwargs) -> dict:
 # ISSUE 1 – Auto Mode inactivity penalty
 # ---------------------------------------------------------------------------
 
-class TestAutoModeInactivityPenalty:
-    """_score_strategy must penalise a strategy that has been selected but has
-    not produced a trade for more than 2 hours."""
+class TestAutoModeScoring:
+    """_score_strategy returns a dict with the three components of the new formula:
 
-    def test_no_penalty_within_grace_period(self):
+        final = (opportunity × 3) + performance - risk_penalty
+
+    Inactivity alone is NOT penalised (the spec removed pure time-based decay).
+    The opportunity_score handles whether a setup is present.
+    """
+
+    def test_returns_dict_with_required_keys(self):
         engine = _engine()
         caps = _capabilities()["adaptive_grid"]
-        # activated 30 min ago → within the 1-hour grace window
-        activated = (datetime.utcnow() - timedelta(minutes=30)).isoformat()
-        metrics = _metrics(activated_at=activated)
-        score = engine._score_strategy("adaptive_grid", caps, metrics)
-        # Base priority is 2, no penalty; score must equal base+bonus (≥2 here)
-        assert score >= 2.0
+        result = engine._score_strategy("adaptive_grid", caps, _metrics())
+        assert isinstance(result, dict)
+        for key in ("final", "opportunity", "performance", "confidence", "risk_penalty"):
+            assert key in result, f"Missing key: {key}"
 
-    def test_penalty_accumulates_after_grace(self):
+    def test_no_inactivity_penalty_without_bar_history(self):
+        """Pure inactivity does not penalise — opportunity score defaults to 5.0
+        (neutral) when bar_history is empty."""
         engine = _engine()
         caps = _capabilities()["adaptive_grid"]
-        # activated 10 hours ago → 9h past 1h grace → phase1 penalty = 9 * 0.4 = 3.6
-        activated = (datetime.utcnow() - timedelta(hours=10)).isoformat()
-        metrics = _metrics(activated_at=activated)
-        score = engine._score_strategy("adaptive_grid", caps, metrics)
-        # Score must be well below base priority of 2
-        assert score < 0.0
+        # Strategy was 'inactive' for 100 hours — no penalty under new spec
+        very_old = (datetime.utcnow() - timedelta(hours=100)).isoformat()
+        result = engine._score_strategy("adaptive_grid", caps, _metrics(activated_at=very_old))
+        # opportunity=5.0, performance=0, risk=0 → final = 15.0
+        assert result["final"] == pytest.approx(15.0, abs=0.1)
+        assert result["risk_penalty"] == pytest.approx(0.0, abs=0.01)
 
-    def test_penalty_capped_at_8(self):
+    def test_failure_count_adds_risk_penalty(self):
+        """Each failure adds 5.0 to risk_penalty."""
+        engine = _engine()
+        caps = _capabilities()["trend_following"]
+        result = engine._score_strategy("trend_following", caps, _metrics(failure_count=2))
+        assert result["risk_penalty"] == pytest.approx(10.0, abs=0.01)
+
+    def test_drawdown_adds_exponential_risk_penalty(self):
+        """Drawdown penalty = (max_drawdown_pct / 5) ** 2."""
+        engine = _engine()
+        caps = _capabilities()["trend_following"]
+        result = engine._score_strategy("trend_following", caps, _metrics(max_drawdown_pct=10.0))
+        # (10/5)^2 = 4.0
+        assert result["risk_penalty"] == pytest.approx(4.0, abs=0.01)
+
+    def test_performance_zero_with_no_trades(self):
+        """With zero trades confidence=0 → performance=0."""
         engine = _engine()
         caps = _capabilities()["adaptive_grid"]
-        # activated 100 hours ago → cap kicks in at 8.0
-        activated = (datetime.utcnow() - timedelta(hours=100)).isoformat()
-        metrics = _metrics(activated_at=activated)
-        score = engine._score_strategy("adaptive_grid", caps, metrics)
-        # Max penalty is 8.0; base=2, bonus=0 → floor is 2-8 = -6
-        assert score >= -6.0
-        assert score < 0.0
+        result = engine._score_strategy("adaptive_grid", caps, _metrics(total_trades=0))
+        assert result["confidence"] == pytest.approx(0.0, abs=0.01)
+        assert result["performance"] == pytest.approx(0.0, abs=0.01)
 
-    def test_fresh_trade_resets_inactivity(self):
+    def test_confidence_scales_performance(self):
+        """25 trades → confidence=0.5 → performance is halved vs full confidence."""
         engine = _engine()
         caps = _capabilities()["adaptive_grid"]
-        # activated 48h ago but traded 30 minutes ago → no inactivity penalty
-        old_activation = (datetime.utcnow() - timedelta(hours=48)).isoformat()
-        recent_trade = (datetime.utcnow() - timedelta(minutes=30)).isoformat()
-        metrics = _metrics(activated_at=old_activation, last_trade_time=recent_trade)
-        score = engine._score_strategy("adaptive_grid", caps, metrics)
-        # Recent trade clears penalty; score ≥ base priority
-        assert score >= 2.0
-
-    def test_inactive_strategy_scores_below_active_competitor(self):
-        """After sufficient inactivity AG (prio 2) must score below MR (prio 2)
-        which has recent trades and only a tiny PnL penalty."""
-        engine = _engine()
-        caps = _capabilities()
-
-        # AG: activated 20h ago, no trades
-        ag_activated = (datetime.utcnow() - timedelta(hours=20)).isoformat()
-        ag_metrics = _metrics(activated_at=ag_activated)
-        ag_score = engine._score_strategy("adaptive_grid", caps["adaptive_grid"], ag_metrics)
-
-        # MR: traded 1h ago (no inactivity penalty)
-        mr_trade = (datetime.utcnow() - timedelta(hours=1)).isoformat()
-        mr_metrics = _metrics(last_trade_time=mr_trade, recent_pnl_pct=-0.02)
-        mr_score = engine._score_strategy("mean_reversion", caps["mean_reversion"], mr_metrics)
-
-        assert mr_score > ag_score, (
-            f"MR ({mr_score:.3f}) should outrank inactive AG ({ag_score:.3f})"
+        m_25 = _metrics(
+            total_trades=25, winning_trades=20, win_rate=0.8,
+            profit_factor=2.0, recent_pnl_pct=5.0
         )
+        m_50 = _metrics(
+            total_trades=50, winning_trades=40, win_rate=0.8,
+            profit_factor=2.0, recent_pnl_pct=5.0
+        )
+        r25 = engine._score_strategy("adaptive_grid", caps, m_25)
+        r50 = engine._score_strategy("adaptive_grid", caps, m_50)
+        assert r25["confidence"] == pytest.approx(0.5, abs=0.01)
+        assert r50["confidence"] == pytest.approx(1.0, abs=0.01)
+        # Performance is proportional to confidence
+        assert r50["performance"] == pytest.approx(r25["performance"] * 2.0, rel=0.05)
 
-    def test_no_penalty_without_baseline(self):
+    def test_high_performance_with_full_confidence_adds_to_final(self):
+        """50+ trades, good win rate, high PF → positive performance contribution."""
+        engine = _engine()
+        caps = _capabilities()["adaptive_grid"]
+        m = _metrics(
+            total_trades=50, winning_trades=40, win_rate=0.8,
+            profit_factor=3.0, recent_pnl_pct=10.0
+        )
+        result = engine._score_strategy("adaptive_grid", caps, m)
+        # opportunity=5 (no bar history), performance>0, risk=0
+        assert result["performance"] > 0.0
+        assert result["final"] > 15.0  # > (5 * 3) + 0 - 0
+
+    def test_no_crash_without_baseline(self):
         """Strategy with no activated_at / last_trade_time must not crash."""
         engine = _engine()
         caps = _capabilities()["adaptive_grid"]
-        score = engine._score_strategy("adaptive_grid", caps, _metrics())
-        assert isinstance(score, float)
+        result = engine._score_strategy("adaptive_grid", caps, _metrics())
+        assert isinstance(result["final"], float)
 
 
 # ---------------------------------------------------------------------------
@@ -646,85 +664,123 @@ class TestDefaultParameterChanges:
 # NEW – Auto Mode: aggressive inactivity decay causes rotation
 # ---------------------------------------------------------------------------
 
-class TestAutoModeInactivityDecay:
-    """After sufficient inactivity the decayed strategy score must fall below
-    a freshly-activated fallback (DCA priority 0 with no penalty)."""
+class TestAutoModeOpportunityScore:
+    """_compute_opportunity_score returns 0–10 based on live market conditions.
 
-    def test_priority4_strategy_decays_below_dca_after_11h(self):
-        """trend_following (priority=4) should drop below DCA (priority=0)
-        after 11 hours of inactivity (1h grace + 10h at 0.4/h = 4.0 penalty)."""
+    These tests verify the signal logic for each strategy type using controlled
+    synthetic bar histories.
+    """
+
+    @staticmethod
+    def _flat_bars(price: float, n: int = 50, spread: float = 50.0) -> list:
+        """n bars oscillating ±spread around price."""
+        bars = []
+        for i in range(n):
+            c = price + (spread if i % 2 == 0 else -spread)
+            bars.append({"open": price, "high": price + spread, "low": price - spread, "close": c})
+        return bars
+
+    @staticmethod
+    def _uptrend_bars(start: float = 60000.0, n: int = 60, drift: float = 50.0) -> list:
+        """n bars with a consistent upward drift."""
+        bars = []
+        price = start
+        for _ in range(n):
+            price += drift
+            bars.append({"open": price - drift, "high": price + 20, "low": price - 20, "close": price})
+        return bars
+
+    def test_trend_following_scores_high_in_uptrend(self):
+        engine = _engine()
+        bars = self._uptrend_bars(n=60)
+        score = engine._compute_opportunity_score(
+            "trend_following", bars, bars[-1]["close"],
+            {"trend_state": "up", "volatility_direction": "expanding"}
+        )
+        assert score >= 5.0, f"TF should score high in uptrend, got {score:.2f}"
+
+    def test_trend_following_scores_low_in_flat_market(self):
+        engine = _engine()
+        bars = self._flat_bars(64000.0, spread=20.0)
+        score = engine._compute_opportunity_score(
+            "trend_following", bars, 64000.0,
+            {"trend_state": "flat", "volatility_direction": "stable"}
+        )
+        assert score <= 6.0, f"TF should score low in flat market, got {score:.2f}"
+
+    def test_mean_reversion_scores_high_when_price_below_band(self):
+        engine = _engine()
+        # 20 bars around 64000, then crash to 62500 (well below lower BB)
+        bars = self._flat_bars(64000.0, n=50, spread=100.0)
+        score = engine._compute_opportunity_score(
+            "mean_reversion", bars, 62500.0,  # ~24% below in std units = very extreme
+            {"trend_state": "flat", "volatility_direction": "stable"}
+        )
+        assert score >= 6.0, f"MR should score high when price far below mean, got {score:.2f}"
+
+    def test_mean_reversion_scores_low_near_mean(self):
+        engine = _engine()
+        bars = self._flat_bars(64000.0, n=50, spread=100.0)
+        score = engine._compute_opportunity_score(
+            "mean_reversion", bars, 64000.0,  # at the mean
+            {"trend_state": "flat", "volatility_direction": "stable"}
+        )
+        assert score <= 6.0, f"MR should score low near mean, got {score:.2f}"
+
+    def test_dca_scores_higher_with_bigger_drawdown(self):
+        engine = _engine()
+        bars_low = self._flat_bars(64000.0, n=50, spread=50.0)
+        bars_high = self._flat_bars(64000.0, n=50, spread=50.0)
+        # 5% dip vs at peak
+        score_dip = engine._compute_opportunity_score("dca_accumulator", bars_low, 60800.0, {})
+        score_peak = engine._compute_opportunity_score("dca_accumulator", bars_high, 64000.0, {})
+        assert score_dip > score_peak, (
+            f"DCA at dip ({score_dip:.2f}) should score > at peak ({score_peak:.2f})"
+        )
+
+    def test_returns_5_with_insufficient_bars(self):
+        engine = _engine()
+        bars = self._flat_bars(64000.0, n=5)  # only 5 bars
+        score = engine._compute_opportunity_score("trend_following", bars, 64000.0, {})
+        assert score == pytest.approx(5.0)
+
+    def test_scores_are_within_range(self):
+        """All strategy scores must be in [0, 10] for any input."""
         engine = _engine()
         caps = _capabilities()
+        bars = self._flat_bars(64000.0, n=50, spread=200.0)
+        regime = {"trend_state": "flat", "volatility_state": "medium",
+                  "volatility_direction": "stable", "liquidity_state": "normal"}
+        for name in caps:
+            score = engine._compute_opportunity_score(name, bars, 64000.0, regime)
+            assert 0.0 <= score <= 10.0, f"{name} score {score:.2f} out of [0,10]"
 
-        activated = (datetime.utcnow() - timedelta(hours=11)).isoformat()
-        tf_metrics = _metrics(activated_at=activated)
-        tf_score = engine._score_strategy("trend_following", caps["trend_following"], tf_metrics)
-
-        dca_score = engine._score_strategy("dca_accumulator", caps["dca_accumulator"], _metrics())
-
-        assert tf_score < dca_score, (
-            f"11h-inactive TF score ({tf_score:.3f}) must be < DCA score ({dca_score:.3f})"
-        )
-
-    def test_priority2_strategy_decays_below_dca_after_6h(self):
-        """adaptive_grid (priority=2) should drop below DCA (priority=0)
-        after 6 hours of inactivity (1h grace + 5h at 0.4/h = 2.0 penalty)."""
+    def test_final_score_dominated_by_opportunity(self):
+        """final = oppty*3 + perf - risk.  At max opportunity a strategy with
+        no performance history should still score high."""
         engine = _engine()
         caps = _capabilities()
-
-        activated = (datetime.utcnow() - timedelta(hours=6)).isoformat()
-        ag_metrics = _metrics(activated_at=activated)
-        ag_score = engine._score_strategy("adaptive_grid", caps["adaptive_grid"], ag_metrics)
-
-        dca_score = engine._score_strategy("dca_accumulator", caps["dca_accumulator"], _metrics())
-
-        assert ag_score < dca_score, (
-            f"6h-inactive AG score ({ag_score:.3f}) must be < DCA score ({dca_score:.3f})"
+        bars = self._uptrend_bars(n=60)
+        regime = {"trend_state": "up", "volatility_direction": "expanding",
+                  "volatility_state": "high", "liquidity_state": "normal"}
+        result = engine._score_strategy(
+            "trend_following", caps["trend_following"], _metrics(),
+            bar_history=bars, current_price=bars[-1]["close"], current_regime=regime
+        )
+        # Even with zero performance history, the opportunity component should dominate
+        assert result["final"] > result["opportunity"] * 2.5, (
+            f"Opportunity should dominate final score: {result}"
         )
 
-    def test_two_phase_acceleration_after_13h(self):
-        """Beyond 13h the phase-2 rate (0.8/h) applies, accelerating decay."""
-        engine = _engine()
-        caps = _capabilities()["trend_following"]
-
-        t13 = (datetime.utcnow() - timedelta(hours=14)).isoformat()  # 13h over grace
-        t6 = (datetime.utcnow() - timedelta(hours=7)).isoformat()    # 6h over grace
-
-        score_13 = engine._score_strategy("trend_following", caps, _metrics(activated_at=t13))
-        score_6 = engine._score_strategy("trend_following", caps, _metrics(activated_at=t6))
-
-        assert score_13 < score_6, "Longer inactivity must produce a lower score"
-
-    def test_recent_trade_prevents_decay(self):
-        """last_trade_time resets the inactivity clock regardless of activated_at."""
+    def test_bad_performance_with_low_confidence_barely_penalises(self):
+        """With only 3 trades (confidence=0.06), even −100% PnL barely moves the score."""
         engine = _engine()
         caps = _capabilities()["adaptive_grid"]
-
-        old_activation = (datetime.utcnow() - timedelta(hours=48)).isoformat()
-        recent_trade = (datetime.utcnow() - timedelta(minutes=20)).isoformat()
-        metrics = _metrics(activated_at=old_activation, last_trade_time=recent_trade)
-        score = engine._score_strategy("adaptive_grid", caps, metrics)
-
-        # 20 minutes of inactivity < 1h grace → no inactivity penalty
-        assert score >= 2.0, f"Score {score:.3f} should be ≥ 2.0 with recent trade"
-
-    def test_zero_trades_never_adds_activity_bonus(self):
-        """A strategy with winning trade history must score higher than one with zero trades."""
-        engine = _engine()
-        caps = _capabilities()["adaptive_grid"]
-        metrics_no_trades = _metrics(total_trades=0)
-        metrics_active = _metrics(
-            total_trades=20,
-            winning_trades=14,
-            losing_trades=6,
-            win_rate=0.7,
-            profit_factor=2.0,
-            last_trade_time=(datetime.utcnow() - timedelta(minutes=10)).isoformat(),
-        )
-        score_no = engine._score_strategy("adaptive_grid", caps, metrics_no_trades)
-        score_active = engine._score_strategy("adaptive_grid", caps, metrics_active)
-        assert score_active > score_no, (
-            f"Active strategy ({score_active:.3f}) must score higher than idle ({score_no:.3f})"
+        m = _metrics(total_trades=3, recent_pnl_pct=-100.0, win_rate=0.0, profit_factor=0.0)
+        result = engine._score_strategy("adaptive_grid", caps, m)
+        # performance = raw_perf * (3/50) ≈ very small penalty
+        assert abs(result["performance"]) < 1.5, (
+            f"Low-confidence bad performance should barely affect score: {result['performance']:.3f}"
         )
 
 

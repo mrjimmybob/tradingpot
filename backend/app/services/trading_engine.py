@@ -3464,14 +3464,20 @@ class TradingEngine:
             eligible_strategies = ["dca_accumulator"]
 
         # === DYNAMIC PRIORITY SCORING ===
+        bar_history = auto_state.get("bar_history", [])
         scored_strategies = []
         for strategy_name in eligible_strategies:
             caps = capabilities[strategy_name]
             metrics = strategy_metrics.get(strategy_name, {})
-            effective_priority = self._score_strategy(strategy_name, caps, metrics)
-            scored_strategies.append((strategy_name, effective_priority, caps, metrics))
+            score_detail = self._score_strategy(
+                strategy_name, caps, metrics,
+                bar_history=bar_history,
+                current_price=current_price,
+                current_regime=current_regime,
+            )
+            scored_strategies.append((strategy_name, score_detail["final"], caps, metrics, score_detail))
 
-        # Sort by effective priority (descending)
+        # Sort by final score (descending)
         scored_strategies.sort(key=lambda x: x[1], reverse=True)
 
         # === FORCE-EXIT CHECK ===
@@ -3501,56 +3507,72 @@ class TradingEngine:
                 session=session
             )
 
-        # === STRATEGY SELECTION WITH INERTIA ===
-        best_strategy, best_priority, best_caps, best_metrics = scored_strategies[0]
+        # === STRATEGY SELECTION WITH HYSTERESIS ===
+        # Switch only when the new best score beats the current strategy by at
+        # least the hysteresis margin.  This prevents oscillation when two
+        # strategies have similar opportunity scores.
+        _HYSTERESIS = params.get("switch_hysteresis", 1.0)
+
+        best_strategy, best_score, best_caps, best_metrics, best_detail = scored_strategies[0]
         selected_strategy = current_strategy
         should_switch = False
         switch_reason = ""
 
         if current_strategy not in eligible_strategies:
-            # Must switch, current is ineligible
+            # Hard switch: current strategy is ineligible (regime change, kill switch, etc.)
             selected_strategy = best_strategy
             should_switch = True
             switch_reason = f"current strategy ineligible, switching to {best_strategy}"
         elif best_strategy != current_strategy:
-            # Check if better strategy available
-            current_priority = next((s[1] for s in scored_strategies if s[0] == current_strategy), 0)
+            current_score = next((s[1] for s in scored_strategies if s[0] == current_strategy), 0.0)
 
-            if best_priority > current_priority:
-                # Check min switch interval
+            if best_score > current_score + _HYSTERESIS:
+                # Check min switch interval (prevents flapping)
                 last_switch = auto_state.get("last_switch_time")
                 if last_switch:
                     time_since_switch = (now - datetime.fromisoformat(last_switch)).total_seconds() / 60
                     if time_since_switch < min_switch_interval:
-                        switch_reason = f"better strategy {best_strategy} available but too soon (last switch {time_since_switch:.1f}m ago)"
+                        switch_reason = (
+                            f"{best_strategy} scores higher ({best_score:.2f} vs {current_score:.2f}) "
+                            f"but too soon to switch ({time_since_switch:.1f}m since last)"
+                        )
                     else:
                         selected_strategy = best_strategy
                         should_switch = True
-                        switch_reason = f"higher priority strategy {best_strategy} (priority {best_priority:.2f} > {current_priority:.2f})"
+                        switch_reason = (
+                            f"{best_strategy} score {best_score:.2f} > {current_strategy} "
+                            f"{current_score:.2f} + hysteresis {_HYSTERESIS}"
+                        )
                 else:
                     selected_strategy = best_strategy
                     should_switch = True
-                    switch_reason = f"higher priority strategy {best_strategy} (priority {best_priority:.2f})"
+                    switch_reason = f"{best_strategy} score {best_score:.2f} dominates (first switch)"
             else:
-                switch_reason = f"current strategy {current_strategy} still optimal (priority {current_priority:.2f})"
+                switch_reason = (
+                    f"{current_strategy} retained (margin {best_score - current_score:.2f} "
+                    f"< hysteresis {_HYSTERESIS})"
+                )
         else:
-            switch_reason = f"current strategy {current_strategy} is best (priority {best_priority:.2f})"
+            switch_reason = f"{current_strategy} is highest-scoring eligible strategy ({best_score:.2f})"
 
         # === STRATEGY SWITCHING ===
         if should_switch:
             logger.info(
-                f"Bot {bot.id}: Auto Mode SWITCHING - {current_strategy} → {selected_strategy} ({switch_reason})"
+                f"Bot {bot.id}: Auto Mode SWITCHING {current_strategy} → {selected_strategy} | {switch_reason}"
             )
             auto_state["current_strategy"] = selected_strategy
             auto_state["last_switch_time"] = now.isoformat()
             current_strategy = selected_strategy
-            # Record activation time so inactivity penalty has a baseline
             if current_strategy not in strategy_metrics:
                 strategy_metrics[current_strategy] = {}
-            strategy_metrics[current_strategy]["activated_at"] = now.isoformat()
             auto_state["strategy_metrics"] = strategy_metrics
         else:
-            logger.debug(f"Bot {bot.id}: Auto Mode HOLDING {current_strategy} ({switch_reason})")
+            logger.debug(f"Bot {bot.id}: Auto Mode HOLDING {current_strategy} | {switch_reason}")
+
+        # Persist score breakdown for observability
+        auto_state["last_scores"] = {
+            name: detail for name, _, _, _, detail in scored_strategies
+        }
 
         # === DECISION LOGGING ===
         self._log_auto_mode_decision(
@@ -3728,8 +3750,27 @@ class TradingEngine:
                 new_volatility = "high"
             else:
                 new_volatility = "medium"
+
+            # Direction of ATR change (expanding vs contracting vs stable)
+            # Compare recent 7-bar ATR against older 7-bar ATR
+            if len(atr_values) >= 14:
+                recent_half = sum(atr_values[-7:]) / 7
+                older_half = sum(atr_values[-14:-7]) / 7
+                if older_half > 0:
+                    direction_ratio = recent_half / older_half
+                    if direction_ratio > 1.15:
+                        new_volatility_direction = "expanding"
+                    elif direction_ratio < 0.85:
+                        new_volatility_direction = "contracting"
+                    else:
+                        new_volatility_direction = "stable"
+                else:
+                    new_volatility_direction = "stable"
+            else:
+                new_volatility_direction = "stable"
         else:
             new_volatility = "medium"
+            new_volatility_direction = "stable"
 
         # === LIQUIDITY STATE (proxy using bar range stability) ===
         recent_ranges = []
@@ -3758,6 +3799,7 @@ class TradingEngine:
             return {
                 "trend_state": new_trend,
                 "volatility_state": new_volatility,
+                "volatility_direction": new_volatility_direction,
                 "liquidity_state": new_liquidity,
                 "persistence_bars": persistence_required
             }
@@ -3774,6 +3816,7 @@ class TradingEngine:
                 return {
                     "trend_state": new_trend,
                     "volatility_state": new_volatility,
+                    "volatility_direction": new_volatility_direction,
                     "liquidity_state": new_liquidity,
                     "persistence_bars": 0
                 }
@@ -3781,6 +3824,7 @@ class TradingEngine:
                 return {
                     "trend_state": current_regime.get("trend_state"),
                     "volatility_state": current_regime.get("volatility_state"),
+                    "volatility_direction": current_regime.get("volatility_direction", "stable"),
                     "liquidity_state": current_regime.get("liquidity_state"),
                     "persistence_bars": persistence_bars,
                 }
@@ -3788,6 +3832,7 @@ class TradingEngine:
             return {
                 "trend_state": new_trend,
                 "volatility_state": new_volatility,
+                "volatility_direction": new_volatility_direction,
                 "liquidity_state": new_liquidity,
                 "persistence_bars": 0
             }
@@ -3838,11 +3883,13 @@ class TradingEngine:
         allowed = capabilities.get("allowed_regimes", [])
         trend = current_regime.get("trend_state", "flat")
         volatility = current_regime.get("volatility_state", "medium")
+        vol_direction = current_regime.get("volatility_direction", "stable")
         liquidity = current_regime.get("liquidity_state", "normal")
 
         regime_tags = [
             f"trend_{trend}",
             f"volatility_{volatility}",
+            f"volatility_{vol_direction}",
             f"liquidity_{liquidity}"
         ]
 
@@ -3870,114 +3917,284 @@ class TradingEngine:
 
         return True, "eligible"
 
+    def _compute_opportunity_score(
+        self,
+        strategy_name: str,
+        bar_history: list,
+        current_price: float,
+        current_regime: dict,
+    ) -> float:
+        """Live market opportunity score (0–10) for a strategy.
+
+        Measures how well current market conditions match the strategy's ideal
+        setup — independently of historical performance. This is the dominant
+        selection factor.
+
+        10 = exceptional setup present right now.
+         5 = neutral / eligible but no strong setup.
+         0 = setup actively absent.
+
+        Returns 5.0 (neutral) when bar_history is too short to compute signals.
+        """
+        if len(bar_history) < 20:
+            return 5.0
+
+        closes = [b["close"] for b in bar_history]
+        highs = [b["high"] for b in bar_history]
+        lows = [b["low"] for b in bar_history]
+        n = len(closes)
+
+        def _clamp(v: float) -> float:
+            return max(0.0, min(10.0, v))
+
+        def _ema(prices: list, period: int) -> list:
+            if len(prices) < period:
+                return prices[:]
+            mult = 2.0 / (period + 1)
+            val = sum(prices[:period]) / period
+            result = [val]
+            for p in prices[period:]:
+                val = (p - val) * mult + val
+                result.append(val)
+            return result
+
+        def _atr_series(h: list, l: list, period: int) -> list:
+            trs = [h[i] - l[i] for i in range(len(h))]
+            if len(trs) < period:
+                return trs
+            result = [sum(trs[:period]) / period]
+            mult = 2.0 / (period + 1)
+            for tr in trs[period:]:
+                result.append((tr - result[-1]) * mult + result[-1])
+            return result
+
+        def _rsi(prices: list, period: int = 14) -> float:
+            if len(prices) < period + 1:
+                return 50.0
+            gains, losses = [], []
+            for i in range(len(prices) - period, len(prices)):
+                d = prices[i] - prices[i - 1]
+                gains.append(max(d, 0.0))
+                losses.append(max(-d, 0.0))
+            ag = sum(gains) / period
+            al = sum(losses) / period
+            if al == 0:
+                return 100.0
+            return 100.0 - 100.0 / (1.0 + ag / al)
+
+        def _bollinger(prices: list, period: int = 20, nstd: float = 2.0):
+            w = prices[-period:]
+            mean = sum(w) / len(w)
+            var = sum((p - mean) ** 2 for p in w) / len(w)
+            std = var ** 0.5
+            return mean, mean + nstd * std, mean - nstd * std, std
+
+        if strategy_name == "trend_following":
+            ema20 = _ema(closes, 20)
+            ema50 = _ema(closes, min(50, n))
+            e20, e50 = ema20[-1], ema50[-1]
+            # 5-bar slope of EMA-20
+            e20_prev = ema20[-min(6, len(ema20))]
+            separation_pct = (e20 - e50) / e50 * 100.0 if e50 > 0 else 0.0
+            slope_pct = (e20 - e20_prev) / e20_prev * 100.0 if e20_prev > 0 else 0.0
+            # separation > 0.5% + positive slope drives score to 10
+            # each +0.5% separation ≈ +1.5 pts; each +0.5% slope ≈ +1 pt
+            return _clamp(separation_pct * 3.0 + max(0.0, slope_pct) * 2.0 + 2.0)
+
+        elif strategy_name == "mean_reversion":
+            mean, upper, lower, std = _bollinger(closes, 20, 2.0)
+            if std == 0:
+                return 5.0
+            z = (current_price - mean) / std        # negative = below mean = long opportunity
+            rsi = _rsi(closes)
+            # Opportunity when price is extended BELOW mean (fade the drop, buy)
+            below_score = _clamp(-z * 2.5 + 5.0)   # z=-2 → 10, z=0 → 5, z=+1 → 2.5
+            rsi_score = _clamp((50.0 - rsi) / 5.0 + 5.0)  # RSI=30 → 9, RSI=50 → 5, RSI=70 → 1
+            return _clamp(below_score * 0.6 + rsi_score * 0.4)
+
+        elif strategy_name == "adaptive_grid":
+            # Grid works best when ATR is stable (low coefficient of variation)
+            # and price oscillates moderately inside the range
+            atrs = _atr_series(highs, lows, 14)
+            if not atrs:
+                return 5.0
+            atr_mean = sum(atrs) / len(atrs)
+            atr_std = (sum((a - atr_mean) ** 2 for a in atrs) / len(atrs)) ** 0.5
+            atr_cv = atr_std / atr_mean if atr_mean > 0 else 1.0
+            stability_score = _clamp((1.0 - min(atr_cv, 1.0)) * 8.0 + 2.0)
+
+            # Moderate price oscillation = grid fill opportunities
+            recent_c = closes[-20:]
+            rc_mean = sum(recent_c) / len(recent_c)
+            rc_std = (sum((p - rc_mean) ** 2 for p in recent_c) / len(recent_c)) ** 0.5
+            oscillation_pct = rc_std / rc_mean * 100.0 if rc_mean > 0 else 0.0
+            # 0.3–1.0% oscillation = ideal; above 2% grid may break
+            if oscillation_pct <= 1.0:
+                osc_score = _clamp(oscillation_pct * 5.0)
+            else:
+                osc_score = _clamp(10.0 - (oscillation_pct - 1.0) * 4.0)
+
+            return _clamp(stability_score * 0.6 + osc_score * 0.4)
+
+        elif strategy_name == "volatility_breakout":
+            # Score = compression quality (tight BB relative to history)
+            mean, upper, lower, std = _bollinger(closes, 20, 2.0)
+            if mean == 0:
+                return 5.0
+            bb_width_pct = (upper - lower) / mean * 100.0
+
+            # Rolling BB widths to compute compression percentile
+            bb_widths = []
+            for i in range(20, n):
+                w = closes[i - 20:i]
+                m = sum(w) / 20
+                s = (sum((p - m) ** 2 for p in w) / 20) ** 0.5
+                bb_widths.append(4.0 * s / m * 100.0 if m > 0 else 0.0)
+
+            if not bb_widths:
+                return 5.0
+            avg_width = sum(bb_widths) / len(bb_widths)
+            compression_ratio = bb_width_pct / avg_width if avg_width > 0 else 1.0
+
+            # Tight compression (ratio < 0.5) → high score; already expanding (>1.5) → 0
+            compression_score = _clamp((1.0 - compression_ratio) * 10.0 + 5.0)
+
+            # Bonus if ATR just started expanding (breakout building)
+            atrs = _atr_series(highs, lows, 7)
+            if len(atrs) >= 2:
+                atr_accel = atrs[-1] / atrs[-2] if atrs[-2] > 0 else 1.0
+                expansion_bonus = _clamp((atr_accel - 1.0) * 20.0)
+            else:
+                expansion_bonus = 0.0
+
+            return _clamp(compression_score * 0.75 + expansion_bonus * 0.25)
+
+        elif strategy_name == "funding_carry":
+            # Funding rate requires exchange API; proxy on trend + vol direction
+            trend = current_regime.get("trend_state", "flat")
+            vol_dir = current_regime.get("volatility_direction", "stable")
+            score = 5.0
+            if trend == "up":
+                score += 2.0    # uptrend = best environment for positive carry
+            elif trend == "down":
+                score -= 2.0    # downtrend = adverse
+            if vol_dir == "contracting":
+                score += 1.0    # low and falling vol = stable carry environment
+            elif vol_dir == "expanding":
+                score -= 1.0    # expanding vol = higher risk to carry position
+            return _clamp(score)
+
+        elif strategy_name == "dca_accumulator":
+            # Attractiveness = how far price has fallen from recent high (buy the dip)
+            recent_c = closes[-min(30, n):]
+            recent_high = max(recent_c)
+            drawdown_pct = (recent_high - current_price) / recent_high * 100.0 if recent_high > 0 else 0.0
+            # 0% drawdown → 3.0 (DCA is always mildly desirable as fallback)
+            # 5% drawdown → ~10 (strong accumulation opportunity)
+            return _clamp(drawdown_pct * 1.4 + 3.0)
+
+        return 5.0  # neutral for unknown strategies
+
     def _score_strategy(
         self,
         strategy_name: str,
         capabilities: dict,
-        strategy_metrics: dict
-    ) -> float:
-        """Calculate risk-adjusted effective priority for a strategy.
+        strategy_metrics: dict,
+        bar_history: Optional[list] = None,
+        current_price: float = 0.0,
+        current_regime: Optional[dict] = None,
+    ) -> dict:
+        """Calculate market-first, performance-adjusted priority for a strategy.
 
         Formula:
-            effective_priority = base_priority + performance_bonus - risk_penalty
+            final_score = (opportunity_score × 3) + performance_score - risk_penalty
 
-        Where:
-            - performance_bonus is proportional to recent_pnl_pct (capped)
-            - risk_penalty grows aggressively with drawdown and failures
-            - Risk penalty MUST dominate performance bonus
+        Step 1 — Opportunity score (dominant, 0–10):
+            Live market conditions matching the strategy's setup.
+            Returns 5.0 when bar_history is unavailable.
 
-        Args:
-            strategy_name: Name of strategy
-            capabilities: Strategy capability dict
-            strategy_metrics: Performance metrics
+        Step 2 — Performance score with confidence weighting:
+            confidence = min(1.0, total_trades / 50)
+            raw_performance = pnl + win_rate + profit_factor components
+            performance_score = raw_performance × confidence
+
+        Step 3 — Risk penalty (structural risks only):
+            - Exponential drawdown penalty
+            - Failure count penalty
+            - Recent exit cooling period
+            Inactivity alone is NOT penalised — the opportunity score handles
+            whether there is a setup present.
 
         Returns:
-            Effective priority score (float)
+            dict with keys: final, opportunity, performance, confidence, risk_penalty
         """
-        base_priority = capabilities.get("priority", 0)
+        bar_history = bar_history or []
+        current_regime = current_regime or {"trend_state": "flat", "volatility_state": "medium",
+                                            "volatility_direction": "stable", "liquidity_state": "normal"}
 
-        # Performance bonus — composed from PnL, win rate, profit factor, trade count
-        recent_pnl_pct = strategy_metrics.get("recent_pnl_pct", 0.0)
-        performance_bonus = recent_pnl_pct / 5.0  # +/-20% PnL ≈ +/-4, before cap
+        # --- Step 1: Opportunity score ---
+        opportunity = self._compute_opportunity_score(
+            strategy_name, bar_history, current_price, current_regime
+        )
 
+        # --- Step 2: Performance score with confidence weighting ---
         total_trades = strategy_metrics.get("total_trades", 0)
+        confidence = min(1.0, total_trades / 50.0)
+
+        recent_pnl_pct = strategy_metrics.get("recent_pnl_pct", 0.0)
         win_rate = strategy_metrics.get("win_rate", 0.0)
         profit_factor = strategy_metrics.get("profit_factor", 0.0)
 
+        raw_perf = recent_pnl_pct / 5.0   # ±20% PnL ≈ ±4 before confidence
+
         if total_trades >= 3:
-            # Win rate component: 50% = neutral; each +10% = +0.25 bonus
-            performance_bonus += (win_rate - 0.5) * 2.5
-
-            # Profit factor component: 1.0 = neutral
+            raw_perf += (win_rate - 0.5) * 2.5   # 50% WR = neutral; +10% WR = +0.25
             if profit_factor > 1.0:
-                performance_bonus += min(0.5, (profit_factor - 1.0) * 0.5)
+                raw_perf += min(0.5, (profit_factor - 1.0) * 0.5)
             elif 0.0 < profit_factor < 1.0:
-                performance_bonus -= min(0.5, (1.0 - profit_factor) * 0.5)
+                raw_perf -= min(0.5, (1.0 - profit_factor) * 0.5)
 
-        # Small bonus for strategies that actually generate trades (proven activity)
         if total_trades > 0:
-            performance_bonus += min(0.5, total_trades / 40.0)
+            raw_perf += min(0.5, total_trades / 40.0)   # activity evidence bonus
 
-        performance_bonus = min(2.0, max(-2.0, performance_bonus))
+        raw_perf = min(4.0, max(-4.0, raw_perf))
+        performance = raw_perf * confidence
 
-        # Risk penalty
+        # --- Step 3: Risk penalty (structural only) ---
         risk_penalty = 0.0
 
-        # Drawdown penalty (exponential: 5%=-1, 10%=-4, 15%=-9, 20%=-16)
+        # Drawdown: exponential (5%→1, 10%→4, 15%→9, 20%→16)
         max_drawdown_pct = strategy_metrics.get("max_drawdown_pct", 0.0)
         if max_drawdown_pct > 0:
             risk_penalty += (max_drawdown_pct / 5.0) ** 2
 
-        # Failure penalty (linear and heavy)
+        # Hard failure signals (kill switches, stop-loss trips)
         failure_count = strategy_metrics.get("failure_count", 0)
         risk_penalty += failure_count * 5.0
 
-        # Recent exit penalty (discourage recently exited strategies)
+        # Recent exit cooling (prevents immediate re-entry after forced exit)
         last_exit_time = strategy_metrics.get("last_exit_time")
         if last_exit_time:
             try:
                 exit_time = datetime.fromisoformat(last_exit_time)
                 hours_since_exit = (datetime.utcnow() - exit_time).total_seconds() / 3600
-                if hours_since_exit < 1:
+                if hours_since_exit < 1.0:
                     risk_penalty += 3.0
-                elif hours_since_exit < 6:
+                elif hours_since_exit < 6.0:
                     risk_penalty += 1.0
             except (ValueError, TypeError):
                 pass
 
-        # Inactivity penalty — aggressive two-phase decay so auto-mode actively
-        # rotates away from strategies that are eligible but produce no trades.
-        #
-        # Grace 1 h → no penalty.
-        # Phase 1 (h 1–13): 0.4 pts/h.  At h 13: 4.8 pts.
-        # Phase 2 (h 13+): 0.8 pts/h.   Hard cap: 8.0 pts.
-        #
-        # Effect: prio-4 (TF) drops below DCA after ~11 h inactive.
-        #         prio-2 (grid) drops below DCA after ~6 h inactive.
-        _INACTIVITY_GRACE = 1.0
-        _INACTIVITY_RATE_1 = 0.4
-        _INACTIVITY_RATE_2 = 0.8
-        _INACTIVITY_PHASE1_HRS = 12.0
-        _INACTIVITY_MAX = 8.0
+        # --- Final score ---
+        final = (opportunity * 3.0) + performance - risk_penalty
 
-        last_trade_str = strategy_metrics.get("last_trade_time")
-        activated_str = strategy_metrics.get("activated_at")
-        baseline_str = last_trade_str or activated_str
-        if baseline_str:
-            try:
-                baseline_dt = datetime.fromisoformat(baseline_str)
-                hours_inactive = (datetime.utcnow() - baseline_dt).total_seconds() / 3600
-                if hours_inactive > _INACTIVITY_GRACE:
-                    over = hours_inactive - _INACTIVITY_GRACE
-                    phase1 = min(over, _INACTIVITY_PHASE1_HRS) * _INACTIVITY_RATE_1
-                    phase2 = max(0.0, over - _INACTIVITY_PHASE1_HRS) * _INACTIVITY_RATE_2
-                    risk_penalty += min(phase1 + phase2, _INACTIVITY_MAX)
-            except (ValueError, TypeError):
-                pass
-
-        effective_priority = base_priority + performance_bonus - risk_penalty
-
-        return effective_priority
+        return {
+            "final": final,
+            "opportunity": opportunity,
+            "performance": performance,
+            "confidence": confidence,
+            "risk_penalty": risk_penalty,
+        }
 
     async def _update_strategy_performance_metrics(
         self,
@@ -4328,20 +4545,27 @@ class TradingEngine:
         log_msg += f"{'-' * 80}\n"
         log_msg += f"Regime: {regime_str}\n"
         log_msg += f"Selected: {selected_strategy} (switched: {should_switch})\n"
-        log_msg += f"Reason: {switch_reason}\n"
-        log_msg += f"\n"
+        log_msg += f"Reason: {switch_reason}\n\n"
 
-        log_msg += f"Eligible Strategies ({len(eligible_strategies)}):\n"
-        for name, score, caps, metrics in scored_strategies:
-            pnl = metrics.get("recent_pnl_pct", 0.0)
-            dd = metrics.get("max_drawdown_pct", 0.0)
-            failures = metrics.get("failure_count", 0)
-            log_msg += f"  - {name:30s} score={score:6.2f} pnl={pnl:+6.2f}% dd={dd:5.2f}% failures={failures}\n"
+        log_msg += (
+            f"{'Strategy':<22} {'Final':>6} {'Oppty':>6} {'Perf':>6} "
+            f"{'Conf':>5} {'Risk':>5} {'Trades':>6}\n"
+        )
+        log_msg += f"{'-' * 60}\n"
+        for entry in scored_strategies:
+            name, score, caps, metrics, detail = entry
+            trades = metrics.get("total_trades", 0)
+            marker = " ◀" if name == selected_strategy else ""
+            log_msg += (
+                f"  {name:<20} {score:>6.2f} {detail['opportunity']:>6.2f} "
+                f"{detail['performance']:>6.2f} {detail['confidence']:>5.2f} "
+                f"{detail['risk_penalty']:>5.2f} {trades:>6}{marker}\n"
+            )
 
         if ineligible_reasons:
-            log_msg += f"\nIneligible Strategies ({len(ineligible_reasons)}):\n"
+            log_msg += f"\nIneligible ({len(ineligible_reasons)}):\n"
             for name, reason in ineligible_reasons.items():
-                log_msg += f"  - {name:30s} {reason}\n"
+                log_msg += f"  - {name:<22} {reason}\n"
 
         log_msg += f"{'=' * 80}\n"
 
@@ -4360,30 +4584,40 @@ class TradingEngine:
         """
         return {
             "trend_following": {
-                "allowed_regimes": ["trend_up"],
+                # trend_up: classic momentum setup
+                # volatility_expanding: early breakout phase, TF capitalises on
+                #   expanding moves before "trend_up" is confirmed
+                "allowed_regimes": ["trend_up", "volatility_expanding"],
                 "priority": 4,
                 "typical_holding_time": "long",
                 "description": "Best for sustained uptrends with clear momentum"
             },
             "volatility_breakout": {
-                "allowed_regimes": ["volatility_high", "volatility_expanding"],
+                # volatility_contracting: compression phase — ATR shrinking means
+                #   a squeeze is building; "breakout conditions building" = high opp score
+                # volatility_low: absolute low vol also signals compression
+                "allowed_regimes": ["volatility_contracting", "volatility_low"],
                 "priority": 3,
                 "typical_holding_time": "medium",
                 "description": "Captures breakouts after volatility compression"
             },
             "mean_reversion": {
-                "allowed_regimes": ["trend_flat", "volatility_high"],
+                # Only eligible in flat/ranging markets; TF flips, expanding vol
+                # both indicate a trending move that breaks mean-reversion
+                "allowed_regimes": ["trend_flat"],
                 "priority": 2,
                 "typical_holding_time": "short",
                 "description": "Profits from price mean reversion in choppy markets"
             },
             "adaptive_grid": {
-                "allowed_regimes": ["trend_flat", "volatility_medium"],
+                # Flat trend + stable/medium volatility = ideal grid conditions
+                "allowed_regimes": ["trend_flat", "volatility_medium", "volatility_stable"],
                 "priority": 2,
                 "typical_holding_time": "medium",
                 "description": "Range-bound grid trading for sideways markets"
             },
             "funding_carry": {
+                # Eligible in uptrend and flat markets; downtrend disqualifies
                 "allowed_regimes": ["trend_up", "trend_flat"],
                 "priority": 3,
                 "typical_holding_time": "long",
@@ -4391,6 +4625,7 @@ class TradingEngine:
             },
             # Note: VWAP removed - it is an execution algorithm, not an alpha strategy
             "dca_accumulator": {
+                # Always eligible as the default fallback accumulator
                 "allowed_regimes": ["all"],
                 "priority": 0,
                 "typical_holding_time": "long",
