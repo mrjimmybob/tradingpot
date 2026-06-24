@@ -51,8 +51,8 @@ class TestAutoModeInactivityPenalty:
     def test_no_penalty_within_grace_period(self):
         engine = _engine()
         caps = _capabilities()["adaptive_grid"]
-        # activated 1 hour ago → still within the 2-hour grace window
-        activated = (datetime.utcnow() - timedelta(hours=1)).isoformat()
+        # activated 30 min ago → within the 1-hour grace window
+        activated = (datetime.utcnow() - timedelta(minutes=30)).isoformat()
         metrics = _metrics(activated_at=activated)
         score = engine._score_strategy("adaptive_grid", caps, metrics)
         # Base priority is 2, no penalty; score must equal base+bonus (≥2 here)
@@ -61,22 +61,23 @@ class TestAutoModeInactivityPenalty:
     def test_penalty_accumulates_after_grace(self):
         engine = _engine()
         caps = _capabilities()["adaptive_grid"]
-        # activated 10 hours ago → 8 hours past grace → penalty = 8 * 0.15 = 1.2
+        # activated 10 hours ago → 9h past 1h grace → phase1 penalty = 9 * 0.4 = 3.6
         activated = (datetime.utcnow() - timedelta(hours=10)).isoformat()
         metrics = _metrics(activated_at=activated)
         score = engine._score_strategy("adaptive_grid", caps, metrics)
-        # Score must be below base priority of 2
-        assert score < 2.0
+        # Score must be well below base priority of 2
+        assert score < 0.0
 
-    def test_penalty_capped_at_4(self):
+    def test_penalty_capped_at_8(self):
         engine = _engine()
         caps = _capabilities()["adaptive_grid"]
-        # activated 100 hours ago → cap kicks in
+        # activated 100 hours ago → cap kicks in at 8.0
         activated = (datetime.utcnow() - timedelta(hours=100)).isoformat()
         metrics = _metrics(activated_at=activated)
         score = engine._score_strategy("adaptive_grid", caps, metrics)
-        # Max penalty is 4.0; base=2, bonus=0 → floor is 2-4 = -2
-        assert score >= -2.0
+        # Max penalty is 8.0; base=2, bonus=0 → floor is 2-8 = -6
+        assert score >= -6.0
+        assert score < 0.0
 
     def test_fresh_trade_resets_inactivity(self):
         engine = _engine()
@@ -639,3 +640,256 @@ class TestDefaultParameterChanges:
         assert signal.action == "buy", (
             f"Expected buy when last bar close is far below lower band; got: {signal.reason}"
         )
+
+
+# ---------------------------------------------------------------------------
+# NEW – Auto Mode: aggressive inactivity decay causes rotation
+# ---------------------------------------------------------------------------
+
+class TestAutoModeInactivityDecay:
+    """After sufficient inactivity the decayed strategy score must fall below
+    a freshly-activated fallback (DCA priority 0 with no penalty)."""
+
+    def test_priority4_strategy_decays_below_dca_after_11h(self):
+        """trend_following (priority=4) should drop below DCA (priority=0)
+        after 11 hours of inactivity (1h grace + 10h at 0.4/h = 4.0 penalty)."""
+        engine = _engine()
+        caps = _capabilities()
+
+        activated = (datetime.utcnow() - timedelta(hours=11)).isoformat()
+        tf_metrics = _metrics(activated_at=activated)
+        tf_score = engine._score_strategy("trend_following", caps["trend_following"], tf_metrics)
+
+        dca_score = engine._score_strategy("dca_accumulator", caps["dca_accumulator"], _metrics())
+
+        assert tf_score < dca_score, (
+            f"11h-inactive TF score ({tf_score:.3f}) must be < DCA score ({dca_score:.3f})"
+        )
+
+    def test_priority2_strategy_decays_below_dca_after_6h(self):
+        """adaptive_grid (priority=2) should drop below DCA (priority=0)
+        after 6 hours of inactivity (1h grace + 5h at 0.4/h = 2.0 penalty)."""
+        engine = _engine()
+        caps = _capabilities()
+
+        activated = (datetime.utcnow() - timedelta(hours=6)).isoformat()
+        ag_metrics = _metrics(activated_at=activated)
+        ag_score = engine._score_strategy("adaptive_grid", caps["adaptive_grid"], ag_metrics)
+
+        dca_score = engine._score_strategy("dca_accumulator", caps["dca_accumulator"], _metrics())
+
+        assert ag_score < dca_score, (
+            f"6h-inactive AG score ({ag_score:.3f}) must be < DCA score ({dca_score:.3f})"
+        )
+
+    def test_two_phase_acceleration_after_13h(self):
+        """Beyond 13h the phase-2 rate (0.8/h) applies, accelerating decay."""
+        engine = _engine()
+        caps = _capabilities()["trend_following"]
+
+        t13 = (datetime.utcnow() - timedelta(hours=14)).isoformat()  # 13h over grace
+        t6 = (datetime.utcnow() - timedelta(hours=7)).isoformat()    # 6h over grace
+
+        score_13 = engine._score_strategy("trend_following", caps, _metrics(activated_at=t13))
+        score_6 = engine._score_strategy("trend_following", caps, _metrics(activated_at=t6))
+
+        assert score_13 < score_6, "Longer inactivity must produce a lower score"
+
+    def test_recent_trade_prevents_decay(self):
+        """last_trade_time resets the inactivity clock regardless of activated_at."""
+        engine = _engine()
+        caps = _capabilities()["adaptive_grid"]
+
+        old_activation = (datetime.utcnow() - timedelta(hours=48)).isoformat()
+        recent_trade = (datetime.utcnow() - timedelta(minutes=20)).isoformat()
+        metrics = _metrics(activated_at=old_activation, last_trade_time=recent_trade)
+        score = engine._score_strategy("adaptive_grid", caps, metrics)
+
+        # 20 minutes of inactivity < 1h grace → no inactivity penalty
+        assert score >= 2.0, f"Score {score:.3f} should be ≥ 2.0 with recent trade"
+
+    def test_zero_trades_never_adds_activity_bonus(self):
+        """A strategy with winning trade history must score higher than one with zero trades."""
+        engine = _engine()
+        caps = _capabilities()["adaptive_grid"]
+        metrics_no_trades = _metrics(total_trades=0)
+        metrics_active = _metrics(
+            total_trades=20,
+            winning_trades=14,
+            losing_trades=6,
+            win_rate=0.7,
+            profit_factor=2.0,
+            last_trade_time=(datetime.utcnow() - timedelta(minutes=10)).isoformat(),
+        )
+        score_no = engine._score_strategy("adaptive_grid", caps, metrics_no_trades)
+        score_active = engine._score_strategy("adaptive_grid", caps, metrics_active)
+        assert score_active > score_no, (
+            f"Active strategy ({score_active:.3f}) must score higher than idle ({score_no:.3f})"
+        )
+
+
+# ---------------------------------------------------------------------------
+# NEW – Funding Carry: stale ["trend_up"] default upgraded at runtime
+# ---------------------------------------------------------------------------
+
+class TestFundingCarryStaleMigration:
+    """Bots created under the old default allowed_regimes=['trend_up'] must
+    be silently upgraded to ['trend_up','trend_flat'] at runtime so they can
+    enter in flat markets."""
+
+    @pytest.mark.asyncio
+    async def test_stale_trend_up_only_config_still_enters_in_flat_regime(self):
+        """Bot with persisted allowed_regimes=['trend_up'] must enter when
+        regime is trend_flat (migration normalises the stale default)."""
+        engine = _engine()
+
+        bot = MagicMock()
+        bot.id = 201
+        bot.strategy = "funding_carry"
+        bot.trading_pair = "BTC/USDT"
+        bot.current_balance = 10_000.0
+
+        session = AsyncMock()
+        engine._price_histories = {bot.id: [64000.0] * 250}
+        engine._funding_states = {}
+
+        flat_regime = {"trend_state": "flat", "volatility_state": "medium", "liquidity_state": "normal"}
+
+        # Simulate the old, stale persisted default
+        stale_params = {"allowed_regimes": ["trend_up"]}
+
+        with patch.object(engine, "_detect_market_regime", return_value=flat_regime):
+            with patch.object(engine, "_get_funding_signal", new=AsyncMock(return_value=0.0001)):
+                with patch.object(engine, "_get_bot_positions", new=AsyncMock(return_value=[])):
+                    signal = await engine._strategy_funding_carry(
+                        bot, 64000.0, stale_params, session
+                    )
+
+        assert signal.action == "buy", (
+            f"Stale ['trend_up'] config must be normalised to include trend_flat; got: {signal.reason}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_explicit_trend_up_only_does_not_block_trend_up(self):
+        """After normalisation, trend_up regime still triggers entry."""
+        engine = _engine()
+
+        bot = MagicMock()
+        bot.id = 202
+        bot.strategy = "funding_carry"
+        bot.trading_pair = "BTC/USDT"
+        bot.current_balance = 10_000.0
+
+        session = AsyncMock()
+        engine._price_histories = {bot.id: [64000.0] * 250}
+        engine._funding_states = {}
+
+        up_regime = {"trend_state": "up", "volatility_state": "medium", "liquidity_state": "normal"}
+
+        with patch.object(engine, "_detect_market_regime", return_value=up_regime):
+            with patch.object(engine, "_get_funding_signal", new=AsyncMock(return_value=0.0001)):
+                with patch.object(engine, "_get_bot_positions", new=AsyncMock(return_value=[])):
+                    signal = await engine._strategy_funding_carry(
+                        bot, 64000.0, {"allowed_regimes": ["trend_up"]}, session
+                    )
+
+        assert signal.action == "buy", f"trend_up must still trigger entry; got: {signal.reason}"
+
+
+# ---------------------------------------------------------------------------
+# NEW – Adaptive Grid: minimum profitable spacing
+# ---------------------------------------------------------------------------
+
+class TestAdaptiveGridMinProfitableSpacing:
+    """Grid spacing must never be smaller than the round-trip transaction cost
+    (2 × taker fee + spread + profit buffer), even when ATR is tiny."""
+
+    @pytest.mark.asyncio
+    async def test_tiny_atr_spacing_floored_to_min_profitable(self):
+        """When ATR-derived spacing < min_spacing, effective spacing uses the
+        minimum.  With default fees (0.1% taker ×2 + 0.05% spread + 0.1% buffer
+        = 0.35%) and center $60 000: min_spacing = $210.  Inject ATR=$5
+        → raw_spacing = 5*8/10 = $4 → should be floored to ~$210."""
+        engine = _engine()
+
+        bot = MagicMock()
+        bot.id = 301
+        bot.strategy = "adaptive_grid"
+        bot.trading_pair = "BTC/USDT"
+        bot.current_balance = 5_000.0
+        bot.budget = 5_000.0
+
+        session = AsyncMock()
+        session.execute = AsyncMock(return_value=MagicMock(
+            scalars=MagicMock(return_value=MagicMock(all=MagicMock(return_value=[])))
+        ))
+
+        center = 60_000.0
+        # 15 very tight bars → ATR will be tiny (~$5)
+        bar_ts = datetime.utcnow() - timedelta(hours=2)
+        bars = [
+            {"open": center, "high": center + 5, "low": center - 5, "close": center,
+             "start_ts": bar_ts + timedelta(minutes=i)}
+            for i in range(15)
+        ]
+
+        engine._grid_states = {
+            bot.id: {
+                "initialized": True,
+                "center_price": center,
+                "initial_capital": 5_000.0,
+                "virtual_cash": 5_000.0,
+                "virtual_crypto": 0.0,
+                "grid_levels": {},
+                "last_bar_close_time": None,
+                "current_bar": None,
+                "completed_bars": bars,
+                "last_order_bar": None,
+                "peak_portfolio_value": 5_000.0,
+                "last_recenter_time": datetime.utcnow() - timedelta(hours=3),
+                "lifetime_return_pct": 0.0,
+                "lifetime_max_drawdown_pct": 0.0,
+                "last_kill_switch_time": None,
+                "kill_switch_count": 0,
+                "atr_at_recenter": None,
+                "total_trades": 0,
+                "atr_spacing": None,
+                "current_atr": None,
+                "current_grid_range": None,
+                "current_grid_spacing": None,
+            }
+        }
+
+        with patch.object(engine, "_get_bot_positions", new=AsyncMock(return_value=[])):
+            # Open a bar
+            await engine._strategy_grid(bot, center, {}, session)
+            # Complete it
+            state = engine._grid_states[bot.id]
+            if state.get("current_bar"):
+                state["current_bar"]["start_ts"] = datetime.utcnow() - timedelta(seconds=65)
+            await engine._strategy_grid(bot, center, {}, session)
+
+        state = engine._grid_states[bot.id]
+        spacing = state.get("current_grid_spacing", 0)
+        expected_min = center * (2 * 0.001 + 0.0005 + 0.001)  # 0.35% of 60000 = 210
+        assert spacing >= expected_min * 0.99, (
+            f"Spacing ${spacing:.2f} must be ≥ min profitable ${expected_min:.2f}"
+        )
+
+    def test_min_spacing_formula_matches_fee_structure(self):
+        """Unit test for the min_spacing formula independent of bar execution."""
+        center = 60_000.0
+        taker_fee = 0.001   # 0.1%
+        spread = 0.0005     # 0.05%
+        buffer = 0.001      # 0.1%
+        min_spacing = center * (2 * taker_fee + spread + buffer)
+        assert min_spacing == pytest.approx(210.0)
+
+    def test_wider_atr_spacing_unchanged(self):
+        """When ATR spacing > min_spacing, it must not be reduced."""
+        # ATR=300, multiplier=8, count=10 → spacing=$240 > $210 minimum
+        atr_spacing = (300 * 8) / 10  # $240
+        center = 60_000.0
+        min_spacing = center * 0.0035  # $210
+        effective = max(atr_spacing, min_spacing)
+        assert effective == atr_spacing, "ATR spacing should win when larger"

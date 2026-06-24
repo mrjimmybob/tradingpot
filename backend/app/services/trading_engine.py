@@ -1234,6 +1234,19 @@ class TradingEngine:
             grid_spacing = center_price * atr_warmup_spacing_pct
             grid_range = grid_spacing * grid_count
 
+        # Minimum economically viable spacing: grid profit per cycle must exceed
+        # round-trip transaction costs (two taker fills + bid-ask spread) plus a
+        # configurable profit buffer.  This prevents the grid from targeting
+        # profit smaller than fees, which would make every trade a net loser.
+        taker_fee_pct = params.get("taker_fee_pct", 0.1) / 100.0
+        spread_pct = params.get("spread_pct", 0.05) / 100.0
+        min_profit_buffer_pct = params.get("min_profit_buffer_pct", 0.1) / 100.0
+        min_spacing_usd = center_price * (2.0 * taker_fee_pct + spread_pct + min_profit_buffer_pct)
+
+        if grid_spacing < min_spacing_usd:
+            grid_spacing = min_spacing_usd
+            grid_range = grid_spacing * grid_count
+
         grid_half_range = grid_range / 2.0  # each side extends this far from center
 
         # Update diagnostic state every bar
@@ -2574,6 +2587,11 @@ class TradingEngine:
         max_funding = params.get("max_funding_rate", 0.0005)
         lookback = int(params.get("funding_lookback_periods", 3))
         allowed_regimes = params.get("allowed_regimes", ["trend_up", "trend_flat"])
+        # Migrate stale single-element default written before trend_flat was added.
+        # Bots created under the old default have ["trend_up"] persisted in the DB;
+        # the code default now includes "trend_flat" so we silently upgrade.
+        if allowed_regimes == ["trend_up"]:
+            allowed_regimes = ["trend_up", "trend_flat"]
         max_alloc = params.get("max_allocation_percent", 20.0) / 100.0
         cooldown_seconds = params.get("cooldown_seconds", 300)
         refresh_seconds = params.get("funding_refresh_seconds", 300)
@@ -3878,22 +3896,41 @@ class TradingEngine:
         """
         base_priority = capabilities.get("priority", 0)
 
-        # Performance bonus (capped at +2.0)
+        # Performance bonus — composed from PnL, win rate, profit factor, trade count
         recent_pnl_pct = strategy_metrics.get("recent_pnl_pct", 0.0)
-        performance_bonus = min(2.0, max(-2.0, recent_pnl_pct / 5.0))  # +/-20% PnL = +/-4 bonus, capped at +/-2
+        performance_bonus = recent_pnl_pct / 5.0  # +/-20% PnL ≈ +/-4, before cap
 
-        # Risk penalty (aggressive)
+        total_trades = strategy_metrics.get("total_trades", 0)
+        win_rate = strategy_metrics.get("win_rate", 0.0)
+        profit_factor = strategy_metrics.get("profit_factor", 0.0)
+
+        if total_trades >= 3:
+            # Win rate component: 50% = neutral; each +10% = +0.25 bonus
+            performance_bonus += (win_rate - 0.5) * 2.5
+
+            # Profit factor component: 1.0 = neutral
+            if profit_factor > 1.0:
+                performance_bonus += min(0.5, (profit_factor - 1.0) * 0.5)
+            elif 0.0 < profit_factor < 1.0:
+                performance_bonus -= min(0.5, (1.0 - profit_factor) * 0.5)
+
+        # Small bonus for strategies that actually generate trades (proven activity)
+        if total_trades > 0:
+            performance_bonus += min(0.5, total_trades / 40.0)
+
+        performance_bonus = min(2.0, max(-2.0, performance_bonus))
+
+        # Risk penalty
         risk_penalty = 0.0
 
-        # Drawdown penalty (exponential)
+        # Drawdown penalty (exponential: 5%=-1, 10%=-4, 15%=-9, 20%=-16)
         max_drawdown_pct = strategy_metrics.get("max_drawdown_pct", 0.0)
         if max_drawdown_pct > 0:
-            # Penalty grows exponentially: 5% = -1, 10% = -4, 15% = -9, 20% = -16
             risk_penalty += (max_drawdown_pct / 5.0) ** 2
 
         # Failure penalty (linear and heavy)
         failure_count = strategy_metrics.get("failure_count", 0)
-        risk_penalty += failure_count * 5.0  # Each failure = -5 priority
+        risk_penalty += failure_count * 5.0
 
         # Recent exit penalty (discourage recently exited strategies)
         last_exit_time = strategy_metrics.get("last_exit_time")
@@ -3902,18 +3939,27 @@ class TradingEngine:
                 exit_time = datetime.fromisoformat(last_exit_time)
                 hours_since_exit = (datetime.utcnow() - exit_time).total_seconds() / 3600
                 if hours_since_exit < 1:
-                    risk_penalty += 3.0  # Heavy penalty if exited < 1h ago
+                    risk_penalty += 3.0
                 elif hours_since_exit < 6:
-                    risk_penalty += 1.0  # Moderate penalty if exited < 6h ago
+                    risk_penalty += 1.0
             except (ValueError, TypeError):
                 pass
 
-        # Inactivity penalty: a strategy that produces no trades while selected
-        # loses score at 0.15 priority/hour after a 2-hour grace period (capped
-        # at -4.0). This prevents auto mode from parking indefinitely on an
-        # eligible but non-participating strategy. last_trade_time is set each
-        # time the sub-strategy returns a buy/sell; activated_at is set on
-        # strategy switch. The baseline is the more recent of the two.
+        # Inactivity penalty — aggressive two-phase decay so auto-mode actively
+        # rotates away from strategies that are eligible but produce no trades.
+        #
+        # Grace 1 h → no penalty.
+        # Phase 1 (h 1–13): 0.4 pts/h.  At h 13: 4.8 pts.
+        # Phase 2 (h 13+): 0.8 pts/h.   Hard cap: 8.0 pts.
+        #
+        # Effect: prio-4 (TF) drops below DCA after ~11 h inactive.
+        #         prio-2 (grid) drops below DCA after ~6 h inactive.
+        _INACTIVITY_GRACE = 1.0
+        _INACTIVITY_RATE_1 = 0.4
+        _INACTIVITY_RATE_2 = 0.8
+        _INACTIVITY_PHASE1_HRS = 12.0
+        _INACTIVITY_MAX = 8.0
+
         last_trade_str = strategy_metrics.get("last_trade_time")
         activated_str = strategy_metrics.get("activated_at")
         baseline_str = last_trade_str or activated_str
@@ -3921,8 +3967,11 @@ class TradingEngine:
             try:
                 baseline_dt = datetime.fromisoformat(baseline_str)
                 hours_inactive = (datetime.utcnow() - baseline_dt).total_seconds() / 3600
-                if hours_inactive > 2.0:
-                    risk_penalty += min((hours_inactive - 2.0) * 0.15, 4.0)
+                if hours_inactive > _INACTIVITY_GRACE:
+                    over = hours_inactive - _INACTIVITY_GRACE
+                    phase1 = min(over, _INACTIVITY_PHASE1_HRS) * _INACTIVITY_RATE_1
+                    phase2 = max(0.0, over - _INACTIVITY_PHASE1_HRS) * _INACTIVITY_RATE_2
+                    risk_penalty += min(phase1 + phase2, _INACTIVITY_MAX)
             except (ValueError, TypeError):
                 pass
 
@@ -3939,23 +3988,20 @@ class TradingEngine:
     ) -> None:
         """Update per-strategy performance metrics on bar close.
 
-        Tracks:
-        - recent_pnl_pct: Rolling window PnL percentage
-        - max_drawdown_pct: Maximum drawdown observed
-        - failure_count: Number of failures
-        - last_exit_time: Timestamp of last exit
+        Groups the last 50 filled orders by strategy name (extracted from the
+        [Auto:strategy|regime] reason prefix).  For each strategy computes:
+        - total_trades, winning_trades, losing_trades  (from consecutive balance Δ)
+        - win_rate, profit_factor, realized_pnl_usd
+        - recent_pnl_pct (rolling window %)
+        - max_drawdown_pct (worst ever, monotonically increasing)
+        - last_trade_time
 
-        Args:
-            bot_id: Bot ID
-            auto_state: Auto mode state
-            session: Database session
-            performance_window: Number of bars for rolling window
+        All of these flow into _score_strategy for priority calculation.
         """
-        # Get recent orders to calculate PnL
         query = select(Order).where(
             Order.bot_id == bot_id,
             Order.status == OrderStatus.FILLED
-        ).order_by(Order.filled_at.desc()).limit(50)
+        ).order_by(Order.filled_at.asc()).limit(50)
 
         result = await session.execute(query)
         orders = result.scalars().all()
@@ -3963,26 +4009,18 @@ class TradingEngine:
         if not orders:
             return
 
-        # Group orders by strategy (extracted from reason field)
-        strategy_pnl = {}
-        strategy_orders = {}
-
+        # Group orders by strategy; keep chronological order (ascending fill time)
+        strategy_orders: dict = {}
         for order in orders:
-            # Extract strategy from reason (format: "[Auto:strategy_name|regime] reason")
             reason = order.reason or ""
-            if reason.startswith("[Auto:"):
-                strategy_part = reason.split("|")[0].replace("[Auto:", "")
-                strategy_name = strategy_part.strip()
+            if not reason.startswith("[Auto:"):
+                continue
+            strategy_part = reason.split("|")[0].replace("[Auto:", "").strip()
+            if strategy_part not in strategy_orders:
+                strategy_orders[strategy_part] = []
+            if order.running_balance_after is not None:
+                strategy_orders[strategy_part].append(order)
 
-                if strategy_name not in strategy_pnl:
-                    strategy_pnl[strategy_name] = []
-                    strategy_orders[strategy_name] = []
-
-                # Calculate order PnL (simplified)
-                if order.running_balance_after is not None:
-                    strategy_orders[strategy_name].append(order)
-
-        # Update metrics for each strategy
         strategy_metrics = auto_state.get("strategy_metrics", {})
 
         for strategy_name, orders_list in strategy_orders.items():
@@ -3990,30 +4028,74 @@ class TradingEngine:
                 strategy_metrics[strategy_name] = {
                     "recent_pnl_pct": 0.0,
                     "max_drawdown_pct": 0.0,
+                    "total_trades": 0,
+                    "winning_trades": 0,
+                    "losing_trades": 0,
+                    "realized_pnl_usd": 0.0,
+                    "profit_factor": 0.0,
+                    "win_rate": 0.0,
+                    "last_trade_time": None,
                     "failure_count": 0,
                     "last_exit_time": None,
-                    "cooldown_until": None
+                    "cooldown_until": None,
                 }
 
             metrics = strategy_metrics[strategy_name]
+            window = orders_list[-performance_window:]
 
-            # Calculate recent PnL (simplified - use running balance changes)
-            if len(orders_list) >= 2:
-                recent_orders = orders_list[:min(performance_window, len(orders_list))]
-                start_balance = recent_orders[-1].running_balance_after
-                end_balance = recent_orders[0].running_balance_after
+            # --- last trade time ---
+            if window:
+                last_filled = window[-1].filled_at
+                if last_filled:
+                    metrics["last_trade_time"] = last_filled.isoformat()
 
-                if start_balance and start_balance > 0:
-                    pnl_pct = ((end_balance - start_balance) / start_balance) * 100
+            # --- trade count ---
+            metrics["total_trades"] = len(window)
+
+            # --- win / loss from consecutive balance changes ---
+            # Each consecutive pair (order[i-1], order[i]) represents one "round":
+            # balance increased → win; decreased → loss.
+            gross_profit = 0.0
+            gross_loss = 0.0
+            wins = 0
+            losses = 0
+            realized_pnl = 0.0
+
+            for i in range(1, len(window)):
+                prev_bal = window[i - 1].running_balance_after
+                curr_bal = window[i].running_balance_after
+                if prev_bal is None or curr_bal is None or prev_bal <= 0:
+                    continue
+                delta = curr_bal - prev_bal
+                realized_pnl += delta
+                if delta > 0:
+                    wins += 1
+                    gross_profit += delta
+                elif delta < 0:
+                    losses += 1
+                    gross_loss += abs(delta)
+
+            metrics["winning_trades"] = wins
+            metrics["losing_trades"] = losses
+            metrics["realized_pnl_usd"] = realized_pnl
+            metrics["profit_factor"] = (gross_profit / gross_loss) if gross_loss > 0 else (1.0 if gross_profit > 0 else 0.0)
+            completed = wins + losses
+            metrics["win_rate"] = (wins / completed) if completed > 0 else 0.0
+
+            # --- rolling PnL % over performance_window ---
+            if len(window) >= 2:
+                start_bal = window[0].running_balance_after
+                end_bal = window[-1].running_balance_after
+                if start_bal and start_bal > 0:
+                    pnl_pct = ((end_bal - start_bal) / start_bal) * 100
                     metrics["recent_pnl_pct"] = pnl_pct
-
-                    # Update max drawdown
                     if pnl_pct < 0:
-                        metrics["max_drawdown_pct"] = max(metrics["max_drawdown_pct"], abs(pnl_pct))
+                        metrics["max_drawdown_pct"] = max(
+                            metrics.get("max_drawdown_pct", 0.0), abs(pnl_pct)
+                        )
 
         auto_state["strategy_metrics"] = strategy_metrics
 
-        # Persist all updated metrics to database
         await self._save_all_strategy_metrics_to_db(
             bot_id=bot_id,
             all_metrics=strategy_metrics,
@@ -4127,30 +4209,26 @@ class TradingEngine:
         result = await session.execute(query)
         existing = result.scalar_one_or_none()
 
+        def _parse_dt(val):
+            if val is None:
+                return None
+            return datetime.fromisoformat(val) if isinstance(val, str) else val
+
         if existing:
-            # Update existing record
             existing.recent_pnl_pct = metrics.get("recent_pnl_pct", 0.0)
             existing.max_drawdown_pct = metrics.get("max_drawdown_pct", 0.0)
+            existing.total_trades = metrics.get("total_trades", 0)
+            existing.winning_trades = metrics.get("winning_trades", 0)
+            existing.losing_trades = metrics.get("losing_trades", 0)
+            existing.realized_pnl_usd = metrics.get("realized_pnl_usd", 0.0)
+            existing.profit_factor = metrics.get("profit_factor", 0.0)
+            existing.win_rate = metrics.get("win_rate", 0.0)
+            existing.last_trade_time = _parse_dt(metrics.get("last_trade_time"))
             existing.failure_count = metrics.get("failure_count", 0)
-
-            # Handle datetime conversion
-            last_exit = metrics.get("last_exit_time")
-            if last_exit:
-                if isinstance(last_exit, str):
-                    existing.last_exit_time = datetime.fromisoformat(last_exit)
-                else:
-                    existing.last_exit_time = last_exit
-
-            cooldown = metrics.get("cooldown_until")
-            if cooldown:
-                if isinstance(cooldown, str):
-                    existing.cooldown_until = datetime.fromisoformat(cooldown)
-                else:
-                    existing.cooldown_until = cooldown
-
+            existing.last_exit_time = _parse_dt(metrics.get("last_exit_time"))
+            existing.cooldown_until = _parse_dt(metrics.get("cooldown_until"))
             existing.last_updated = datetime.utcnow()
         else:
-            # Create new record
             new_metrics = StrategyPerformanceMetrics.from_dict(
                 bot_id=bot_id,
                 strategy_name=strategy_name,
@@ -4276,6 +4354,12 @@ class TradingEngine:
                 "priority": 2,
                 "typical_holding_time": "medium",
                 "description": "Range-bound grid trading for sideways markets"
+            },
+            "funding_carry": {
+                "allowed_regimes": ["trend_up", "trend_flat"],
+                "priority": 3,
+                "typical_holding_time": "long",
+                "description": "Spot entry gated on funding rate band and trend regime"
             },
             # Note: VWAP removed - it is an execution algorithm, not an alpha strategy
             "dca_accumulator": {

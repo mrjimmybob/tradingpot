@@ -26,6 +26,9 @@ CENTER = 64000.0
 GRID_COUNT = 10
 ATR_MULT = 8.0
 
+# Pass to _complete_one_bar when testing pure ATR spacing (disables fee floor)
+NO_FEE_PARAMS: dict = {"taker_fee_pct": 0.0, "spread_pct": 0.0, "min_profit_buffer_pct": 0.0}
+
 
 def _engine() -> TradingEngine:
     return TradingEngine()
@@ -141,14 +144,15 @@ class TestHighVolatilityWiderGrid:
         The freshly completed bar has range≈0 (both ticks at CENTER), so the
         14-bar ATR over 15 bars = 13/14 × 600 ≈ $557.  Expected spacing ≈ $446.
         We assert spacing > $300 to confirm the grid is meaningfully wide.
+        NO_FEE_PARAMS disables the min-profitable-spacing floor so this test
+        measures pure ATR-driven spacing.
         """
         engine = _engine()
         bot = _make_bot(51)
-        # 14 bars with $600 range → ATR dominated by high-range bars
         bars = _make_bars(count=14, bar_range=600.0)
         engine._grid_states = _grid_state(bot.id, bars=bars)
 
-        signal = await _complete_one_bar(engine, bot, CENTER)
+        signal = await _complete_one_bar(engine, bot, CENTER, NO_FEE_PARAMS)
 
         state = engine._grid_states[bot.id]
         spacing = state.get("current_grid_spacing")
@@ -156,7 +160,6 @@ class TestHighVolatilityWiderGrid:
         assert spacing > 300.0, (
             f"Expected wide spacing (>$300) for high-ATR bars, got {spacing:.2f}"
         )
-        # First sell level must be about one spacing above center
         sell_levels = [
             lv for lv in state["grid_levels"].values() if lv["side"] == "sell"
         ]
@@ -183,13 +186,15 @@ class TestLowVolatilityNarrowerGrid:
 
         ATR ≈ 13/14 × 60 ≈ $55.7 → spacing ≈ $44.6.  We assert spacing < $80
         to confirm the grid is meaningfully tighter than the high-volatility case.
+        NO_FEE_PARAMS disables the min-profitable-spacing floor so this test
+        measures pure ATR-driven spacing.
         """
         engine = _engine()
         bot = _make_bot(52)
         bars = _make_bars(count=14, bar_range=60.0)
         engine._grid_states = _grid_state(bot.id, bars=bars)
 
-        signal = await _complete_one_bar(engine, bot, CENTER)
+        signal = await _complete_one_bar(engine, bot, CENTER, NO_FEE_PARAMS)
 
         state = engine._grid_states[bot.id]
         spacing = state.get("current_grid_spacing")
@@ -220,7 +225,7 @@ class TestGridContractsOnLowVolatility:
         # Override: inject precomputed atr_spacing so engine sees the "old" value
         engine._grid_states = _grid_state(bot.id, bars=bars, atr_spacing=old_spacing)
 
-        signal = await _complete_one_bar(engine, bot, CENTER)
+        signal = await _complete_one_bar(engine, bot, CENTER, NO_FEE_PARAMS)
 
         state = engine._grid_states[bot.id]
         new_spacing = state.get("atr_spacing")
@@ -253,7 +258,7 @@ class TestGridExpandsOnHighVolatility:
         bars = _make_bars(count=14, bar_range=300.0)
         engine._grid_states = _grid_state(bot.id, bars=bars, atr_spacing=old_spacing)
 
-        signal = await _complete_one_bar(engine, bot, CENTER)
+        signal = await _complete_one_bar(engine, bot, CENTER, NO_FEE_PARAMS)
 
         state = engine._grid_states[bot.id]
         new_spacing = state.get("atr_spacing")
@@ -285,13 +290,14 @@ class TestTradeExecutionWithAtrSpacing:
         # Trigger price just below that
         trigger = CENTER - 165.0
 
+        # NO_FEE_PARAMS: test pure ATR-derived levels (spacing=$160, L1 buy=$63840)
         session = _session()
         with patch.object(engine, "_get_bot_positions", new=AsyncMock(return_value=[])):
-            await engine._strategy_grid(bot, CENTER, {}, session)
+            await engine._strategy_grid(bot, CENTER, NO_FEE_PARAMS, session)
             state = engine._grid_states[bot.id]
             if state.get("current_bar"):
                 state["current_bar"]["start_ts"] = datetime.utcnow() - timedelta(seconds=65)
-            signal = await engine._strategy_grid(bot, trigger, {}, session)
+            signal = await engine._strategy_grid(bot, trigger, NO_FEE_PARAMS, session)
 
         assert signal is not None
         assert signal.action == "buy", (
@@ -306,21 +312,20 @@ class TestTradeExecutionWithAtrSpacing:
         bot = _make_bot(56)
         bar_range = 200.0
         bars = _make_bars(count=14, bar_range=bar_range)
-        # Seed with some virtual crypto so sell can proceed
         engine._grid_states = _grid_state(
             bot.id, bars=bars, virtual_crypto=1.0, virtual_cash=5000.0
         )
 
-        # L1 sell at CENTER + 160 = 64160
+        # With NO_FEE_PARAMS: spacing=$160, L1 sell at CENTER+160=$64160
         trigger = CENTER + 165.0
 
         session = _session()
         with patch.object(engine, "_get_bot_positions", new=AsyncMock(return_value=[])):
-            await engine._strategy_grid(bot, CENTER, {}, session)
+            await engine._strategy_grid(bot, CENTER, NO_FEE_PARAMS, session)
             state = engine._grid_states[bot.id]
             if state.get("current_bar"):
                 state["current_bar"]["start_ts"] = datetime.utcnow() - timedelta(seconds=65)
-            signal = await engine._strategy_grid(bot, trigger, {}, session)
+            signal = await engine._strategy_grid(bot, trigger, NO_FEE_PARAMS, session)
 
         assert signal is not None
         assert signal.action == "sell", (
@@ -336,14 +341,14 @@ class TestTradeExecutionWithAtrSpacing:
         bars = _make_bars(count=14, bar_range=200.0)
         engine._grid_states = _grid_state(bot.id, bars=bars)
 
-        # With spacing≈160, no level is crossed when price stays at center
+        # With NO_FEE_PARAMS spacing≈160, no level crossed when price stays at center
         session = _session()
         with patch.object(engine, "_get_bot_positions", new=AsyncMock(return_value=[])):
-            await engine._strategy_grid(bot, CENTER, {}, session)
+            await engine._strategy_grid(bot, CENTER, NO_FEE_PARAMS, session)
             state = engine._grid_states[bot.id]
             if state.get("current_bar"):
                 state["current_bar"]["start_ts"] = datetime.utcnow() - timedelta(seconds=65)
-            signal = await engine._strategy_grid(bot, CENTER, {}, session)
+            signal = await engine._strategy_grid(bot, CENTER, NO_FEE_PARAMS, session)
 
         assert signal is not None
         assert signal.action == "hold"
@@ -367,10 +372,12 @@ class TestSoftRecenter:
         old_center = CENTER
         engine._grid_states = _grid_state(bot.id, bars=bars, center=old_center)
 
-        # Price drifts 450 from center — beyond the 400 threshold
+        # Price drifts 450 from center — beyond the 400 threshold.
+        # NO_FEE_PARAMS disables the min-spacing floor so the ATR-derived
+        # grid_half_range (800) and recenter threshold (400) are used.
         new_price = old_center + 450.0
 
-        signal = await _complete_one_bar(engine, bot, new_price)
+        signal = await _complete_one_bar(engine, bot, new_price, NO_FEE_PARAMS)
 
         state = engine._grid_states[bot.id]
         assert state["center_price"] == pytest.approx(new_price), (
@@ -393,7 +400,7 @@ class TestSoftRecenter:
 
         # Price moves only 100 — well within the 400 threshold
         new_price = old_center + 100.0
-        signal = await _complete_one_bar(engine, bot, new_price)
+        signal = await _complete_one_bar(engine, bot, new_price, NO_FEE_PARAMS)
 
         state = engine._grid_states[bot.id]
         assert state["center_price"] == pytest.approx(old_center), (
@@ -416,14 +423,15 @@ class TestAtrDiagnostics:
         bars = _make_bars(count=14, bar_range=200.0)
         engine._grid_states = _grid_state(bot.id, bars=bars)
 
-        await _complete_one_bar(engine, bot, CENTER)
+        # NO_FEE_PARAMS disables the min-spacing floor so diagnostic values
+        # match the pure ATR formula exactly.
+        await _complete_one_bar(engine, bot, CENTER, NO_FEE_PARAMS)
 
         state = engine._grid_states[bot.id]
         assert state.get("current_atr") is not None, "current_atr must be set"
         assert state.get("current_grid_range") is not None, "current_grid_range must be set"
         assert state.get("current_grid_spacing") is not None, "current_grid_spacing must be set"
 
-        # Verify mathematical consistency
         atr = state["current_atr"]
         expected_range = atr * ATR_MULT
         expected_spacing = expected_range / GRID_COUNT
@@ -438,7 +446,7 @@ class TestAtrDiagnostics:
         bars = _make_bars(count=14, bar_range=200.0)
         engine._grid_states = _grid_state(bot.id, bars=bars)
 
-        await _complete_one_bar(engine, bot, CENTER)
+        await _complete_one_bar(engine, bot, CENTER, NO_FEE_PARAMS)
 
         state = engine._grid_states[bot.id]
         center = state["center_price"]

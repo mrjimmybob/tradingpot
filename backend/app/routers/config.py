@@ -54,6 +54,9 @@ STRATEGIES = [
             "regime_filter_enabled": {"type": "boolean", "default": True, "description": "Enable regime-aware gating (flat/normal markets only)"},
             "allowed_regimes": {"type": "array", "default": ["trend_flat", "volatility_medium"], "description": "Allowed regimes (trend_flat, volatility_medium recommended)"},
             "cooldown_after_kill_hours": {"type": "number", "default": 2, "min": 0, "max": 24, "description": "Hours to wait after kill switch (prevents re-entry)"},
+            "taker_fee_pct": {"type": "number", "default": 0.1, "min": 0.0, "max": 1.0, "description": "Taker fee rate (%). Used to compute minimum profitable spacing."},
+            "spread_pct": {"type": "number", "default": 0.05, "min": 0.0, "max": 0.5, "description": "Estimated bid-ask spread (%). Part of minimum profitable spacing."},
+            "min_profit_buffer_pct": {"type": "number", "default": 0.1, "min": 0.0, "max": 1.0, "description": "Minimum profit buffer above fees (%). Ensures each cycle is economically viable."},
         }
     ),
     StrategyInfo(
