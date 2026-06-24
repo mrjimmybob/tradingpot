@@ -82,11 +82,50 @@ interface DecisionStatus {
   updated_at: string | null
 }
 
+interface RecoveryExitCriterion {
+  current?: number
+  target?: number
+  met: boolean
+  description: string
+  wins?: number
+  trades?: number
+  rate?: number
+  pnl_usd?: number
+}
+
+interface RecoveryDiagnostics {
+  is_active: boolean
+  reason: string
+  started_at: string | null
+  trade_count: number
+  win_count: number
+  loss_count: number
+  win_rate: number
+  pnl_usd: number
+  consecutive_wins: number
+  has_open_position: boolean
+  last_trade_at: string | null
+  exit_criteria: {
+    consecutive_wins: RecoveryExitCriterion
+    last_5_win_rate: RecoveryExitCriterion
+    last_5_pnl: RecoveryExitCriterion
+  }
+  events: {
+    type: string
+    at: string
+    reason?: string
+    gain_loss_usd?: number
+    entry_price?: number
+    exit_price?: number
+  }[]
+}
+
 interface Diagnostics {
   bot_id: number
   status: string
   current_activity: string
   paused_reason: string | null
+  recovery: RecoveryDiagnostics | null
   evaluations: {
     total: number
     runtime: number
@@ -186,6 +225,8 @@ function getDecisionStateColor(state: string | null): string {
     case 'Waiting for data':
     case 'Warming up indicators':
       return 'bg-sky-500/10 text-sky-300 border-sky-500/40'
+    case 'Recovery Mode — Paper Trading':
+      return 'bg-recovery/10 text-recovery border-recovery/40'
     default:
       // Hold / Evaluating / anything else: neutral, clearly secondary.
       return 'bg-slate-500/10 text-slate-300 border-slate-500/40'
@@ -224,9 +265,16 @@ function getStatusColor(status: string): string {
       return 'bg-paused/20 text-paused border-paused'
     case 'stopped':
       return 'bg-stopped/20 text-stopped border-stopped'
+    case 'recovery_mode':
+      return 'bg-recovery/20 text-recovery border-recovery'
     default:
       return 'bg-gray-700 text-gray-400 border-gray-600'
   }
+}
+
+function getStatusLabel(status: string): string {
+  if (status === 'recovery_mode') return 'Recovery Mode'
+  return status
 }
 
 // #140, #141: Validate bot ID from URL parameter
@@ -451,6 +499,7 @@ export default function BotDetail() {
   }
 
   const canEdit = bot.status === 'paused' || bot.status === 'stopped'
+  const isActivelyRunning = bot.status === 'running' || bot.status === 'recovery_mode'
 
   return (
     <div className="space-y-6">
@@ -472,7 +521,7 @@ export default function BotDetail() {
                   bot.status
                 )}`}
               >
-                {bot.status}
+                {getStatusLabel(bot.status)}
               </span>
               {bot.is_dry_run && (
                 <span className="px-3 py-1 bg-yellow-500/20 text-yellow-500 rounded-full text-sm">
@@ -534,7 +583,7 @@ export default function BotDetail() {
               {stopMutation.isPending ? 'Stopping...' : 'Stop'}
             </button>
           )}
-          {bot.status === 'running' && (
+          {isActivelyRunning && (
             <button
               onClick={() => {
                 if (confirm('Are you sure you want to trigger the kill switch? This will cancel all pending orders.')) {
@@ -775,6 +824,123 @@ export default function BotDetail() {
           </div>
         )}
       </div>
+
+      {/* Recovery Mode Status Panel — only shown when bot.status === recovery_mode */}
+      {bot.status === 'recovery_mode' && diagnostics?.recovery && (
+        <div className="bg-gray-800 rounded-lg p-6 border border-recovery/30">
+          <div className="flex items-center gap-2 mb-4">
+            <span className="inline-block w-2.5 h-2.5 rounded-full bg-recovery animate-pulse" />
+            <h3 className="text-lg font-semibold text-recovery">Recovery Mode — Paper Trading</h3>
+          </div>
+
+          {/* Why recovery started */}
+          <div className="bg-recovery/10 border border-recovery/30 rounded-md p-4 mb-4">
+            <p className="text-recovery text-xs uppercase tracking-wide mb-1 font-semibold">Reason</p>
+            <p className="text-sm text-gray-100">{diagnostics.recovery.reason}</p>
+            {diagnostics.recovery.started_at && (
+              <p className="text-xs text-gray-400 mt-1">
+                Started {new Date(diagnostics.recovery.started_at).toLocaleString()}
+              </p>
+            )}
+          </div>
+
+          {/* Paper trade stats */}
+          <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 mb-4">
+            <div className="bg-gray-900 rounded-md p-3 text-center">
+              <p className="text-gray-400 text-xs mb-1">Paper Trades</p>
+              <p className="text-xl font-bold text-gray-100">{diagnostics.recovery.trade_count}</p>
+            </div>
+            <div className="bg-gray-900 rounded-md p-3 text-center">
+              <p className="text-gray-400 text-xs mb-1">Wins</p>
+              <p className="text-xl font-bold text-profit">{diagnostics.recovery.win_count}</p>
+            </div>
+            <div className="bg-gray-900 rounded-md p-3 text-center">
+              <p className="text-gray-400 text-xs mb-1">Losses</p>
+              <p className="text-xl font-bold text-loss">{diagnostics.recovery.loss_count}</p>
+            </div>
+            <div className="bg-gray-900 rounded-md p-3 text-center">
+              <p className="text-gray-400 text-xs mb-1">Win Rate</p>
+              <p className="text-xl font-bold text-gray-100">
+                {diagnostics.recovery.trade_count > 0
+                  ? `${(diagnostics.recovery.win_rate * 100).toFixed(0)}%`
+                  : '—'}
+              </p>
+            </div>
+          </div>
+
+          {/* P&L and position */}
+          <div className="grid grid-cols-2 gap-3 mb-4">
+            <div className="bg-gray-900 rounded-md p-3">
+              <p className="text-gray-400 text-xs mb-1">Paper P&L</p>
+              <p className={`text-lg font-bold font-mono-numbers ${diagnostics.recovery.pnl_usd >= 0 ? 'text-profit' : 'text-loss'}`}>
+                {diagnostics.recovery.pnl_usd >= 0 ? '+' : ''}${diagnostics.recovery.pnl_usd.toFixed(4)}
+              </p>
+            </div>
+            <div className="bg-gray-900 rounded-md p-3">
+              <p className="text-gray-400 text-xs mb-1">Consecutive Wins</p>
+              <p className="text-lg font-bold text-gray-100">{diagnostics.recovery.consecutive_wins} / 2</p>
+            </div>
+          </div>
+
+          {/* Exit criteria progress */}
+          <div className="bg-gray-900 rounded-md p-4 mb-4">
+            <p className="text-gray-400 text-xs uppercase tracking-wide mb-3">Exit Criteria (any one resumes live trading)</p>
+            <div className="space-y-2">
+              {/* Criterion 1: consecutive wins */}
+              <div className="flex items-center justify-between text-sm">
+                <span className="text-gray-300">Consecutive wins</span>
+                <span className={`font-mono-numbers font-medium ${diagnostics.recovery.exit_criteria.consecutive_wins.met ? 'text-profit' : 'text-gray-100'}`}>
+                  {diagnostics.recovery.exit_criteria.consecutive_wins.description}
+                  {diagnostics.recovery.exit_criteria.consecutive_wins.met && ' ✓'}
+                </span>
+              </div>
+              {/* Criterion 2: last-5 win rate */}
+              <div className="flex items-center justify-between text-sm">
+                <span className="text-gray-300">Win rate ≥60% (last 5)</span>
+                <span className={`font-mono-numbers font-medium ${diagnostics.recovery.exit_criteria.last_5_win_rate.met ? 'text-profit' : 'text-gray-100'}`}>
+                  {diagnostics.recovery.exit_criteria.last_5_win_rate.description}
+                  {diagnostics.recovery.exit_criteria.last_5_win_rate.met && ' ✓'}
+                </span>
+              </div>
+              {/* Criterion 3: last-5 P&L */}
+              <div className="flex items-center justify-between text-sm">
+                <span className="text-gray-300">Positive P&L (last 5)</span>
+                <span className={`font-mono-numbers font-medium ${diagnostics.recovery.exit_criteria.last_5_pnl.met ? 'text-profit' : 'text-gray-100'}`}>
+                  {diagnostics.recovery.exit_criteria.last_5_pnl.description}
+                  {diagnostics.recovery.exit_criteria.last_5_pnl.met && ' ✓'}
+                </span>
+              </div>
+            </div>
+          </div>
+
+          {/* Recovery event history */}
+          {diagnostics.recovery.events.length > 0 && (
+            <div className="bg-gray-900 rounded-md p-4">
+              <p className="text-gray-400 text-xs uppercase tracking-wide mb-2">Event History</p>
+              <ul className="space-y-1.5 text-xs max-h-48 overflow-y-auto">
+                {[...diagnostics.recovery.events].reverse().map((ev, i) => (
+                  <li key={i} className="flex items-start gap-2">
+                    <span className="text-gray-500 shrink-0 font-mono-numbers">
+                      {new Date(ev.at).toLocaleTimeString()}
+                    </span>
+                    <span className={
+                      ev.type === 'paper_win' ? 'text-profit' :
+                      ev.type === 'paper_loss' ? 'text-loss' :
+                      ev.type === 'exited' ? 'text-running' :
+                      'text-recovery'
+                    }>
+                      {ev.type === 'entered' && `Entered Recovery: ${ev.reason ?? ''}`}
+                      {ev.type === 'paper_win' && `Paper WIN +$${ev.gain_loss_usd?.toFixed(4)} (${ev.entry_price?.toFixed(2)} → ${ev.exit_price?.toFixed(2)})`}
+                      {ev.type === 'paper_loss' && `Paper LOSS $${ev.gain_loss_usd?.toFixed(4)} (${ev.entry_price?.toFixed(2)} → ${ev.exit_price?.toFixed(2)})`}
+                      {ev.type === 'exited' && `Recovery Exit: ${ev.reason ?? ''}`}
+                    </span>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
+        </div>
+      )}
 
       {/* Strategy Diagnostics — observe-only operability: what the bot has been
           doing, thinking, waiting for, blocked by, and why it's paused */}

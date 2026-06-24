@@ -10,10 +10,11 @@ export default {
         // Custom color palette from design system
         profit: '#22c55e',  // Green for profits
         loss: '#ef4444',    // Red for losses
-        running: '#3b82f6', // Blue for running status
-        paused: '#eab308',  // Yellow for paused status
-        stopped: '#6b7280', // Gray for stopped status
-        accent: '#6366f1',  // Indigo accent
+        running: '#3b82f6',   // Blue for running status
+        paused: '#eab308',    // Yellow for paused status
+        stopped: '#6b7280',   // Gray for stopped status
+        recovery: '#a855f7',  // Purple for recovery mode (active but paper-trading)
+        accent: '#6366f1',    // Indigo accent
       },
       textColor: {
         profit: '#22c55e',
@@ -21,6 +22,7 @@ export default {
         running: '#3b82f6',
         paused: '#eab308',
         stopped: '#6b7280',
+        recovery: '#a855f7',
         accent: '#6366f1',
       },
       ringColor: {

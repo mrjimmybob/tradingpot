@@ -749,10 +749,8 @@ def _diagnostics_current_activity(bot, decision, diag) -> str:
     """Build the one-line human-readable "what is this bot doing right now" line.
 
     The "Paused" wording is reserved for the LIFECYCLE state: it appears here
-    ONLY when bot.status == PAUSED. For a RUNNING bot this returns its trading
-    DECISION (e.g. "Waiting for market regime — ...", "Hold — ...") and never
-    begins with "Paused", so a waiting/holding bot is not mistaken for a stopped
-    one.
+    ONLY when bot.status == PAUSED. RECOVERY_MODE is an active operating state —
+    it must NEVER show "Bot is not running."
     """
     if bot.status == BotStatus.PAUSED:
         reason = (
@@ -761,8 +759,17 @@ def _diagnostics_current_activity(bot, decision, diag) -> str:
             or "reason not captured this runtime"
         )
         return f"Paused: {reason}"
+
+    if bot.status == BotStatus.RECOVERY_MODE:
+        recovery_reason = (
+            (diag.recovery_reason if diag else None)
+            or "consecutive losses triggered recovery"
+        )
+        return f"Recovery Mode — Paper Trading ({recovery_reason})"
+
     if bot.status != BotStatus.RUNNING:
         return "Bot is not running."
+
     if decision is not None and decision.state:
         # Defensive: a decision must never surface the lifecycle "Paused" label on
         # a non-paused bot. If it ever does, present it as a HOLD instead.
@@ -812,4 +819,78 @@ async def get_bot_diagnostics(
             (decision.reason if decision else None)
             or "Paused (reason not captured this runtime — check alerts/logs)"
         )
+
+    # Recovery diagnostics: merge in-memory event log (diag.recovery) with
+    # persisted paper-trade state (bot.strategy_state["recovery_mode"]).  The
+    # DB state is authoritative for stats; the in-memory log provides events
+    # that survive only for the current runtime.
+    if bot.status == BotStatus.RECOVERY_MODE:
+        ss = bot.strategy_state or {}
+        rm = ss.get("recovery_mode") or {}
+        paper_trades = rm.get("paper_trades", [])
+        total = len(paper_trades)
+        win_count = sum(1 for t in paper_trades if t.get("win"))
+        loss_count = total - win_count
+        pnl_usd = sum(t.get("gain_loss_usd", 0.0) for t in paper_trades)
+        pnl_pct = (pnl_usd / (sum(t.get("entry_price", 0) * (t.get("amount_usd", 0) or 0) for t in paper_trades) or 1)) * 100
+        cons_wins = rm.get("consecutive_paper_wins", 0)
+        last5 = paper_trades[-5:]
+
+        # Compute how close each exit criterion is.
+        criteria: dict = {
+            "consecutive_wins": {
+                "current": cons_wins,
+                "target": 2,
+                "met": cons_wins >= 2,
+                "description": f"{cons_wins} / 2 consecutive wins",
+            },
+        }
+        if total >= 5:
+            wins5 = sum(1 for t in last5 if t.get("win"))
+            pnl5 = sum(t.get("gain_loss_usd", 0.0) for t in last5)
+            wr5 = wins5 / 5
+            criteria["last_5_win_rate"] = {
+                "wins": wins5,
+                "trades": 5,
+                "rate": round(wr5, 3),
+                "target": 0.60,
+                "met": wr5 >= 0.60,
+                "description": f"{wins5}/5 wins ({wr5:.0%})",
+            }
+            criteria["last_5_pnl"] = {
+                "pnl_usd": round(pnl5, 4),
+                "met": pnl5 > 0,
+                "description": f"${pnl5:+.2f} over last 5 trades",
+            }
+        else:
+            remaining = max(0, 5 - total)
+            criteria["last_5_win_rate"] = {
+                "met": False,
+                "description": f"needs {remaining} more paper trade(s) to evaluate",
+            }
+            criteria["last_5_pnl"] = {
+                "met": False,
+                "description": f"needs {remaining} more paper trade(s) to evaluate",
+            }
+
+        last_trade_at = paper_trades[-1].get("timestamp") if paper_trades else None
+
+        data["recovery"] = {
+            "is_active": True,
+            "reason": rm.get("trigger_reason", "consecutive losses"),
+            "started_at": rm.get("entered_at"),
+            "trade_count": total,
+            "win_count": win_count,
+            "loss_count": loss_count,
+            "win_rate": round(win_count / total, 3) if total else 0.0,
+            "pnl_usd": round(pnl_usd, 4),
+            "consecutive_wins": cons_wins,
+            "has_open_position": rm.get("paper_position") is not None,
+            "last_trade_at": last_trade_at,
+            "exit_criteria": criteria,
+            "events": data.get("recovery", {}).get("events", []),
+        }
+    else:
+        data["recovery"] = None
+
     return data

@@ -124,6 +124,19 @@ class BotDiagnostics:
     pause_reason: Optional[str] = None
     paused_at: Optional[datetime] = None
 
+    # --- Recovery mode diagnostics ---
+    recovery_is_active: bool = False
+    recovery_reason: Optional[str] = None
+    recovery_started_at: Optional[datetime] = None
+    recovery_trade_count: int = 0
+    recovery_win_count: int = 0
+    recovery_loss_count: int = 0
+    recovery_pnl_usd: float = 0.0
+    recovery_consecutive_wins: int = 0
+    last_recovery_trade_at: Optional[datetime] = None
+    # Capped at 50 most-recent events to bound memory use.
+    recovery_events: List[dict] = field(default_factory=list)
+
     def _bump_eval_bucket(self, now: datetime) -> None:
         key = now.replace(minute=0, second=0, microsecond=0).isoformat()
         self.eval_buckets[key] = self.eval_buckets.get(key, 0) + 1
@@ -190,6 +203,18 @@ class BotDiagnostics:
             "pause": {
                 "reason": self.pause_reason,
                 "paused_at": _iso(self.paused_at),
+            },
+            "recovery": {
+                "is_active": self.recovery_is_active,
+                "reason": self.recovery_reason,
+                "started_at": _iso(self.recovery_started_at),
+                "trade_count": self.recovery_trade_count,
+                "win_count": self.recovery_win_count,
+                "loss_count": self.recovery_loss_count,
+                "pnl_usd": self.recovery_pnl_usd,
+                "consecutive_wins": self.recovery_consecutive_wins,
+                "last_trade_at": _iso(self.last_recovery_trade_at),
+                "events": list(self.recovery_events),
             },
         }
 
@@ -309,6 +334,66 @@ class DiagnosticsStore:
         d = self._get_or_create(bot_id)
         d.pause_reason = reason
         d.paused_at = datetime.utcnow()
+
+    @_guard
+    def record_recovery_entered(self, bot_id: int, reason: str) -> None:
+        d = self._get_or_create(bot_id)
+        d.recovery_is_active = True
+        d.recovery_reason = reason
+        d.recovery_started_at = datetime.utcnow()
+        d.recovery_trade_count = 0
+        d.recovery_win_count = 0
+        d.recovery_loss_count = 0
+        d.recovery_pnl_usd = 0.0
+        d.recovery_consecutive_wins = 0
+        d.recovery_events.append({
+            "type": "entered",
+            "at": datetime.utcnow().isoformat(),
+            "reason": reason,
+        })
+        if len(d.recovery_events) > 50:
+            d.recovery_events = d.recovery_events[-50:]
+
+    @_guard
+    def record_paper_trade(
+        self,
+        bot_id: int,
+        gain_loss_usd: float,
+        win: bool,
+        entry_price: Optional[float] = None,
+        exit_price: Optional[float] = None,
+    ) -> None:
+        d = self._get_or_create(bot_id)
+        d.recovery_trade_count += 1
+        d.recovery_pnl_usd += gain_loss_usd
+        d.last_recovery_trade_at = datetime.utcnow()
+        if win:
+            d.recovery_win_count += 1
+            d.recovery_consecutive_wins += 1
+        else:
+            d.recovery_loss_count += 1
+            d.recovery_consecutive_wins = 0
+        d.recovery_events.append({
+            "type": "paper_win" if win else "paper_loss",
+            "at": datetime.utcnow().isoformat(),
+            "gain_loss_usd": round(gain_loss_usd, 4),
+            "entry_price": entry_price,
+            "exit_price": exit_price,
+        })
+        if len(d.recovery_events) > 50:
+            d.recovery_events = d.recovery_events[-50:]
+
+    @_guard
+    def record_recovery_exited(self, bot_id: int, reason: str) -> None:
+        d = self._get_or_create(bot_id)
+        d.recovery_is_active = False
+        d.recovery_events.append({
+            "type": "exited",
+            "at": datetime.utcnow().isoformat(),
+            "reason": reason,
+        })
+        if len(d.recovery_events) > 50:
+            d.recovery_events = d.recovery_events[-50:]
 
     def get(self, bot_id: int) -> Optional[BotDiagnostics]:
         return self._diags.get(bot_id)

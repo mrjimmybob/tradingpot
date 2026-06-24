@@ -112,7 +112,7 @@ function savePreferences(prefs: Partial<UserPreferences>): void {
 // #141: Validate URL parameters
 const VALID_SORT_FIELDS: SortField[] = ['name', 'trading_pair', 'strategy', 'status', 'total_pnl', 'created_at']
 const VALID_SORT_DIRS: SortDirection[] = ['asc', 'desc']
-const VALID_STATUSES = ['', 'running', 'paused', 'stopped', 'created']
+const VALID_STATUSES = ['', 'running', 'paused', 'stopped', 'created', 'recovery_mode']
 
 function isValidSortField(value: string | null): value is SortField {
   return value !== null && VALID_SORT_FIELDS.includes(value as SortField)
@@ -158,9 +158,16 @@ function getStatusColor(status: string): string {
       return 'bg-paused/20 text-paused'
     case 'stopped':
       return 'bg-stopped/20 text-stopped'
+    case 'recovery_mode':
+      return 'bg-recovery/20 text-recovery'
     default:
       return 'bg-gray-700 text-gray-400'
   }
+}
+
+function getStatusLabel(status: string): string {
+  if (status === 'recovery_mode') return 'Recovery'
+  return status
 }
 
 function SortIcon({ field, sortField, sortDirection }: {
@@ -469,6 +476,7 @@ export default function BotList() {
           >
             <option value="">All Status</option>
             <option value="running">Running</option>
+            <option value="recovery_mode">Recovery</option>
             <option value="paused">Paused</option>
             <option value="stopped">Stopped</option>
             <option value="created">Created</option>
@@ -595,7 +603,7 @@ export default function BotList() {
                             bot.status
                           )}`}
                         >
-                          {bot.status}
+                          {getStatusLabel(bot.status)}
                         </span>
                       </td>
                       {/* #161: P&L with screen reader context (not just color) */}

@@ -616,6 +616,24 @@ class TradingEngine:
                             await self._enter_recovery_mode(bot, bot_id, risk_assessment.reason, session)
                         # Don't break — fall through to paper-trade the strategy signal.
 
+                    # Keep decision status current when already in recovery mode
+                    # (entering recovery updates it; this keeps it live on every tick).
+                    if bot.status == BotStatus.RECOVERY_MODE and risk_assessment.action != RiskAction.ENTER_RECOVERY_MODE:
+                        recovery = self._recovery_states.get(bot.id)
+                        if recovery:
+                            trades = recovery.get("paper_trades", [])
+                            wins = sum(1 for t in trades if t.get("win"))
+                            cons = recovery.get("consecutive_paper_wins", 0)
+                            decision_status_store.update(
+                                bot_id,
+                                DecisionState.RECOVERY_MODE_PAPER_TRADING,
+                                reason=(
+                                    f"{len(trades)} paper trades, {wins} wins, "
+                                    f"{cons} consecutive — evaluating {bot.strategy}"
+                                ),
+                                symbol=bot.trading_pair,
+                            )
+
                     # 7-day stale recovery warning (periodic, not every tick)
                     if bot.status == BotStatus.RECOVERY_MODE:
                         recovery = self._recovery_states.get(bot.id)
@@ -5609,6 +5627,11 @@ class TradingEngine:
             f"Bot {bot_id}: Entered RECOVERY_MODE — {reason}. "
             "All order signals will be paper-traded until recovery criteria are met."
         )
+        diagnostics_store.record_recovery_entered(bot_id, reason)
+        decision_status_store.update(
+            bot_id, DecisionState.RECOVERY_MODE_PAPER_TRADING,
+            reason=reason, symbol=bot.trading_pair,
+        )
         email_service.send_bot_paused_alert(
             bot_id=bot_id,
             bot_name=bot.name,
@@ -5631,6 +5654,12 @@ class TradingEngine:
 
         logger.info(
             f"Bot {bot_id}: Exited RECOVERY_MODE — {reason}. Resuming real trading."
+        )
+        diagnostics_store.record_recovery_exited(bot_id, reason)
+        decision_status_store.update(
+            bot_id, DecisionState.EVALUATING,
+            reason=f"Resumed real trading after recovery: {reason}",
+            symbol=bot.trading_pair,
         )
 
     def _check_recovery_exit(self, recovery_state: dict) -> tuple:
@@ -5703,6 +5732,22 @@ class TradingEngine:
                 f"Bot {bot_id}: [PAPER] SELL @ {current_price:.4f} "
                 f"(P&L ${gain_loss_usd:+.2f}, win={win}, "
                 f"consecutive_wins={recovery['consecutive_paper_wins']})"
+            )
+            diagnostics_store.record_paper_trade(
+                bot_id,
+                gain_loss_usd=gain_loss_usd,
+                win=win,
+                entry_price=entry_price,
+                exit_price=current_price,
+            )
+            decision_status_store.update(
+                bot_id,
+                DecisionState.RECOVERY_MODE_PAPER_TRADING,
+                reason=(
+                    f"Paper trade {'WIN' if win else 'LOSS'} ${gain_loss_usd:+.2f} — "
+                    f"{recovery['consecutive_paper_wins']} consecutive win(s)"
+                ),
+                symbol=bot.trading_pair,
             )
 
             # Persist updated state before potentially exiting recovery.

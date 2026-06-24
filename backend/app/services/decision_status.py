@@ -44,6 +44,9 @@ class DecisionState:
     # operator) where bot.status is set to PAUSED. A HOLD signal must NEVER be
     # mapped to PAUSED - a bot waiting for market conditions is still RUNNING.
     PAUSED = "Paused"
+    # Active paper-trading state during recovery mode. The bot is running and
+    # evaluating its strategy normally; only order *execution* is simulated.
+    RECOVERY_MODE_PAPER_TRADING = "Recovery Mode — Paper Trading"
 
 
 @dataclass
@@ -91,6 +94,23 @@ _HOLD_REASON_STATES = (
     ("starting new bar", DecisionState.WARMING_UP),
     ("regime", DecisionState.WAITING_FOR_REGIME),
 )
+
+# States that represent an active bot (not paused/stopped). Used by the router
+# to decide whether to surface "Bot is not running" fallback text.
+ACTIVE_STATES = frozenset({
+    DecisionState.EVALUATING,
+    DecisionState.WAITING_FOR_DATA,
+    DecisionState.WARMING_UP,
+    DecisionState.WAITING_FOR_REGIME,
+    DecisionState.HOLD,
+    DecisionState.BUY_SIGNAL,
+    DecisionState.SELL_SIGNAL,
+    DecisionState.ENTERING_POSITION,
+    DecisionState.EXITING_POSITION,
+    DecisionState.COOLDOWN,
+    DecisionState.RISK_LIMIT,
+    DecisionState.RECOVERY_MODE_PAPER_TRADING,
+})
 
 
 def derive_state_from_signal(signal) -> str:

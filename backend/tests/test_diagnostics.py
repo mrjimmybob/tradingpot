@@ -461,3 +461,159 @@ async def test_current_activity_never_leads_with_paused_while_running(client, te
     diag = (await client.get(f"/api/bots/{bot.id}/diagnostics")).json()
     assert diag["status"] == "running"
     assert not diag["current_activity"].startswith("Paused")
+
+
+# --------------------------------------------------------------------------- #
+# Recovery Mode diagnostics
+# --------------------------------------------------------------------------- #
+
+
+def test_record_recovery_entered_initialises_fields():
+    """record_recovery_entered resets all counters and adds an 'entered' event."""
+    store = DiagnosticsStore()
+    store.record_recovery_entered(1, "3 consecutive losses")
+    d = store.get(1)
+    assert d.recovery_is_active is True
+    assert d.recovery_reason == "3 consecutive losses"
+    assert d.recovery_started_at is not None
+    assert d.recovery_trade_count == 0
+    assert d.recovery_win_count == 0
+    assert d.recovery_loss_count == 0
+    assert d.recovery_pnl_usd == 0.0
+    assert d.recovery_consecutive_wins == 0
+    assert len(d.recovery_events) == 1
+    assert d.recovery_events[0]["type"] == "entered"
+    assert d.recovery_events[0]["reason"] == "3 consecutive losses"
+
+
+def test_record_paper_trade_win():
+    """A winning paper trade increments win count and consecutive wins."""
+    store = DiagnosticsStore()
+    store.record_recovery_entered(1, "test reason")
+    store.record_paper_trade(1, gain_loss_usd=5.50, win=True, entry_price=100.0, exit_price=106.0)
+    d = store.get(1)
+    assert d.recovery_trade_count == 1
+    assert d.recovery_win_count == 1
+    assert d.recovery_loss_count == 0
+    assert d.recovery_consecutive_wins == 1
+    assert abs(d.recovery_pnl_usd - 5.50) < 0.001
+    assert d.last_recovery_trade_at is not None
+    assert d.recovery_events[-1]["type"] == "paper_win"
+    assert d.recovery_events[-1]["gain_loss_usd"] == pytest.approx(5.50, abs=0.001)
+
+
+def test_record_paper_trade_loss_resets_consecutive_wins():
+    """A losing paper trade resets consecutive_wins to 0."""
+    store = DiagnosticsStore()
+    store.record_recovery_entered(1, "test")
+    store.record_paper_trade(1, gain_loss_usd=3.0, win=True)
+    store.record_paper_trade(1, gain_loss_usd=3.0, win=True)
+    assert store.get(1).recovery_consecutive_wins == 2
+    store.record_paper_trade(1, gain_loss_usd=-2.0, win=False)
+    d = store.get(1)
+    assert d.recovery_consecutive_wins == 0
+    assert d.recovery_win_count == 2
+    assert d.recovery_loss_count == 1
+    assert d.recovery_trade_count == 3
+    assert d.recovery_events[-1]["type"] == "paper_loss"
+
+
+def test_record_recovery_exited_clears_active_flag():
+    """record_recovery_exited marks the recovery as inactive and adds an exit event."""
+    store = DiagnosticsStore()
+    store.record_recovery_entered(1, "losses")
+    store.record_paper_trade(1, gain_loss_usd=5.0, win=True)
+    store.record_recovery_exited(1, "2 consecutive wins")
+    d = store.get(1)
+    assert d.recovery_is_active is False
+    assert d.recovery_events[-1]["type"] == "exited"
+    assert d.recovery_events[-1]["reason"] == "2 consecutive wins"
+    # Historic stats are preserved
+    assert d.recovery_win_count == 1
+
+
+def test_recovery_events_capped_at_50():
+    """Events list never exceeds 50 entries."""
+    store = DiagnosticsStore()
+    store.record_recovery_entered(1, "test")
+    for i in range(60):
+        store.record_paper_trade(1, gain_loss_usd=1.0, win=True)
+    assert len(store.get(1).recovery_events) == 50
+
+
+def test_to_dict_includes_recovery_section():
+    """to_dict() always includes a 'recovery' key with the expected structure."""
+    d = BotDiagnostics(bot_id=42)
+    r = d.to_dict()["recovery"]
+    assert "is_active" in r
+    assert "trade_count" in r
+    assert "win_count" in r
+    assert "loss_count" in r
+    assert "pnl_usd" in r
+    assert "events" in r
+
+
+@pytest.mark.asyncio
+async def test_recovery_mode_current_activity_not_not_running(client, test_db):
+    """A bot in RECOVERY_MODE must never show 'Bot is not running.'
+    Recovery is an active operating state."""
+    bot = await _create_bot(test_db, status=BotStatus.RECOVERY_MODE)
+    diagnostics_store.clear(bot.id)
+    diagnostics_store.record_recovery_entered(bot.id, "3 consecutive losses")
+    decision_status_store.clear(bot.id)
+
+    diag = (await client.get(f"/api/bots/{bot.id}/diagnostics")).json()
+    assert diag["status"] == "recovery_mode"
+    assert "not running" not in diag["current_activity"].lower()
+    assert "Recovery Mode" in diag["current_activity"]
+    assert "Paper Trading" in diag["current_activity"]
+
+
+@pytest.mark.asyncio
+async def test_recovery_mode_exposes_recovery_block(client, test_db):
+    """When bot.status == RECOVERY_MODE, diagnostics response includes
+    'recovery' key with is_active=True (even if engine hasn't run yet,
+    we fall back to strategy_state)."""
+    from datetime import datetime
+    bot = await _create_bot(test_db, status=BotStatus.RECOVERY_MODE)
+    # Seed strategy_state as the engine would persist it.
+    from sqlalchemy import select
+    from app.models import Bot
+    async with test_db as session:
+        result = await session.execute(select(Bot).where(Bot.id == bot.id))
+        b = result.scalar_one()
+        b.strategy_state = {
+            "recovery_mode": {
+                "active": True,
+                "entered_at": datetime.utcnow().isoformat(),
+                "trigger_reason": "3 consecutive losses — entering recovery mode",
+                "paper_position": None,
+                "paper_trades": [
+                    {"gain_loss_usd": 2.0, "win": True, "entry_price": 100.0, "exit_price": 102.0, "timestamp": datetime.utcnow().isoformat()},
+                    {"gain_loss_usd": -1.0, "win": False, "entry_price": 102.0, "exit_price": 101.0, "timestamp": datetime.utcnow().isoformat()},
+                ],
+                "consecutive_paper_wins": 0,
+            }
+        }
+        await session.commit()
+
+    diag = (await client.get(f"/api/bots/{bot.id}/diagnostics")).json()
+    assert diag["status"] == "recovery_mode"
+    r = diag["recovery"]
+    assert r is not None
+    assert r["is_active"] is True
+    assert r["trade_count"] == 2
+    assert r["win_count"] == 1
+    assert r["loss_count"] == 1
+    assert r["pnl_usd"] == pytest.approx(1.0, abs=0.01)
+    assert "consecutive_wins" in r
+    assert "exit_criteria" in r
+    assert "consecutive_wins" in r["exit_criteria"]
+
+
+@pytest.mark.asyncio
+async def test_recovery_null_when_not_in_recovery_mode(client, test_db):
+    """A RUNNING bot's diagnostics response has recovery=None."""
+    bot = await _create_bot(test_db, status=BotStatus.RUNNING)
+    diag = (await client.get(f"/api/bots/{bot.id}/diagnostics")).json()
+    assert diag["recovery"] is None
