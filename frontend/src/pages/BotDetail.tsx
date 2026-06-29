@@ -120,12 +120,48 @@ interface RecoveryDiagnostics {
   }[]
 }
 
+// Structured, numeric decision explanation computed by the backend
+// (strategy_explain.ExplanationBuilder). The frontend ONLY renders it — it never
+// re-derives any strategy logic.
+type DiagValue = number | string | boolean | null
+
+interface DecisionCheck {
+  name: string
+  current: DiagValue
+  required: string
+  passed: boolean
+  detail: string | null
+}
+
+interface DecisionCandidate {
+  strategy: string
+  opportunity: number | null
+  performance: number | null
+  risk: number | null
+  final: number | null
+  eligible: boolean
+  selected: boolean
+  reason?: string
+}
+
+interface DecisionExplanation {
+  strategy: string
+  decision: string
+  reason: string
+  checks: DecisionCheck[]
+  metrics: Record<string, DiagValue>
+  candidates: DecisionCandidate[]
+  selected: string | null
+  evaluated_at: string | null
+}
+
 interface Diagnostics {
   bot_id: number
   status: string
   current_activity: string
   paused_reason: string | null
   recovery: RecoveryDiagnostics | null
+  explanation: DecisionExplanation | null
   evaluations: {
     total: number
     runtime: number
@@ -243,6 +279,145 @@ function DiagRow({ label, value, danger }: { label: string; value: ReactNode; da
     <div className="flex items-baseline justify-between gap-3">
       <span className="text-gray-400">{label}</span>
       <span className={`font-mono-numbers ${danger ? 'text-loss' : 'text-gray-100'}`}>{value}</span>
+    </div>
+  )
+}
+
+// Format a raw diagnostic value for display: numbers get thousands separators and
+// trimmed precision; booleans become Yes/No; null becomes an em dash.
+function fmtDiagValue(v: DiagValue): string {
+  if (v === null || v === undefined) return '—'
+  if (typeof v === 'boolean') return v ? 'Yes' : 'No'
+  if (typeof v === 'number') {
+    if (Number.isInteger(v)) return v.toLocaleString()
+    return v.toLocaleString(undefined, { maximumFractionDigits: 6 })
+  }
+  return String(v)
+}
+
+// Turn a snake_case metric key into a readable label ("lower_bb" -> "Lower bb").
+function humanizeKey(k: string): string {
+  const s = k.replace(/_/g, ' ').trim()
+  return s.charAt(0).toUpperCase() + s.slice(1)
+}
+
+// Generic renderer for the backend-computed decision explanation. Strategy-
+// agnostic: it renders whatever checks / metrics / candidates the backend sent,
+// so adding a check or metric in Python needs NO frontend change.
+function DecisionExplanationCard({ exp }: { exp: DecisionExplanation }) {
+  const decision = (exp.decision || 'hold').toUpperCase()
+  const decisionColor =
+    decision === 'BUY'
+      ? 'bg-emerald-500/10 text-emerald-300 border-emerald-500/40'
+      : decision === 'SELL'
+      ? 'bg-rose-500/10 text-rose-300 border-rose-500/40'
+      : 'bg-slate-500/10 text-slate-300 border-slate-500/40'
+
+  const metricKeys = Object.keys(exp.metrics || {})
+
+  return (
+    <div className="bg-gray-800 rounded-lg p-6">
+      <div className="flex items-center gap-2 mb-1">
+        <Activity size={18} className="text-accent" />
+        <h3 className="text-lg font-semibold">Decision Explanation</h3>
+        <span className="text-xs text-gray-500">(exact numbers behind this evaluation)</span>
+      </div>
+      <div className="flex flex-wrap items-center gap-3 mb-4">
+        <span className="text-xs uppercase tracking-wide text-gray-500">Signal</span>
+        <span className={`px-2.5 py-0.5 rounded-md text-sm border font-medium ${decisionColor}`}>
+          {decision}
+        </span>
+        <span className="text-xs text-gray-500">{humanizeKey(exp.strategy)}</span>
+        {exp.evaluated_at && (
+          <span className="text-xs text-gray-500 ml-auto font-mono-numbers">
+            {new Date(exp.evaluated_at).toLocaleTimeString()}
+          </span>
+        )}
+      </div>
+
+      {/* Checks: the pass/fail gates that produced the decision */}
+      {exp.checks && exp.checks.length > 0 && (
+        <div className="space-y-2 mb-5">
+          {exp.checks.map((c, i) => (
+            <div
+              key={`${c.name}-${i}`}
+              className="flex items-start justify-between gap-3 border-b border-gray-700/40 pb-2"
+            >
+              <div className="flex items-start gap-2 min-w-0">
+                <span className={c.passed ? 'text-profit' : 'text-loss'}>
+                  {c.passed ? '✓' : '✗'}
+                </span>
+                <div className="min-w-0">
+                  <p className="text-sm text-gray-100">{c.name}</p>
+                  {c.detail && <p className="text-xs text-gray-500">{c.detail}</p>}
+                </div>
+              </div>
+              <div className="text-right shrink-0">
+                <p className="font-mono-numbers text-sm text-gray-100">{fmtDiagValue(c.current)}</p>
+                <p className="font-mono-numbers text-xs text-gray-500">need {c.required}</p>
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {/* Auto Mode scoring table (only present for auto_mode) */}
+      {exp.candidates && exp.candidates.length > 0 && (
+        <div className="mb-5 overflow-x-auto">
+          <p className="text-xs uppercase tracking-wide text-gray-500 mb-2">Strategy scoring</p>
+          <table className="w-full text-sm">
+            <thead>
+              <tr className="text-left text-gray-400 border-b border-gray-700">
+                <th className="pb-1 pr-3">Strategy</th>
+                <th className="pb-1 px-2 text-right">Opportunity</th>
+                <th className="pb-1 px-2 text-right">Performance</th>
+                <th className="pb-1 px-2 text-right">Risk</th>
+                <th className="pb-1 pl-2 text-right">Final</th>
+              </tr>
+            </thead>
+            <tbody>
+              {exp.candidates.map((c) => (
+                <tr
+                  key={c.strategy}
+                  className={`border-b border-gray-700/40 ${c.selected ? 'text-accent font-medium' : 'text-gray-200'}`}
+                >
+                  <td className="py-1 pr-3">
+                    {c.selected ? '★ ' : ''}
+                    {humanizeKey(c.strategy)}
+                    {!c.eligible && (
+                      <span className="text-xs text-gray-500"> — {c.reason || 'ineligible'}</span>
+                    )}
+                  </td>
+                  <td className="py-1 px-2 text-right font-mono-numbers">{fmtDiagValue(c.opportunity)}</td>
+                  <td className="py-1 px-2 text-right font-mono-numbers">{fmtDiagValue(c.performance)}</td>
+                  <td className="py-1 px-2 text-right font-mono-numbers">{fmtDiagValue(c.risk)}</td>
+                  <td className="py-1 pl-2 text-right font-mono-numbers">{fmtDiagValue(c.final)}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+
+      {/* Metrics: every participating number that is not itself a gate */}
+      {metricKeys.length > 0 && (
+        <div className="mb-4">
+          <p className="text-xs uppercase tracking-wide text-gray-500 mb-2">Values</p>
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-x-6 gap-y-1 text-sm">
+            {metricKeys.map((k) => (
+              <DiagRow key={k} label={humanizeKey(k)} value={fmtDiagValue(exp.metrics[k])} />
+            ))}
+          </div>
+        </div>
+      )}
+
+      <div className="border-t border-gray-700 pt-3">
+        <p className="text-xs uppercase tracking-wide text-gray-500">Final decision</p>
+        <p className="text-sm text-gray-100 mt-1">
+          <span className="font-medium">{decision}</span>
+          {exp.reason ? ` — ${exp.reason}` : ''}
+        </p>
+      </div>
     </div>
   )
 }
@@ -824,6 +999,12 @@ export default function BotDetail() {
           </div>
         )}
       </div>
+
+      {/* Decision Explanation — the exact numeric decision path the strategy used
+          on its latest evaluation. Backend computes it; this only renders it. */}
+      {diagnostics?.explanation && (
+        <DecisionExplanationCard exp={diagnostics.explanation} />
+      )}
 
       {/* Recovery Mode Status Panel — only shown when bot.status === recovery_mode */}
       {bot.status === 'recovery_mode' && diagnostics?.recovery && (

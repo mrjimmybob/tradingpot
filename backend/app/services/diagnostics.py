@@ -137,6 +137,12 @@ class BotDiagnostics:
     # Capped at 50 most-recent events to bound memory use.
     recovery_events: List[dict] = field(default_factory=list)
 
+    # --- Structured decision explanation (latest evaluation) ---
+    # The exact numeric decision path the strategy used on its most recent
+    # evaluation (see strategy_explain.ExplanationBuilder). Backend computes it;
+    # the UI renders it verbatim. ``None`` until the first instrumented eval.
+    last_explanation: Optional[dict] = None
+
     def _bump_eval_bucket(self, now: datetime) -> None:
         key = now.replace(minute=0, second=0, microsecond=0).isoformat()
         self.eval_buckets[key] = self.eval_buckets.get(key, 0) + 1
@@ -216,6 +222,7 @@ class BotDiagnostics:
                 "last_trade_at": _iso(self.last_recovery_trade_at),
                 "events": list(self.recovery_events),
             },
+            "explanation": self.last_explanation,
         }
 
 
@@ -334,6 +341,16 @@ class DiagnosticsStore:
         d = self._get_or_create(bot_id)
         d.pause_reason = reason
         d.paused_at = datetime.utcnow()
+
+    @_guard
+    def record_explanation(self, bot_id: int, explanation: Optional[dict]) -> None:
+        """Store the latest structured decision explanation for a bot.
+
+        ``explanation`` is the dict produced by
+        ``strategy_explain.ExplanationBuilder.to_dict()``. Overwrites the prior
+        one — only the most recent evaluation's numeric decision path is kept."""
+        d = self._get_or_create(bot_id)
+        d.last_explanation = explanation
 
     @_guard
     def record_recovery_entered(self, bot_id: int, reason: str) -> None:

@@ -35,6 +35,7 @@ from .ledger_writer import LedgerWriterService
 from .accounting import TradeRecorderService, FIFOTaxEngine, CSVExportService
 from .ledger_invariants import LedgerInvariantService, ValidationError
 from .decision_status import decision_status_store, DecisionState
+from .strategy_explain import ExplanationBuilder
 from .diagnostics import (
     diagnostics_store,
     BLOCK_RISK_MANAGER,
@@ -281,6 +282,10 @@ class TradingEngine:
         # Recovery mode state per bot (paper trades, consecutive wins, etc.).
         # Persisted to bot.strategy_state["recovery_mode"] so it survives restarts.
         self._recovery_states: Dict[int, dict] = {}
+        # Per-bot structured decision-explanation builder for the CURRENT
+        # evaluation. Created fresh each tick by _execute_strategy; strategies
+        # populate it via self._explain(bot_id). Observe-only.
+        self._explanations: Dict[int, ExplanationBuilder] = {}
 
     def _make_simulated_exchange(self, budget: float) -> SimulatedExchangeService:
         """Construct a dry-run exchange wired to the shared ticker cache (L-C)."""
@@ -871,7 +876,36 @@ class TradingEngine:
         if not executor:
             return None
 
-        return await executor(bot, current_price, params, session)
+        # Fresh structured-explanation builder for THIS evaluation. Strategies
+        # populate it (self._explain(bot.id)) at the points where the numbers are
+        # computed; we finalize decision+reason from the returned signal and
+        # record it for the diagnostics API. Wrapped so explanation handling can
+        # never affect the trading signal.
+        builder = ExplanationBuilder(strategy_name)
+        self._explanations[bot.id] = builder
+
+        signal = await executor(bot, current_price, params, session)
+
+        try:
+            builder.finalize(signal)
+            diagnostics_store.record_explanation(bot.id, builder.to_dict())
+        except Exception as exc:  # noqa: BLE001 - observability must never throw
+            logger.debug("Bot %s: explanation record failed (non-fatal): %s", bot.id, exc)
+
+        return signal
+
+    def _explain(self, bot_id: int) -> ExplanationBuilder:
+        """Return the current evaluation's explanation builder for a bot.
+
+        Always returns a builder: if none is set (e.g. a strategy invoked
+        directly in a test rather than via _execute_strategy), a detached
+        throwaway is created so strategy call sites never need a None check.
+        """
+        builder = self._explanations.get(bot_id)
+        if builder is None:
+            builder = ExplanationBuilder("unknown")
+            self._explanations[bot_id] = builder
+        return builder
 
     def _get_strategy_executor(
         self,
@@ -990,6 +1024,13 @@ class TradingEngine:
                     f"Bot {bot.id}: DCA PAUSED by regime filter - "
                     f"Current regime: {trend_regime_name}, Allowed: {allowed_regimes}"
                 )
+                self._explain(bot.id).update({
+                    "current_price": current_price,
+                    "regime": trend_regime_name,
+                }).check(
+                    "Regime allows DCA", trend_regime_name,
+                    f"in [{', '.join(allowed_regimes)}]", False,
+                )
                 return TradeSignal(
                     action="hold",
                     amount=0,
@@ -1014,6 +1055,34 @@ class TradingEngine:
                     f"({last_order.created_at} > {now}). Treating as no previous order."
                 )
                 last_order = None
+
+        # --- Structured decision explanation (observe-only) -----------------
+        # DCA here is CLOCK-driven (buy every interval regardless of price), not
+        # a price/drawdown ladder — so it exposes the interval timer and capital
+        # state, not an average-entry/drawdown trigger this version does not use.
+        _dca_exp = self._explain(bot.id)
+        _secs_since = (now - last_order.created_at).total_seconds() if last_order else None
+        _interval_ok = (_secs_since is None) or (_secs_since >= interval_seconds)
+        _remaining = max(0.0, interval_seconds - _secs_since) if _secs_since is not None else 0.0
+        _dca_exp.update({
+            "current_price": current_price,
+            "order_count": order_count,
+            "interval_minutes": interval_minutes,
+            "interval_seconds": interval_seconds,
+            "seconds_since_last_order": round(_secs_since, 1) if _secs_since is not None else None,
+            "time_until_next_buy_s": round(_remaining, 1),
+            "current_balance": bot.current_balance,
+            "budget": bot.budget,
+            "allocated_capital": round((bot.budget or 0.0) - (bot.current_balance or 0.0), 2),
+            "remaining_capital": bot.current_balance,
+        })
+        _dca_exp.check(
+            "Interval elapsed",
+            (f"{_secs_since:.0f}s since last buy" if _secs_since is not None else "no prior order"),
+            f">= {interval_seconds}s", _interval_ok,
+            detail=(f"next buy in {_remaining / 60:.1f} min" if not _interval_ok else "buy due"),
+        )
+        # ---------------------------------------------------------------------
 
         if last_order:
             time_since_last = now - last_order.created_at
@@ -1095,6 +1164,8 @@ class TradingEngine:
             f"at ${current_price:.2f} | "
             f"Balance: ${bot.current_balance:.2f} → ${bot.current_balance - buy_amount:.2f}"
         )
+
+        self._explain(bot.id).metric("buy_amount", buy_amount)
 
         return TradeSignal(
             action="buy",
@@ -1233,6 +1304,16 @@ class TradingEngine:
         # Check if bar is complete
         bar_duration = (now - current_bar["start_ts"]).total_seconds()
         if bar_duration < bar_interval_seconds:
+            self._explain(bot.id).update({
+                "current_price": current_price,
+                "grid_center": state.get("center_price"),
+                "bar_progress_s": round(bar_duration, 1),
+                "bar_interval_s": bar_interval_seconds,
+                "bar_time_remaining_s": round(max(0.0, bar_interval_seconds - bar_duration), 1),
+            }).check(
+                "Bar complete", f"{bar_duration:.0f}s", f">= {bar_interval_seconds}s", False,
+                detail="grid evaluates once per completed bar",
+            )
             return TradeSignal(
                 action="hold",
                 amount=0,
@@ -1533,6 +1614,62 @@ class TradingEngine:
                     nearest_distance = distance
                     nearest_level = level_num
 
+        # --- Structured decision explanation (observe-only): the exact spacing
+        # and nearest-level math that determines whether an order is created ---
+        exp = self._explain(bot.id)
+        if atr is not None and atr > 0:
+            calc_spacing = atr * atr_range_multiplier / grid_count
+        else:
+            calc_spacing = center_price * atr_warmup_spacing_pct
+        _unfilled_buys = [lv["price"] for lv in grid_levels.values()
+                          if lv["side"] == "buy" and not lv["filled"]]
+        _unfilled_sells = [lv["price"] for lv in grid_levels.values()
+                           if lv["side"] == "sell" and not lv["filled"]]
+        nearest_buy_price = (
+            min(_unfilled_buys, key=lambda p: abs(p - bar_close_price)) if _unfilled_buys else None)
+        nearest_sell_price = (
+            min(_unfilled_sells, key=lambda p: abs(p - bar_close_price)) if _unfilled_sells else None)
+        dist_buy = (bar_close_price - nearest_buy_price) if nearest_buy_price is not None else None
+        dist_sell = (nearest_sell_price - bar_close_price) if nearest_sell_price is not None else None
+        exp.update({
+            "current_price": bar_close_price,
+            "grid_center": center_price,
+            "atr": atr if atr is not None else "warmup",
+            "atr_range_multiplier": atr_range_multiplier,
+            "calculated_spacing": calc_spacing,
+            "min_profitable_spacing": min_spacing_usd,
+            "effective_spacing": grid_spacing,
+            "grid_range": grid_range,
+            "buy_levels": buy_levels,
+            "sell_levels": sell_levels,
+            "nearest_buy": nearest_buy_price,
+            "nearest_sell": nearest_sell_price,
+            "distance_to_buy": dist_buy,
+            "distance_to_sell": dist_sell,
+            "virtual_cash": state["virtual_cash"],
+            "virtual_crypto": state["virtual_crypto"],
+            "total_trades": state.get("total_trades", 0),
+            "drawdown_pct": drawdown_pct,
+        })
+        if nearest_buy_price is not None:
+            exp.check(
+                "Nearest BUY", f"{dist_buy:+.2f} from level",
+                f"price <= {nearest_buy_price:.2f}", bar_close_price <= nearest_buy_price,
+                detail=f"trigger spacing {grid_spacing:.2f}",
+            )
+        if nearest_sell_price is not None:
+            exp.check(
+                "Nearest SELL", f"{dist_sell:+.2f} from level",
+                f"price >= {nearest_sell_price:.2f}", bar_close_price >= nearest_sell_price,
+                detail=f"trigger spacing {grid_spacing:.2f}",
+            )
+        exp.check(
+            "Grid level triggered",
+            "yes" if nearest_level is not None else "no",
+            "price crossed an unfilled level", nearest_level is not None,
+        )
+        # ---------------------------------------------------------------------
+
         if nearest_level is None:
             # PRODUCTION DIAGNOSIS: how far price is from the closest unfilled
             # buy/sell level, so an operator can see whether the grid is simply
@@ -1821,6 +1958,10 @@ class TradingEngine:
         # Need enough bars for calculations
         if len(state["bars"]) < period:
             self._mean_reversion_states[bot.id] = state
+            self._explain(bot.id).metric("current_price", current_price).check(
+                "Bars collected", len(state["bars"]), f">= {period}", False,
+                detail="warming up Bollinger window",
+            )
             return TradeSignal(
                 action="hold",
                 amount=0,
@@ -1939,6 +2080,64 @@ class TradingEngine:
                 f"regime={regime_name} entry_allowed={regime_allows_entry} "
                 f"cooldown={cd_remaining}s has_position={has_position} bars={len(state['bars'])}"
             )
+
+        # --- Structured decision explanation (observe-only; never affects logic) ---
+        # Records the EXACT numbers behind this evaluation: every band, the ATR,
+        # the distances, cooldown, regime gate, and the entry/exit gates with
+        # current-vs-required-vs-pass. This MR implementation is Bollinger+ATR
+        # based and computes NO RSI, so none is reported (we never fabricate a
+        # check that did not participate).
+        exp = self._explain(bot.id)
+        cd_remaining = 0
+        if state.get("last_exit_time") is not None:
+            cd_remaining = max(
+                0,
+                int(cooldown_seconds - (now - state["last_exit_time"]).total_seconds()),
+            )
+        dist_lower_pct = ((last_bar_close - lower_band) / lower_band * 100) if lower_band > 0 else 0.0
+        dist_upper_pct = ((upper_band - last_bar_close) / upper_band * 100) if upper_band > 0 else 0.0
+        exit_target = sma if exit_at_mean else upper_band
+        exp.update({
+            "current_price": current_price,
+            "bar_close": last_bar_close,
+            "middle_bb_sma": sma,
+            "upper_bb": upper_band,
+            "lower_bb": lower_band,
+            "atr": atr,
+            "distance_to_lower_pct": dist_lower_pct,
+            "distance_to_upper_pct": dist_upper_pct,
+            "exit_target": exit_target,
+            "regime": regime_name,
+            "bars_collected": len(state["bars"]),
+            "cooldown_seconds": cooldown_seconds,
+            "cooldown_remaining_s": cd_remaining,
+            "hard_stop": state.get("hard_stop"),
+            "bars_since_entry": state.get("bars_since_entry", 0),
+            "max_hold_bars": max_hold_bars,
+            "has_position": has_position,
+        })
+        if has_position:
+            exp.check("Open position", "Yes", "held → evaluating exits", True)
+            exp.check(
+                f"Exit target ({'mean' if exit_at_mean else 'upper band'})",
+                last_bar_close, f">= {exit_target:.2f}", last_bar_close >= exit_target,
+                detail=f"{dist_upper_pct:+.3f}% from target",
+            )
+            _hs = state.get("hard_stop")
+            if _hs is not None:
+                exp.check("Hard stop", current_price, f"<= {_hs:.2f}", current_price <= _hs)
+            _bse = state.get("bars_since_entry", 0)
+            exp.check("Time stop", _bse, f">= {max_hold_bars} bars", _bse >= max_hold_bars)
+            exp.check("Regime flip", regime_name, "trend_up/down forces exit", force_exit_regime)
+        else:
+            exp.check("Regime allows entry", regime_name, "trend_flat or volatility_high", regime_allows_entry)
+            exp.check("Cooldown", f"{cd_remaining} sec remaining", f">= {cooldown_seconds} sec elapsed", cd_remaining == 0)
+            exp.check("Open position", "No", "must be flat to enter", not has_position)
+            exp.check(
+                "Lower band touch", last_bar_close, f"<= {lower_band:.2f}",
+                last_bar_close <= lower_band, detail=f"{dist_lower_pct:+.3f}% from band",
+            )
+        # ---------------------------------------------------------------------
 
         # === POSITION EXIT LOGIC (BOUNDED RISK) ===
         # Exits: Mean reached | Hard stop | Time stop | Regime flip
@@ -2297,6 +2496,10 @@ class TradingEngine:
 
         # Need enough data for EMA calculation
         if len(price_history) < long_period:
+            self._explain(bot.id).metric("current_price", current_price).check(
+                "Data collected", len(price_history), f">= {long_period}", False,
+                detail="warming up EMA window",
+            )
             return TradeSignal(
                 action="hold",
                 amount=0,
@@ -2376,6 +2579,58 @@ class TradingEngine:
             f"EMA({short_period}): ${ema_short:.2f}, EMA({long_period}): ${ema_long:.2f}, "
             f"ATR: ${atr:.2f}"
         )
+
+        # --- Structured decision explanation (observe-only) -----------------
+        # The exact EMA/ATR/confirmation math behind entry & exit. This is a
+        # pure EMA-cross + ATR-trailing-stop trend follower: it uses NO ADX and
+        # NO pullback metric, so neither is reported (we never invent a check).
+        exp = self._explain(bot.id)
+        ema_sep = ema_short - ema_long
+        ema_sep_pct = (ema_sep / ema_long * 100) if ema_long else 0.0
+        price_vs_long_pct = ((current_price - ema_long) / ema_long * 100) if ema_long else 0.0
+        tf_cd_remaining = 0
+        if state.get("last_exit_time") is not None:
+            tf_cd_remaining = max(
+                0,
+                int(cooldown_seconds - (datetime.utcnow() - state["last_exit_time"]).total_seconds()),
+            )
+        exp.update({
+            "current_price": current_price,
+            "ema_fast": ema_short,
+            "ema_slow": ema_long,
+            "ema_distance": ema_sep,
+            "ema_distance_pct": ema_sep_pct,
+            "price_vs_slow_ema_pct": price_vs_long_pct,
+            "trend_strength_pct": ema_sep_pct,
+            "atr": atr,
+            "entry_confirmation_count": state.get("entry_confirmation_count", 0),
+            "exit_confirmation_count": state.get("exit_confirmation_count", 0),
+            "entry_threshold_loops": entry_confirmation_loops,
+            "exit_threshold_loops": exit_confirmation_loops,
+            "cooldown_seconds": cooldown_seconds,
+            "cooldown_remaining_s": tf_cd_remaining,
+            "trailing_stop": state.get("trailing_stop"),
+            "highest_price": state.get("highest_price"),
+            "has_position": has_position,
+        })
+        if not has_position:
+            _entry_cond = current_price > ema_long and ema_short > ema_long
+            _proj_conf = (state.get("entry_confirmation_count", 0) + 1) if _entry_cond else 0
+            exp.check("Cooldown", f"{tf_cd_remaining} sec remaining", f">= {cooldown_seconds} sec elapsed", tf_cd_remaining == 0)
+            exp.check("Price above slow EMA", current_price, f"> {ema_long:.2f}", current_price > ema_long, detail=f"{price_vs_long_pct:+.3f}%")
+            exp.check("EMA crossover (fast>slow)", ema_short, f"> {ema_long:.2f}", ema_short > ema_long, detail=f"sep {ema_sep:+.2f} ({ema_sep_pct:+.3f}%)")
+            exp.check("Entry confirmation", _proj_conf, f">= {entry_confirmation_loops} loops", _proj_conf >= entry_confirmation_loops)
+        else:
+            _ts = state.get("trailing_stop")
+            if _ts is not None:
+                exp.check("Trailing stop hit", current_price, f"<= {_ts:.2f}", current_price <= _ts)
+            _exit_cond = current_price < ema_long
+            _proj_exit = (state.get("exit_confirmation_count", 0) + 1) if _exit_cond else 0
+            exp.check(
+                "Trend break (price < slow EMA)", current_price, f"< {ema_long:.2f}",
+                _exit_cond, detail=f"confirm {_proj_exit}/{exit_confirmation_loops}",
+            )
+        # ---------------------------------------------------------------------
 
         # Trading logic
         if not has_position:
@@ -2747,6 +3002,40 @@ class TradingEngine:
 
         funding_pct = mean_funding * 100.0
 
+        # --- Structured decision explanation (observe-only) -----------------
+        # Funding is used purely as an ENTRY FILTER here (this strategy does not
+        # short or harvest funding), so there is no carry-edge / expected-fee
+        # math to expose — only the funding band, regime gate and cooldown that
+        # actually gate the spot entry/exit.
+        exp = self._explain(bot.id)
+        fc_cd_remaining = 0
+        if state.get("last_exit_time") is not None:
+            fc_cd_remaining = max(
+                0,
+                int(cooldown_seconds - (datetime.utcnow() - state["last_exit_time"]).total_seconds()),
+            )
+        _band = f"in [{min_funding * 100:.5f}%, {max_funding * 100:.5f}%]"
+        exp.update({
+            "current_price": current_price,
+            "funding_rate_pct": funding_pct,
+            "min_funding_pct": min_funding * 100.0,
+            "max_funding_pct": max_funding * 100.0,
+            "funding_lookback_periods": lookback,
+            "regime": trend_regime_name,
+            "allowed_regimes": ", ".join(allowed_regimes),
+            "cooldown_seconds": cooldown_seconds,
+            "cooldown_remaining_s": fc_cd_remaining,
+            "has_position": has_position,
+        })
+        if not has_position:
+            exp.check("Cooldown", f"{fc_cd_remaining} sec remaining", f">= {cooldown_seconds} sec elapsed", fc_cd_remaining == 0)
+            exp.check("Funding in band", f"{funding_pct:.5f}%", _band, funding_favorable)
+            exp.check("Regime favourable", trend_regime_name, f"in [{', '.join(allowed_regimes)}]", market_favorable)
+        else:
+            exp.check("Funding still in band", f"{funding_pct:.5f}%", _band, funding_favorable, detail="exit when funding leaves band")
+            exp.check("Regime still favourable", trend_regime_name, f"in [{', '.join(allowed_regimes)}]", market_favorable, detail="exit when regime turns")
+        # ---------------------------------------------------------------------
+
         if not has_position:
             # --- Entry path ---
             if state.get("last_exit_time") is not None:
@@ -2958,6 +3247,10 @@ class TradingEngine:
         # Need enough bars for calculations
         if len(state["bars"]) < bb_period:
             self._volatility_breakout_states[bot.id] = state
+            self._explain(bot.id).metric("current_price", current_price).check(
+                "Bars collected", len(state["bars"]), f">= {bb_period}", False,
+                detail="warming up Bollinger window",
+            )
             return TradeSignal(
                 action="hold",
                 amount=0,
@@ -3069,6 +3362,34 @@ class TradingEngine:
 
         # === POSITION EXIT LOGIC (INSTITUTIONAL GRADE) ===
         if has_position:
+            # --- Structured decision explanation: exit gates (observe-only) ---
+            _exp = self._explain(bot.id)
+            _ts = state.get("trailing_stop")
+            _bse = state.get("bars_since_entry", 0)
+            _exp.update({
+                "current_price": current_price,
+                "bar_close": last_bar_close,
+                "bb_upper": upper_band,
+                "bb_middle": sma,
+                "bb_lower": lower_band,
+                "bb_width": bb_width,
+                "atr": atr,
+                "trailing_stop": _ts,
+                "bars_since_entry": _bse,
+                "highest_price": state.get("highest_price"),
+                "failed_breakout_bars": failed_breakout_bars,
+                "regime": volatility_regime_name,
+                "has_position": True,
+            })
+            if _ts is not None:
+                _exp.check("Trailing stop hit", current_price, f"<= {_ts:.2f}", current_price <= _ts)
+            _exp.check(
+                "Failed-breakout exit", last_bar_close,
+                f"< {upper_band:.2f} within {failed_breakout_bars} bars",
+                (_bse <= failed_breakout_bars and last_bar_close < upper_band),
+                detail=f"bar {_bse}/{failed_breakout_bars}",
+            )
+            # -----------------------------------------------------------------
             for pos in positions:
                 # Increment bars_since_entry only when bar completes (not on every tick)
                 if bar_completed and state["entry_price"] is not None:
@@ -3256,6 +3577,43 @@ class TradingEngine:
                 f"armed={bool(state.get('breakout_armed'))} regime={volatility_regime_name} "
                 f"bars={len(state['bars'])}"
             )
+
+        # --- Structured decision explanation: entry gates (observe-only) -----
+        # The exact compression + breakout math. This implementation uses NO
+        # volume data, so no volume-confirmation check is reported (never faked).
+        exp = self._explain(bot.id)
+        upper_gap = last_bar_close - upper_band
+        upper_gap_pct = (upper_gap / upper_band * 100) if upper_band > 0 else 0.0
+        compression_ratio = (bb_width / percentile_value) if percentile_value else None
+        exp.update({
+            "current_price": current_price,
+            "bar_close": last_bar_close,
+            "bb_upper": upper_band,
+            "bb_middle": sma,
+            "bb_lower": lower_band,
+            "bb_width": bb_width,
+            "historical_compression_width": percentile_value,
+            "compression_ratio": compression_ratio,
+            "is_compressed": is_compressed,
+            "compression_bars": state.get("compression_bars", 0),
+            "min_compression_bars": min_compression_bars,
+            "breakout_armed": bool(state.get("breakout_armed")),
+            "atr": atr,
+            "breakout_threshold": upper_band,
+            "breakout_distance": upper_gap,
+            "breakout_gap_pct": upper_gap_pct,
+            "regime": volatility_regime_name,
+            "has_position": False,
+        })
+        exp.check(
+            "Compression armed", state.get("compression_bars", 0),
+            f">= {min_compression_bars} bars compressed", compression_satisfied,
+        )
+        exp.check(
+            "Breakout above upper band", last_bar_close, f"> {upper_band:.2f}",
+            last_bar_close > upper_band, detail=f"{upper_gap_pct:+.3f}% vs band",
+        )
+        # ---------------------------------------------------------------------
 
         # Cooldown only gates an ACTUAL breakout entry (sparse trading) - it no
         # longer blocks compression tracking.
@@ -3688,6 +4046,46 @@ class TradingEngine:
 
         # Save updated state
         self._save_auto_state(bot.id, auto_state)
+
+        # --- Structured decision explanation: full Auto Mode scoring ---------
+        # Exposes every strategy's opportunity / performance / risk / final
+        # score and the selected one. The selected sub-strategy then appends its
+        # OWN numeric gates to this same builder below, so the explanation shows
+        # both WHY this strategy was chosen and WHY it did/didn't trade.
+        exp = self._explain(bot.id)
+        regime_str = (
+            f"{current_regime.get('trend_state')}/"
+            f"{current_regime.get('volatility_state')}/"
+            f"{current_regime.get('liquidity_state')}"
+        )
+        for _name, _final, _caps2, _metrics2, _detail in scored_strategies:
+            exp.candidate({
+                "strategy": _name,
+                "opportunity": _detail.get("opportunity", 0.0),
+                "performance": _detail.get("performance", 0.0),
+                "risk": _detail.get("risk_penalty", 0.0),
+                "final": _final,
+                "eligible": True,
+                "selected": _name == current_strategy,
+            })
+        for _name, _reason in ineligible_reasons.items():
+            exp.candidate({
+                "strategy": _name,
+                "opportunity": None, "performance": None, "risk": None, "final": None,
+                "eligible": False, "selected": False, "reason": _reason,
+            })
+        exp.select(current_strategy)
+        exp.update({
+            "regime": regime_str,
+            "selected_strategy": current_strategy,
+            "switch_reason": switch_reason,
+            "eligible_count": len(eligible_strategies),
+        })
+        exp.check(
+            "Strategy selected", current_strategy,
+            "highest final score among eligible", True, detail=switch_reason,
+        )
+        # ---------------------------------------------------------------------
 
         # === FORCE EXIT EXECUTION ===
         if force_exit_signal:
@@ -5854,7 +6252,7 @@ class TradingEngine:
             "_price_histories", "_funding_cache", "_funding_states", "_trend_states",
             "_grid_states", "_mean_reversion_states", "_volatility_breakout_states",
             "_twap_states", "_vwap_states", "_auto_states", "_last_pending_resolve",
-            "_bot_loggers", "_exec_rejections",
+            "_bot_loggers", "_exec_rejections", "_explanations",
         )
         for attr in state_dicts:
             store = getattr(self, attr, None)
