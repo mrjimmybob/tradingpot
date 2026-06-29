@@ -144,10 +144,22 @@ interface DecisionCandidate {
   reason?: string
 }
 
+interface NextTrade {
+  current?: DiagValue
+  current_label?: string
+  target?: DiagValue
+  target_label?: string
+  distance?: DiagValue
+  trigger?: DiagValue
+  status?: string
+}
+
 interface DecisionExplanation {
   strategy: string
   decision: string
   reason: string
+  state: string | null
+  next_trade: NextTrade | null
   checks: DecisionCheck[]
   metrics: Record<string, DiagValue>
   candidates: DecisionCandidate[]
@@ -274,6 +286,21 @@ function fmtDiagTime(iso: string | null): string {
   return iso ? new Date(iso).toLocaleTimeString() : '—'
 }
 
+// Human-readable elapsed duration since an ISO timestamp ("5h 13m", "47s").
+function fmtDurationSince(iso: string | null): string {
+  if (!iso) return '—'
+  const ms = Date.now() - new Date(iso).getTime()
+  if (Number.isNaN(ms) || ms < 0) return '—'
+  const s = Math.floor(ms / 1000)
+  const d = Math.floor(s / 86400)
+  const h = Math.floor((s % 86400) / 3600)
+  const m = Math.floor((s % 3600) / 60)
+  if (d > 0) return `${d}d ${h}h`
+  if (h > 0) return `${h}h ${m}m`
+  if (m > 0) return `${m}m ${s % 60}s`
+  return `${s}s`
+}
+
 function DiagRow({ label, value, danger }: { label: string; value: ReactNode; danger?: boolean }) {
   return (
     <div className="flex items-baseline justify-between gap-3">
@@ -299,6 +326,33 @@ function fmtDiagValue(v: DiagValue): string {
 function humanizeKey(k: string): string {
   const s = k.replace(/_/g, ' ').trim()
   return s.charAt(0).toUpperCase() + s.slice(1)
+}
+
+// Collapsible section (native <details>) used to push secondary panels below the
+// fold so the important "why didn't it trade?" answer fits on one screen.
+function CollapsibleSection({
+  title,
+  icon,
+  defaultOpen = false,
+  children,
+}: {
+  title: string
+  icon?: ReactNode
+  defaultOpen?: boolean
+  children: ReactNode
+}) {
+  return (
+    <details className="bg-gray-800 rounded-lg group" open={defaultOpen}>
+      <summary className="flex items-center gap-2 p-6 cursor-pointer list-none select-none">
+        {icon}
+        <h3 className="text-lg font-semibold">{title}</h3>
+        <span className="ml-auto text-gray-500 text-sm transition-transform group-open:rotate-180">
+          ▾
+        </span>
+      </summary>
+      <div className="px-6 pb-6">{children}</div>
+    </details>
+  )
 }
 
 // Generic renderer for the backend-computed decision explanation. Strategy-
@@ -327,6 +381,11 @@ function DecisionExplanationCard({ exp }: { exp: DecisionExplanation }) {
         <span className={`px-2.5 py-0.5 rounded-md text-sm border font-medium ${decisionColor}`}>
           {decision}
         </span>
+        {exp.state && (
+          <span className="px-2.5 py-0.5 rounded-md text-sm border font-medium bg-sky-500/10 text-sky-300 border-sky-500/40 font-mono-numbers">
+            {exp.state}
+          </span>
+        )}
         <span className="text-xs text-gray-500">{humanizeKey(exp.strategy)}</span>
         {exp.evaluated_at && (
           <span className="text-xs text-gray-500 ml-auto font-mono-numbers">
@@ -334,6 +393,36 @@ function DecisionExplanationCard({ exp }: { exp: DecisionExplanation }) {
           </span>
         )}
       </div>
+
+      {/* Next Trade preview — exactly what is required for the next trade. */}
+      {exp.next_trade && (
+        <div className="mb-5 rounded-lg border border-gray-700 bg-gray-900/40 p-4">
+          <p className="text-xs uppercase tracking-wide text-gray-500 mb-2">Next trade</p>
+          <div className="grid grid-cols-2 sm:grid-cols-4 gap-x-6 gap-y-1 text-sm">
+            {exp.next_trade.current != null && (
+              <DiagRow
+                label={exp.next_trade.current_label || 'Current'}
+                value={fmtDiagValue(exp.next_trade.current)}
+              />
+            )}
+            {exp.next_trade.target != null && (
+              <DiagRow
+                label={exp.next_trade.target_label || 'Target'}
+                value={fmtDiagValue(exp.next_trade.target)}
+              />
+            )}
+            {exp.next_trade.distance != null && (
+              <DiagRow label="Distance" value={fmtDiagValue(exp.next_trade.distance)} />
+            )}
+            {exp.next_trade.trigger != null && (
+              <DiagRow label="Trigger" value={fmtDiagValue(exp.next_trade.trigger)} />
+            )}
+          </div>
+          {exp.next_trade.status && (
+            <p className="mt-2 text-sm text-accent font-medium">{exp.next_trade.status}</p>
+          )}
+        </div>
+      )}
 
       {/* Checks: the pass/fail gates that produced the decision */}
       {exp.checks && exp.checks.length > 0 && (
@@ -1025,6 +1114,64 @@ export default function BotDetail() {
             )}
           </div>
 
+          {/* Live recovery telemetry — duration, evaluations, signal breakdown,
+              and the strategy's CURRENT state/reason (composed from the same
+              diagnostics payload the rest of the page uses). */}
+          <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 mb-4">
+            <div className="bg-gray-900 rounded-md p-3 text-center">
+              <p className="text-gray-400 text-xs mb-1">Duration</p>
+              <p className="text-xl font-bold text-gray-100 font-mono-numbers">
+                {fmtDurationSince(diagnostics.recovery.started_at)}
+              </p>
+            </div>
+            <div className="bg-gray-900 rounded-md p-3 text-center">
+              <p className="text-gray-400 text-xs mb-1">Evaluations</p>
+              <p className="text-xl font-bold text-gray-100 font-mono-numbers">
+                {diagnostics.evaluations.runtime.toLocaleString()}
+              </p>
+            </div>
+            <div className="bg-gray-900 rounded-md p-3 text-center">
+              <p className="text-gray-400 text-xs mb-1">Signals (B/S/H)</p>
+              <p className="text-base font-bold font-mono-numbers">
+                <span className="text-profit">{diagnostics.signals.buy}</span>
+                <span className="text-gray-500"> / </span>
+                <span className="text-loss">{diagnostics.signals.sell}</span>
+                <span className="text-gray-500"> / </span>
+                <span className="text-gray-300">{diagnostics.signals.hold}</span>
+              </p>
+            </div>
+            <div className="bg-gray-900 rounded-md p-3 text-center">
+              <p className="text-gray-400 text-xs mb-1">Paper Trades</p>
+              <p className="text-xl font-bold text-gray-100 font-mono-numbers">
+                {diagnostics.recovery.trade_count}
+              </p>
+            </div>
+          </div>
+
+          {/* Current strategy state + why it hasn't progressed (the meaningful
+              "why" the operator actually wants). Recovery has NO forced timeout —
+              it resumes live on the exit criteria below. */}
+          {diagnostics.explanation && (
+            <div className="bg-gray-900 rounded-md p-4 mb-4">
+              <div className="flex items-center gap-2 mb-1">
+                <p className="text-gray-400 text-xs uppercase tracking-wide">Current state</p>
+                {diagnostics.explanation.state && (
+                  <span className="px-2 py-0.5 rounded text-xs border bg-sky-500/10 text-sky-300 border-sky-500/40 font-mono-numbers">
+                    {diagnostics.explanation.state}
+                  </span>
+                )}
+              </div>
+              <p className="text-sm text-gray-100">
+                {diagnostics.explanation.reason || diagnostics.signals.last_reason || '—'}
+              </p>
+              {diagnostics.explanation.next_trade?.status && (
+                <p className="text-xs text-accent mt-1">
+                  {diagnostics.explanation.next_trade.status}
+                </p>
+              )}
+            </div>
+          )}
+
           {/* Paper trade stats */}
           <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 mb-4">
             <div className="bg-gray-900 rounded-md p-3 text-center">
@@ -1123,16 +1270,55 @@ export default function BotDetail() {
         </div>
       )}
 
-      {/* Strategy Diagnostics — observe-only operability: what the bot has been
-          doing, thinking, waiting for, blocked by, and why it's paused */}
+      {/* Open Positions — kept visible: whether a position is open is central to
+          "why didn't it trade?". */}
       <div className="bg-gray-800 rounded-lg p-6">
-        <div className="flex items-center gap-2 mb-4">
-          <Activity size={18} className="text-accent" />
-          <h3 className="text-lg font-semibold">Strategy Diagnostics</h3>
-        </div>
+        <h3 className="text-lg font-semibold mb-4">Open Positions</h3>
+        {positions && positions.length > 0 ? (
+          <div className="space-y-3">
+            {positions.map((pos) => (
+              <div
+                key={pos.id}
+                className="flex items-center justify-between p-3 bg-gray-700/50 rounded-lg"
+              >
+                <div>
+                  <p className="font-medium">{pos.trading_pair}</p>
+                  <p className="text-sm text-gray-400 capitalize">
+                    {pos.side} &middot; {pos.amount} @ ${pos.entry_price.toFixed(2)}
+                  </p>
+                </div>
+                <div className="text-right">
+                  <p
+                    className={`font-mono-numbers ${
+                      pos.unrealized_pnl >= 0 ? 'text-profit' : 'text-loss'
+                    }`}
+                  >
+                    {pos.unrealized_pnl >= 0 ? '+' : ''}${pos.unrealized_pnl.toFixed(2)}
+                  </p>
+                  <p className="text-sm text-gray-400">
+                    Current: ${pos.current_price.toFixed(2)}
+                  </p>
+                </div>
+              </div>
+            ))}
+          </div>
+        ) : (
+          <div className="text-center py-8 text-gray-400">
+            <TrendingUp size={32} className="mx-auto mb-2 opacity-50" />
+            <p>No open positions</p>
+          </div>
+        )}
+      </div>
+
+      {/* 4. Strategy Diagnostics — collapsed by default (secondary operability:
+          counters, signal/execution stats, top reasons, blocked trades). */}
+      <CollapsibleSection
+        title="Strategy Diagnostics"
+        icon={<Activity size={18} className="text-accent" />}
+      >
         {diagnostics ? (
           <div className="space-y-4">
-            {/* Current activity — the first thing visible */}
+            {/* Current activity */}
             <div className="bg-gray-900 rounded-md p-4">
               <p className="text-gray-400 text-xs uppercase tracking-wide mb-1">
                 Current Activity
@@ -1216,39 +1402,9 @@ export default function BotDetail() {
                   </p>
                 )}
               </div>
-
-              {/* Market data health */}
-              <div className="bg-gray-900 rounded-md p-4">
-                <p className="text-gray-400 text-xs uppercase tracking-wide mb-2">
-                  Market Data Health
-                </p>
-                <div className="space-y-1 text-sm">
-                  <DiagRow
-                    label="Ticker failures"
-                    value={diagnostics.market_data.ticker_failures}
-                    danger={diagnostics.market_data.ticker_failures > 0}
-                  />
-                  <DiagRow
-                    label="Websocket failures"
-                    value={diagnostics.market_data.websocket_failures}
-                    danger={diagnostics.market_data.websocket_failures > 0}
-                  />
-                  <DiagRow
-                    label="Data unavailable"
-                    value={diagnostics.market_data.data_unavailable}
-                    danger={diagnostics.market_data.data_unavailable > 0}
-                  />
-                </div>
-                {diagnostics.market_data.last_failure_reason && (
-                  <p className="text-xs text-loss mt-2 break-words">
-                    Last: {diagnostics.market_data.last_failure_reason} (
-                    {fmtDiagTime(diagnostics.market_data.last_failure_at)})
-                  </p>
-                )}
-              </div>
             </div>
 
-            {/* Top decision reasons — what the strategy is actually thinking */}
+            {/* Top decision reasons */}
             <div className="bg-gray-900 rounded-md p-4">
               <p className="text-gray-400 text-xs uppercase tracking-wide mb-2">
                 Top Decision Reasons
@@ -1297,89 +1453,9 @@ export default function BotDetail() {
             <p>No diagnostics yet</p>
           </div>
         )}
-      </div>
+      </CollapsibleSection>
 
-      <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-        {/* Open Positions */}
-        <div className="bg-gray-800 rounded-lg p-6">
-          <h3 className="text-lg font-semibold mb-4">Open Positions</h3>
-          {positions && positions.length > 0 ? (
-            <div className="space-y-3">
-              {positions.map((pos) => (
-                <div
-                  key={pos.id}
-                  className="flex items-center justify-between p-3 bg-gray-700/50 rounded-lg"
-                >
-                  <div>
-                    <p className="font-medium">{pos.trading_pair}</p>
-                    <p className="text-sm text-gray-400 capitalize">
-                      {pos.side} &middot; {pos.amount} @ ${pos.entry_price.toFixed(2)}
-                    </p>
-                  </div>
-                  <div className="text-right">
-                    <p
-                      className={`font-mono-numbers ${
-                        pos.unrealized_pnl >= 0 ? 'text-profit' : 'text-loss'
-                      }`}
-                    >
-                      {pos.unrealized_pnl >= 0 ? '+' : ''}${pos.unrealized_pnl.toFixed(2)}
-                    </p>
-                    <p className="text-sm text-gray-400">
-                      Current: ${pos.current_price.toFixed(2)}
-                    </p>
-                  </div>
-                </div>
-              ))}
-            </div>
-          ) : (
-            <div className="text-center py-8 text-gray-400">
-              <TrendingUp size={32} className="mx-auto mb-2 opacity-50" />
-              <p>No open positions</p>
-            </div>
-          )}
-        </div>
-
-        {/* Strategy Parameters */}
-        <div className="bg-gray-800 rounded-lg p-6">
-          <h3 className="text-lg font-semibold mb-4">Strategy Parameters</h3>
-          <dl className="space-y-3">
-            <div className="flex justify-between">
-              <dt className="text-gray-400">Strategy</dt>
-              <dd className="capitalize">{bot.strategy.replace(/_/g, ' ')}</dd>
-            </div>
-            <div className="flex justify-between">
-              <dt className="text-gray-400">Compound Mode</dt>
-              <dd>{bot.compound_enabled ? 'Enabled' : 'Disabled'}</dd>
-            </div>
-            {bot.stop_loss_percent && (
-              <div className="flex justify-between">
-                <dt className="text-gray-400">Stop Loss</dt>
-                <dd>{bot.stop_loss_percent}%</dd>
-              </div>
-            )}
-            {bot.drawdown_limit_percent && (
-              <div className="flex justify-between">
-                <dt className="text-gray-400">Drawdown Limit</dt>
-                <dd>{bot.drawdown_limit_percent}%</dd>
-              </div>
-            )}
-            {bot.running_time_hours && (
-              <div className="flex justify-between">
-                <dt className="text-gray-400">Running Time</dt>
-                <dd>{bot.running_time_hours}h</dd>
-              </div>
-            )}
-            {Object.entries(bot.strategy_params || {}).map(([key, value]) => (
-              <div key={key} className="flex justify-between">
-                <dt className="text-gray-400 capitalize">{key.replace(/_/g, ' ')}</dt>
-                <dd>{String(value)}</dd>
-              </div>
-            ))}
-          </dl>
-        </div>
-      </div>
-
-      {/* Recent Orders */}
+      {/* 5. Recent Orders */}
       <div className="bg-gray-800 rounded-lg p-6">
         <h3 className="text-lg font-semibold mb-4">Recent Orders</h3>
         {orders && orders.length > 0 ? (
@@ -1419,6 +1495,79 @@ export default function BotDetail() {
           </div>
         )}
       </div>
+
+      {/* 6. Strategy Parameters — collapsed by default. */}
+      <CollapsibleSection title="Strategy Parameters">
+        <dl className="space-y-3">
+          <div className="flex justify-between">
+            <dt className="text-gray-400">Strategy</dt>
+            <dd className="capitalize">{bot.strategy.replace(/_/g, ' ')}</dd>
+          </div>
+          <div className="flex justify-between">
+            <dt className="text-gray-400">Compound Mode</dt>
+            <dd>{bot.compound_enabled ? 'Enabled' : 'Disabled'}</dd>
+          </div>
+          {bot.stop_loss_percent && (
+            <div className="flex justify-between">
+              <dt className="text-gray-400">Stop Loss</dt>
+              <dd>{bot.stop_loss_percent}%</dd>
+            </div>
+          )}
+          {bot.drawdown_limit_percent && (
+            <div className="flex justify-between">
+              <dt className="text-gray-400">Drawdown Limit</dt>
+              <dd>{bot.drawdown_limit_percent}%</dd>
+            </div>
+          )}
+          {bot.running_time_hours && (
+            <div className="flex justify-between">
+              <dt className="text-gray-400">Running Time</dt>
+              <dd>{bot.running_time_hours}h</dd>
+            </div>
+          )}
+          {Object.entries(bot.strategy_params || {}).map(([key, value]) => (
+            <div key={key} className="flex justify-between">
+              <dt className="text-gray-400 capitalize">{key.replace(/_/g, ' ')}</dt>
+              <dd>{String(value)}</dd>
+            </div>
+          ))}
+        </dl>
+      </CollapsibleSection>
+
+      {/* 7. Market Health — collapsed by default. */}
+      <CollapsibleSection title="Market Health">
+        {diagnostics ? (
+          <div className="bg-gray-900 rounded-md p-4">
+            <div className="space-y-1 text-sm">
+              <DiagRow
+                label="Ticker failures"
+                value={diagnostics.market_data.ticker_failures}
+                danger={diagnostics.market_data.ticker_failures > 0}
+              />
+              <DiagRow
+                label="Websocket failures"
+                value={diagnostics.market_data.websocket_failures}
+                danger={diagnostics.market_data.websocket_failures > 0}
+              />
+              <DiagRow
+                label="Data unavailable"
+                value={diagnostics.market_data.data_unavailable}
+                danger={diagnostics.market_data.data_unavailable > 0}
+              />
+            </div>
+            {diagnostics.market_data.last_failure_reason && (
+              <p className="text-xs text-loss mt-2 break-words">
+                Last: {diagnostics.market_data.last_failure_reason} (
+                {fmtDiagTime(diagnostics.market_data.last_failure_at)})
+              </p>
+            )}
+          </div>
+        ) : (
+          <div className="text-center py-6 text-gray-400">
+            <p>No market data yet</p>
+          </div>
+        )}
+      </CollapsibleSection>
     </div>
   )
 }

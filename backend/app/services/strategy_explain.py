@@ -80,6 +80,14 @@ class DecisionExplanation:
     strategy: str
     decision: str = "hold"
     reason: str = ""
+    # Machine-readable lifecycle state the strategy is in RIGHT NOW, e.g.
+    # "WAITING_LOWER_BAND", "LONG_OPEN", "COOLDOWN". Comes from the strategy, not
+    # inferred by the UI. Answers "what is the bot doing?" at a glance.
+    state: Optional[str] = None
+    # Structured "what is required for the next trade" preview built from the
+    # numbers the strategy already computed. Generic shape (all keys optional):
+    #   {current, current_label, target, target_label, distance, trigger, status}
+    next_trade: Optional[dict] = None
     checks: List[DecisionCheck] = field(default_factory=list)
     metrics: Dict[str, Any] = field(default_factory=dict)
     # Auto Mode scoring rows + the chosen strategy (empty for single strategies).
@@ -92,6 +100,8 @@ class DecisionExplanation:
             "strategy": self.strategy,
             "decision": self.decision,
             "reason": self.reason,
+            "state": self.state,
+            "next_trade": self.next_trade,
             "checks": [c.to_dict() for c in self.checks],
             "metrics": {k: _coerce(v) for k, v in self.metrics.items()},
             "candidates": list(self.candidates),
@@ -139,6 +149,53 @@ class ExplanationBuilder:
             self.exp.metrics[str(name)] = value
         except Exception as exc:  # noqa: BLE001
             logger.debug("explain.metric(%s) failed: %s", name, exc)
+        return self
+
+    def state(self, current_state: Optional[str]) -> "ExplanationBuilder":
+        """Set the strategy's machine-readable current lifecycle state."""
+        try:
+            self.exp.state = str(current_state) if current_state is not None else None
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("explain.state failed: %s", exc)
+        return self
+
+    def next_trade(
+        self,
+        *,
+        current: Any = None,
+        current_label: Optional[str] = None,
+        target: Any = None,
+        target_label: Optional[str] = None,
+        distance: Any = None,
+        trigger: Any = None,
+        status: Optional[str] = None,
+    ) -> "ExplanationBuilder":
+        """Record the structured 'what is required for the next trade' preview.
+
+        All fields are optional and coerced for display. Only the keys a strategy
+        provides are kept, so each strategy describes its own next-trade gate in
+        its own terms (price vs band, EMA fast vs slow, BB width vs threshold, ...)
+        without the renderer needing per-strategy knowledge.
+        """
+        try:
+            nt: Dict[str, Any] = {}
+            if current is not None:
+                nt["current"] = _coerce(current)
+            if current_label is not None:
+                nt["current_label"] = current_label
+            if target is not None:
+                nt["target"] = _coerce(target)
+            if target_label is not None:
+                nt["target_label"] = target_label
+            if distance is not None:
+                nt["distance"] = _coerce(distance)
+            if trigger is not None:
+                nt["trigger"] = _coerce(trigger)
+            if status is not None:
+                nt["status"] = status
+            self.exp.next_trade = nt
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("explain.next_trade failed: %s", exc)
         return self
 
     def update(self, values: Dict[str, Any]) -> "ExplanationBuilder":
@@ -197,6 +254,8 @@ class ExplanationBuilder:
                 "strategy": getattr(self.exp, "strategy", "unknown"),
                 "decision": "hold",
                 "reason": "",
+                "state": None,
+                "next_trade": None,
                 "checks": [],
                 "metrics": {},
                 "candidates": [],

@@ -86,6 +86,27 @@ class TestExplanationBuilder:
         assert d["metrics"]["noisy"] == round(1.0 / 3.0, 6)
         assert isinstance(d["checks"][0]["current"], str)
 
+    def test_state_and_next_trade(self):
+        b = ExplanationBuilder("mean_reversion")
+        b.state("WAITING_LOWER_BAND")
+        b.next_trade(
+            current=60514.0, current_label="Current price",
+            target=60076.0, target_label="Lower band", distance=438.0,
+            status="Needs another 438.00 points lower",
+        )
+        d = b.to_dict()
+        assert d["state"] == "WAITING_LOWER_BAND"
+        assert d["next_trade"]["current"] == 60514.0
+        assert d["next_trade"]["target"] == 60076.0
+        assert d["next_trade"]["distance"] == 438.0
+        assert "438" in d["next_trade"]["status"]
+
+    def test_state_and_next_trade_default_none(self):
+        b = ExplanationBuilder("x")
+        d = b.to_dict()
+        assert d["state"] is None
+        assert d["next_trade"] is None
+
     def test_candidates_and_select(self):
         b = ExplanationBuilder("auto_mode")
         b.candidate({"strategy": "trend_following", "final": 7.8})
@@ -206,3 +227,17 @@ class TestEngineExplanationIntegration:
         assert touch["passed"] is True
         assert signal.action == "buy"
         assert exp["decision"] == "buy"
+        # Machine-readable state + next-trade preview come from the strategy.
+        assert exp["state"] in {"ENTRY_ARMED", "WAITING_LOWER_BAND"}
+        assert exp["next_trade"]["target"] == 100.0  # the lower band
+        assert exp["next_trade"]["current_label"] == "Current price"
+
+    @pytest.mark.asyncio
+    async def test_trend_following_warmup_state(self):
+        """A warming-up trend bot reports WARMING_UP with the data-collected gate."""
+        engine = TradingEngine()
+        bot = _bot("trend_following", 7003, strategy_params={"long_period": 100})
+        session = AsyncMock()
+        await engine._execute_strategy(bot, 50000.0, session)
+        exp = diagnostics_store.get(7003).last_explanation
+        assert exp["state"] == "WARMING_UP"

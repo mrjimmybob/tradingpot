@@ -1024,7 +1024,7 @@ class TradingEngine:
                     f"Bot {bot.id}: DCA PAUSED by regime filter - "
                     f"Current regime: {trend_regime_name}, Allowed: {allowed_regimes}"
                 )
-                self._explain(bot.id).update({
+                self._explain(bot.id).state("WAITING_REGIME").update({
                     "current_price": current_price,
                     "regime": trend_regime_name,
                 }).check(
@@ -1082,6 +1082,16 @@ class TradingEngine:
             f">= {interval_seconds}s", _interval_ok,
             detail=(f"next buy in {_remaining / 60:.1f} min" if not _interval_ok else "buy due"),
         )
+        if _interval_ok:
+            _dca_exp.state("INTERVAL_DUE")
+        else:
+            _dca_exp.state("WAITING_INTERVAL").next_trade(
+                current=round(_secs_since, 1) if _secs_since is not None else 0,
+                current_label="Elapsed since last buy (s)",
+                target=interval_seconds, target_label="Interval (s)",
+                distance=round(_remaining, 1),
+                status=f"next buy in {_remaining / 60:.1f} min",
+            )
         # ---------------------------------------------------------------------
 
         if last_order:
@@ -1304,13 +1314,18 @@ class TradingEngine:
         # Check if bar is complete
         bar_duration = (now - current_bar["start_ts"]).total_seconds()
         if bar_duration < bar_interval_seconds:
-            self._explain(bot.id).update({
+            _rem = max(0.0, bar_interval_seconds - bar_duration)
+            self._explain(bot.id).state("WAITING_BAR_CLOSE").update({
                 "current_price": current_price,
                 "grid_center": state.get("center_price"),
                 "bar_progress_s": round(bar_duration, 1),
                 "bar_interval_s": bar_interval_seconds,
-                "bar_time_remaining_s": round(max(0.0, bar_interval_seconds - bar_duration), 1),
-            }).check(
+                "bar_time_remaining_s": round(_rem, 1),
+            }).next_trade(
+                current=round(bar_duration, 1), current_label="Bar elapsed (s)",
+                target=bar_interval_seconds, target_label="Bar interval (s)",
+                distance=round(_rem, 1), status=f"{_rem:.0f}s until bar closes",
+            ).check(
                 "Bar complete", f"{bar_duration:.0f}s", f">= {bar_interval_seconds}s", False,
                 detail="grid evaluates once per completed bar",
             )
@@ -1358,6 +1373,17 @@ class TradingEngine:
                     f"Bot {bot.id}: Grid in COOLDOWN after kill switch - "
                     f"{remaining_minutes:.1f} minutes remaining (prevents re-entry into bad conditions)"
                 )
+                self._explain(bot.id).state("COOLDOWN").update({
+                    "current_price": current_price,
+                    "cooldown_remaining_min": round(remaining_minutes, 1),
+                }).next_trade(
+                    current=round(remaining_minutes, 1), current_label="Cooldown remaining (min)",
+                    target=0, target_label="Ready", distance=round(remaining_minutes, 1),
+                    status=f"{remaining_minutes:.0f} min until grid resumes",
+                ).check(
+                    "Kill-switch cooldown", f"{remaining_minutes:.1f} min remaining",
+                    "elapsed", False, detail="paused after a kill switch",
+                )
                 return TradeSignal(
                     action="hold",
                     amount=0,
@@ -1392,6 +1418,13 @@ class TradingEngine:
                     f"Bot {bot.id}: Grid PAUSED (regime unsuitable) - "
                     f"Current: {regime_names}, Allowed: {allowed_regimes}. "
                     f"Grid operates in flat/normal markets only (range-bound conditions)."
+                )
+                self._explain(bot.id).state("WAITING_REGIME").update({
+                    "current_price": current_price,
+                    "regime": ", ".join(regime_names),
+                }).check(
+                    "Regime suitable", ", ".join(regime_names),
+                    f"in [{', '.join(allowed_regimes)}]", False,
                 )
                 return TradeSignal(
                     action="hold",
@@ -1668,6 +1701,24 @@ class TradingEngine:
             "yes" if nearest_level is not None else "no",
             "price crossed an unfilled level", nearest_level is not None,
         )
+        # Current state + next-trade preview (from values already computed above).
+        if not _unfilled_buys and not _unfilled_sells:
+            exp.state("GRID_COMPLETE")
+        else:
+            _cand = []
+            if nearest_buy_price is not None:
+                _cand.append(("WAITING_BUY_LEVEL", "Nearest BUY", nearest_buy_price, dist_buy, "BUY"))
+            if nearest_sell_price is not None:
+                _cand.append(("WAITING_SELL_LEVEL", "Nearest SELL", nearest_sell_price, dist_sell, "SELL"))
+            # Wait on whichever unfilled level the price is closest to crossing.
+            _cand.sort(key=lambda c: abs(c[3]))
+            _st, _lbl, _tgt, _d, _side = _cand[0]
+            exp.state(_st).next_trade(
+                current=bar_close_price, current_label="Current price",
+                target=_tgt, target_label=_lbl, distance=_d, trigger=grid_spacing,
+                status=(f"{abs(_d):.2f} away from {_side} level"
+                        if nearest_level is None else f"{_side} level reached — order armed"),
+            )
         # ---------------------------------------------------------------------
 
         if nearest_level is None:
@@ -1958,7 +2009,9 @@ class TradingEngine:
         # Need enough bars for calculations
         if len(state["bars"]) < period:
             self._mean_reversion_states[bot.id] = state
-            self._explain(bot.id).metric("current_price", current_price).check(
+            self._explain(bot.id).state("WARMING_UP").metric(
+                "current_price", current_price
+            ).check(
                 "Bars collected", len(state["bars"]), f">= {period}", False,
                 detail="warming up Bollinger window",
             )
@@ -2136,6 +2189,31 @@ class TradingEngine:
             exp.check(
                 "Lower band touch", last_bar_close, f"<= {lower_band:.2f}",
                 last_bar_close <= lower_band, detail=f"{dist_lower_pct:+.3f}% from band",
+            )
+        # Current state + next-trade preview (from values already computed above).
+        _dist_to_band = last_bar_close - lower_band
+        if has_position:
+            exp.state("WAITING_EXIT").next_trade(
+                current=last_bar_close, current_label="Bar close",
+                target=exit_target, target_label="Exit target",
+                distance=last_bar_close - exit_target,
+                status=(f"{exit_target - last_bar_close:.2f} below target"
+                        if last_bar_close < exit_target else "Target reached — exit armed"),
+            )
+        elif not regime_allows_entry:
+            exp.state("WAITING_REGIME")
+        elif cd_remaining > 0:
+            exp.state("COOLDOWN").next_trade(
+                current=cd_remaining, current_label="Cooldown remaining (s)",
+                target=0, target_label="Ready", distance=cd_remaining,
+                status=f"{cd_remaining}s until cooldown clears",
+            )
+        else:
+            exp.state("ENTRY_ARMED" if last_bar_close <= lower_band else "WAITING_LOWER_BAND").next_trade(
+                current=last_bar_close, current_label="Current price",
+                target=lower_band, target_label="Lower band", distance=_dist_to_band,
+                status=(f"Needs another {_dist_to_band:.2f} points lower"
+                        if _dist_to_band > 0 else "At/below band — entry armed"),
             )
         # ---------------------------------------------------------------------
 
@@ -2496,7 +2574,7 @@ class TradingEngine:
 
         # Need enough data for EMA calculation
         if len(price_history) < long_period:
-            self._explain(bot.id).metric("current_price", current_price).check(
+            self._explain(bot.id).state("WARMING_UP").metric("current_price", current_price).check(
                 "Data collected", len(price_history), f">= {long_period}", False,
                 detail="warming up EMA window",
             )
@@ -2620,6 +2698,27 @@ class TradingEngine:
             exp.check("Price above slow EMA", current_price, f"> {ema_long:.2f}", current_price > ema_long, detail=f"{price_vs_long_pct:+.3f}%")
             exp.check("EMA crossover (fast>slow)", ema_short, f"> {ema_long:.2f}", ema_short > ema_long, detail=f"sep {ema_sep:+.2f} ({ema_sep_pct:+.3f}%)")
             exp.check("Entry confirmation", _proj_conf, f">= {entry_confirmation_loops} loops", _proj_conf >= entry_confirmation_loops)
+            if tf_cd_remaining > 0:
+                exp.state("COOLDOWN").next_trade(
+                    current=tf_cd_remaining, current_label="Cooldown remaining (s)",
+                    target=0, target_label="Ready", distance=tf_cd_remaining,
+                    status=f"{tf_cd_remaining}s until cooldown clears",
+                )
+            elif _entry_cond:
+                _need = max(0, entry_confirmation_loops - _proj_conf)
+                exp.state("WAITING_CONFIRMATION").next_trade(
+                    current=_proj_conf, current_label="Confirmations",
+                    target=entry_confirmation_loops, target_label="Required",
+                    distance=_need, status=f"{_need} more confirmation loop(s)",
+                )
+            else:
+                exp.state("WAITING_CROSSOVER").next_trade(
+                    current=ema_short, current_label="EMA Fast",
+                    target=ema_long, target_label="EMA Slow", distance=ema_sep,
+                    trigger="cross above zero",
+                    status=(f"{abs(ema_sep):.2f} points away from crossover"
+                            if ema_sep <= 0 else "EMA crossed — needs price above slow EMA"),
+                )
         else:
             _ts = state.get("trailing_stop")
             if _ts is not None:
@@ -2629,6 +2728,13 @@ class TradingEngine:
             exp.check(
                 "Trend break (price < slow EMA)", current_price, f"< {ema_long:.2f}",
                 _exit_cond, detail=f"confirm {_proj_exit}/{exit_confirmation_loops}",
+            )
+            exp.state("LONG_OPEN").next_trade(
+                current=current_price, current_label="Current price",
+                target=(_ts if _ts is not None else ema_long),
+                target_label=("Trailing stop" if _ts is not None else "Slow EMA (exit)"),
+                distance=(current_price - _ts) if _ts is not None else (current_price - ema_long),
+                status=("holding — exits on trailing stop or confirmed trend break"),
             )
         # ---------------------------------------------------------------------
 
@@ -2983,6 +3089,12 @@ class TradingEngine:
                 logger.warning(f"Bot {bot.id}: {msg}")
                 if bot.id in self._bot_loggers:
                     self._bot_loggers[bot.id].log_activity(msg)
+            self._explain(bot.id).state("WAITING_FUNDING_RATE").metric(
+                "current_price", current_price
+            ).check(
+                "Funding data available", "none", "perpetual funding history", False,
+                detail="no perpetual market for this pair",
+            )
             return TradeSignal(
                 action="hold",
                 amount=0,
@@ -3027,13 +3139,43 @@ class TradingEngine:
             "cooldown_remaining_s": fc_cd_remaining,
             "has_position": has_position,
         })
+        _min_pct, _max_pct = min_funding * 100.0, max_funding * 100.0
         if not has_position:
             exp.check("Cooldown", f"{fc_cd_remaining} sec remaining", f">= {cooldown_seconds} sec elapsed", fc_cd_remaining == 0)
             exp.check("Funding in band", f"{funding_pct:.5f}%", _band, funding_favorable)
             exp.check("Regime favourable", trend_regime_name, f"in [{', '.join(allowed_regimes)}]", market_favorable)
+            if fc_cd_remaining > 0:
+                exp.state("COOLDOWN").next_trade(
+                    current=fc_cd_remaining, current_label="Cooldown remaining (s)",
+                    target=0, target_label="Ready", distance=fc_cd_remaining,
+                    status=f"{fc_cd_remaining}s until cooldown clears",
+                )
+            elif not funding_favorable:
+                if funding_pct < _min_pct:
+                    _edge, _gap, _dir = _min_pct, _min_pct - funding_pct, "rise"
+                else:
+                    _edge, _gap, _dir = _max_pct, funding_pct - _max_pct, "fall"
+                exp.state("WAITING_FUNDING_RATE").next_trade(
+                    current=funding_pct, current_label="Funding rate (%)",
+                    target=_edge, target_label="Band edge (%)", distance=_gap,
+                    status=f"needs to {_dir} {_gap:.5f}% into band",
+                )
+            elif not market_favorable:
+                exp.state("WAITING_REGIME").next_trade(
+                    current=trend_regime_name, current_label="Regime",
+                    target=", ".join(allowed_regimes), target_label="Allowed",
+                    status=f"waiting for regime in [{', '.join(allowed_regimes)}]",
+                )
+            else:
+                exp.state("ENTRY_ARMED")
         else:
             exp.check("Funding still in band", f"{funding_pct:.5f}%", _band, funding_favorable, detail="exit when funding leaves band")
             exp.check("Regime still favourable", trend_regime_name, f"in [{', '.join(allowed_regimes)}]", market_favorable, detail="exit when regime turns")
+            exp.state("LONG_OPEN").next_trade(
+                current=funding_pct, current_label="Funding rate (%)",
+                target=f"[{_min_pct:.5f}%, {_max_pct:.5f}%]", target_label="Favourable band",
+                status="holding — exits when funding or regime leaves favourable",
+            )
         # ---------------------------------------------------------------------
 
         if not has_position:
@@ -3247,7 +3389,9 @@ class TradingEngine:
         # Need enough bars for calculations
         if len(state["bars"]) < bb_period:
             self._volatility_breakout_states[bot.id] = state
-            self._explain(bot.id).metric("current_price", current_price).check(
+            self._explain(bot.id).state("WARMING_UP").metric(
+                "current_price", current_price
+            ).check(
                 "Bars collected", len(state["bars"]), f">= {bb_period}", False,
                 detail="warming up Bollinger window",
             )
@@ -3388,6 +3532,13 @@ class TradingEngine:
                 f"< {upper_band:.2f} within {failed_breakout_bars} bars",
                 (_bse <= failed_breakout_bars and last_bar_close < upper_band),
                 detail=f"bar {_bse}/{failed_breakout_bars}",
+            )
+            _exp.state("LONG_OPEN").next_trade(
+                current=current_price, current_label="Current price",
+                target=(_ts if _ts is not None else upper_band),
+                target_label=("Trailing stop" if _ts is not None else "BB upper"),
+                distance=(current_price - _ts) if _ts is not None else (current_price - upper_band),
+                status="holding — exits on trailing stop or failed breakout",
             )
             # -----------------------------------------------------------------
             for pos in positions:
@@ -3613,6 +3764,23 @@ class TradingEngine:
             "Breakout above upper band", last_bar_close, f"> {upper_band:.2f}",
             last_bar_close > upper_band, detail=f"{upper_gap_pct:+.3f}% vs band",
         )
+        # Current state + next-trade preview (from values already computed above).
+        if not compression_satisfied:
+            _need_bars = max(0, min_compression_bars - state.get("compression_bars", 0))
+            exp.state("WAITING_COMPRESSION").next_trade(
+                current=state.get("compression_bars", 0), current_label="Compression bars",
+                target=min_compression_bars, target_label="Required bars",
+                distance=_need_bars,
+                status=(f"{_need_bars} more compressed bar(s)" if _need_bars > 0
+                        else "armed — awaiting breakout"),
+            )
+        else:
+            exp.state("WAITING_BREAKOUT").next_trade(
+                current=last_bar_close, current_label="Bar close",
+                target=upper_band, target_label="BB upper (breakout)", distance=upper_gap,
+                status=(f"needs +{abs(upper_gap):.2f} to break out" if upper_gap < 0
+                        else "breakout level reached"),
+            )
         # ---------------------------------------------------------------------
 
         # Cooldown only gates an ACTUAL breakout entry (sparse trading) - it no
@@ -4085,6 +4253,10 @@ class TradingEngine:
             "Strategy selected", current_strategy,
             "highest final score among eligible", True, detail=switch_reason,
         )
+        # On force-exit there is no sub-strategy delegation below to set a state,
+        # so stamp it here. Otherwise the selected sub-strategy sets its own state.
+        if force_exit_signal:
+            exp.state("FORCE_EXIT")
         # ---------------------------------------------------------------------
 
         # === FORCE EXIT EXECUTION ===
