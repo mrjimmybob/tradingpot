@@ -6567,9 +6567,16 @@ class TradingEngine:
             return strategies[0]
 
     async def resume_bots_on_startup(self) -> int:
-        """Resume all bots that were running when server stopped.
+        """Resume all bots that were active when the server stopped.
 
-        This queries for bots with RUNNING status and restarts their execution loops.
+        This restarts the execution loop for every bot whose persisted status is
+        an ACTIVE one — RUNNING *and* RECOVERY_MODE. RECOVERY_MODE is a live,
+        paper-trading state (the bot must keep evaluating the market every tick),
+        NOT an idle one: if it were excluded here, a recovery bot would have no
+        loop task after a restart and would freeze forever — 0 evaluations, 0
+        paper trades — which is exactly the defect this guards against. The
+        recovery state itself is restored from ``bot.strategy_state`` on the
+        loop's first iteration (see ``_run_bot_loop``).
 
         Returns:
             Number of bots resumed
@@ -6581,7 +6588,9 @@ class TradingEngine:
         # not poison the session used for the others.
         async with async_session_maker() as session:
             result = await session.execute(
-                select(Bot.id).where(Bot.status == BotStatus.RUNNING)
+                select(Bot.id).where(
+                    Bot.status.in_([BotStatus.RUNNING, BotStatus.RECOVERY_MODE])
+                )
             )
             bot_ids = [row[0] for row in result.all()]
 

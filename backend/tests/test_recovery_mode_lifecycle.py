@@ -496,3 +496,119 @@ class TestRecoveryExitCriteriaEdgeCases:
         state = self._state([-5, 3], consecutive_wins=1)
         should_exit, _ = engine._check_recovery_exit(state)
         assert not should_exit
+
+
+# ============================================================================
+# 8. Loop-level: a RECOVERY_MODE bot keeps evaluating the market every cycle
+# ============================================================================
+
+
+class _LoopCtx:
+    """Async context manager yielding a fixed session (does not close it)."""
+
+    def __init__(self, session):
+        self._session = session
+
+    async def __aenter__(self):
+        return self._session
+
+    async def __aexit__(self, *args):
+        return False
+
+
+class TestRecoveryLoopKeepsEvaluating:
+    """Drive the REAL ``_run_bot_loop`` for a RECOVERY_MODE bot.
+
+    Defends the core defect end-to-end at the loop level: once a recovery bot
+    has a running task, it must call ``_execute_strategy`` and increment the
+    evaluation heartbeat on EVERY cycle — never silently stop. (The companion
+    guard that the task is even *created* after a restart lives in
+    ``test_startup_resume.py::test_resume_starts_persisted_recovery_mode_bot``.)
+    """
+
+    @pytest.mark.asyncio
+    async def test_loop_executes_strategy_and_counts_every_cycle(self, test_db):
+        import asyncio as _asyncio
+
+        from app.services.diagnostics import DiagnosticsStore
+
+        bot = Bot(
+            name="recovery-loop",
+            trading_pair="BTC/USDT",
+            strategy="dca_accumulator",
+            strategy_params={},
+            strategy_state={
+                "recovery_mode": {
+                    "active": True,
+                    "entered_at": "2026-06-24T10:00:00",
+                    "trigger_reason": "3 consecutive losses",
+                    "paper_position": None,
+                    "paper_trades": [],
+                    "consecutive_paper_wins": 0,
+                }
+            },
+            budget=1000.0,
+            current_balance=1000.0,
+            is_dry_run=True,
+            status=BotStatus.RECOVERY_MODE,
+        )
+        test_db.add(bot)
+        await test_db.flush()
+        bot_id = bot.id
+
+        engine = TradingEngine()
+        engine._stop_flags[bot_id] = False
+
+        # Live ticker every tick.
+        ticker = Mock(last=50000.0)
+        fake_exchange = AsyncMock()
+        fake_exchange.get_ticker = AsyncMock(return_value=ticker)
+        engine._exchange_services[bot_id] = fake_exchange
+
+        # Count strategy executions; stop the loop after the 3rd evaluation.
+        calls = {"n": 0}
+
+        async def fake_execute_strategy(_bot, _price, _session):
+            calls["n"] += 1
+            if calls["n"] >= 3:
+                engine._stop_flags[bot_id] = True
+            return _signal("hold")
+
+        engine._execute_strategy = fake_execute_strategy
+
+        # CONTINUE: bot is already recovering; no entry/exit transition this tick.
+        cont = RiskAssessment(action=RiskAction.CONTINUE, reason="ok", details={})
+
+        diag = DiagnosticsStore()
+        ds = DecisionStatusStore()
+
+        async def _noop(*a, **k):
+            return None
+
+        with (
+            patch(
+                "app.services.trading_engine.async_session_maker",
+                return_value=_LoopCtx(test_db),
+            ),
+            patch("app.services.trading_engine.diagnostics_store", diag),
+            patch("app.services.trading_engine.decision_status_store", ds),
+            patch.object(
+                RiskManagementService, "full_risk_check",
+                AsyncMock(return_value=cont),
+            ),
+            patch.object(TradingEngine, "_check_positions_stop_loss", new=_noop),
+            patch.object(TradingEngine, "_take_pnl_snapshot", new=_noop),
+            patch.object(TradingEngine, "_resolve_pending_orders", new=_noop),
+            patch.object(TradingEngine, "_save_bot_state", new=_noop),
+            patch.object(TradingEngine, "_reconcile_live_account", new=_noop),
+            patch("app.services.trading_engine.asyncio.sleep", new=AsyncMock()),
+        ):
+            await _asyncio.wait_for(engine._run_bot_loop(bot_id), timeout=5.0)
+
+        # The strategy pipeline ran on every cycle...
+        assert calls["n"] == 3
+        # ...and each HOLD evaluation incremented the heartbeat the UI reads.
+        assert diag.get(bot_id).total_evaluations == 3
+        # Recovery state was restored from strategy_state on the first tick.
+        assert bot_id in engine._recovery_states
+        assert engine._recovery_states[bot_id]["active"] is True

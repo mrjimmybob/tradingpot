@@ -119,6 +119,89 @@ async def test_resume_starts_persisted_running_bot(test_db):
 
 
 @pytest.mark.asyncio
+async def test_resume_starts_persisted_recovery_mode_bot(test_db):
+    """End-to-end: a persisted RECOVERY_MODE bot is resumed on startup.
+
+    Regression guard for the defect where Recovery bots froze for days with 0
+    paper trades: ``resume_bots_on_startup`` queried only ``BotStatus.RUNNING``,
+    so after any server restart a RECOVERY_MODE bot got NO loop task and stopped
+    evaluating the market entirely. RECOVERY_MODE is an *active* state and must
+    be resumed exactly like RUNNING. If the query ever drops RECOVERY_MODE
+    again, ``resumed`` is 0 and the bot is absent from ``_running_bots`` — this
+    test fails.
+    """
+    from app.services import trading_engine  # the singleton, as main.py imports it
+
+    bot = Bot(
+        name="recover-me",
+        trading_pair="BTC/USDT",
+        strategy="funding_carry",
+        strategy_params={},
+        # Recovery state persisted exactly as _enter_recovery_mode writes it;
+        # the loop restores it on the first iteration after resume.
+        strategy_state={
+            "recovery_mode": {
+                "active": True,
+                "entered_at": "2026-06-24T22:24:11",
+                "trigger_reason": "3 consecutive losses",
+                "paper_position": None,
+                "paper_trades": [],
+                "consecutive_paper_wins": 0,
+            }
+        },
+        budget=1000.0,
+        current_balance=1000.0,
+        is_dry_run=True,
+        status=BotStatus.RECOVERY_MODE,
+    )
+    test_db.add(bot)
+    await test_db.flush()
+    bot_id = bot.id
+
+    fake_exchange = AsyncMock()
+    fake_exchange.connect = AsyncMock(return_value=True)
+    fake_exchange.disconnect = AsyncMock(return_value=None)
+
+    async def _noop_loop(_self, _bot_id):  # patched onto the class -> bound, gets self
+        return None
+
+    try:
+        with patch(
+            "app.services.trading_engine.async_session_maker",
+            return_value=_Ctx(test_db),
+        ), patch.object(
+            TradingEngine, "_make_simulated_exchange", return_value=fake_exchange
+        ), patch.object(
+            TradingEngine, "_recover_bot_orders", new=AsyncMock()
+        ), patch.object(
+            TradingEngine, "_run_bot_loop", new=_noop_loop
+        ), patch(
+            "app.services.trading_engine.BotLoggingService"
+        ), patch(
+            "app.services.trading_engine.ensure_bot_log_directory"
+        ):
+            resumed = await trading_engine.resume_bots_on_startup()
+
+        assert resumed == 1, "RECOVERY_MODE bot must be resumed on startup"
+        assert bot_id in trading_engine._running_bots, (
+            "a loop task must be created for the recovery bot — without it the "
+            "bot never evaluates the market again"
+        )
+        # Resume must not change the status: still recovering, still paper-trading.
+        refreshed = await test_db.get(Bot, bot_id)
+        assert refreshed.status == BotStatus.RECOVERY_MODE
+    finally:
+        task = trading_engine._running_bots.pop(bot_id, None)
+        if task is not None:
+            task.cancel()
+        trading_engine._exchange_services.pop(bot_id, None)
+        trading_engine._stop_flags.pop(bot_id, None)
+        trading_engine._bot_loggers.pop(bot_id, None)
+        trading_engine._recovery_states.pop(bot_id, None)
+        trading_engine.cleanup_bot_state(bot_id)
+
+
+@pytest.mark.asyncio
 async def test_resume_returns_zero_when_no_running_bots(test_db):
     """No persisted RUNNING bots -> resume is a no-op returning 0."""
     from app.services import trading_engine
