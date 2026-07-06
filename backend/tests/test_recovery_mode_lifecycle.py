@@ -611,4 +611,268 @@ class TestRecoveryLoopKeepsEvaluating:
         assert diag.get(bot_id).total_evaluations == 3
         # Recovery state was restored from strategy_state on the first tick.
         assert bot_id in engine._recovery_states
-        assert engine._recovery_states[bot_id]["active"] is True
+
+
+# ============================================================================
+# 9. Regression: recovery_mode must survive a normal strategy-state checkpoint
+#
+# Defect: bot.strategy_state["recovery_mode"] was written correctly by
+# _enter_recovery_mode / _process_paper_trade, but _save_bot_state (the H-1
+# periodic checkpoint that runs every tick, and graceful_shutdown) persisted
+# `bot.strategy_state = self._collect_bot_state(bot_id)` — a WHOLESALE
+# replacement built only from _PERSISTED_STATE_ATTRS, which never included
+# recovery data. The very next checkpoint after entering RECOVERY_MODE erased
+# recovery_mode from the DB entirely, so paper trades, entered_at and the
+# recovery counters all read back NULL even though the bot kept evaluating
+# and status stayed RECOVERY_MODE.
+# ============================================================================
+
+
+class TestRecoveryModeSurvivesNormalCheckpoint:
+    """Required test (A): enter RECOVERY_MODE, persist, run a normal strategy
+    save, assert strategy_state.recovery_mode still exists."""
+
+    @pytest.mark.asyncio
+    async def test_recovery_mode_survives_a_normal_strategy_state_checkpoint(self, test_db):
+        bot = Bot(
+            name="checkpoint-bot",
+            trading_pair="BTC/USDT",
+            strategy="dca_accumulator",
+            strategy_params={},
+            budget=1000.0,
+            current_balance=1000.0,
+            is_dry_run=True,
+            status=BotStatus.RUNNING,
+        )
+        test_db.add(bot)
+        await test_db.flush()
+        bot_id = bot.id
+
+        engine = TradingEngine()
+        try:
+            # Enter recovery: writes to both the in-memory dict (fast path) and
+            # bot.strategy_state (durable path).
+            await engine._enter_recovery_mode(
+                bot, bot_id, "3 consecutive losses", test_db
+            )
+            await test_db.commit()
+
+            refreshed = await test_db.get(Bot, bot_id)
+            assert refreshed.strategy_state["recovery_mode"]["active"] is True
+
+            # Unrelated strategy runtime state a normal tick would also
+            # checkpoint (trailing stop, cooldowns, ...).
+            engine._trend_states = {bot_id: {"trailing_stop": 95.0}}
+
+            # This is exactly what the H-1 periodic checkpoint (and
+            # graceful_shutdown) calls on every tick for a RUNNING/RECOVERY_MODE
+            # bot — it must not clobber recovery_mode.
+            await engine._save_bot_state(bot_id, test_db)
+            await test_db.commit()
+
+            refreshed = await test_db.get(Bot, bot_id)
+            rm = refreshed.strategy_state.get("recovery_mode")
+            assert rm is not None, (
+                "recovery_mode was erased by a normal strategy-state checkpoint"
+            )
+            assert rm["active"] is True
+            assert rm["trigger_reason"] == "3 consecutive losses"
+            # Unrelated runtime state was still persisted normally alongside it.
+            assert refreshed.strategy_state["_trend_states"]["trailing_stop"] == 95.0
+        finally:
+            engine._recovery_states.pop(bot_id, None)
+            engine.cleanup_bot_state(bot_id)
+
+
+class TestRecoveryCountersSurviveRestart:
+    """Required test (B): a RECOVERY_MODE bot loaded from DB after a restart
+    has its recovery state (paper trades, consecutive wins) restored by
+    resume_bots_on_startup, and a post-restore checkpoint does not reset those
+    counters back to empty."""
+
+    @pytest.mark.asyncio
+    async def test_resume_restores_and_preserves_recovery_counters(self, test_db):
+        import asyncio
+
+        prior_trade = {
+            "gain_loss_usd": 4.2,
+            "win": True,
+            "entry_price": 100.0,
+            "exit_price": 104.2,
+            "timestamp": "2026-06-24T10:05:00",
+        }
+        bot = Bot(
+            name="restart-recovery-bot",
+            trading_pair="BTC/USDT",
+            strategy="funding_carry",
+            strategy_params={},
+            strategy_state={
+                "recovery_mode": {
+                    "active": True,
+                    "entered_at": "2026-06-24T10:00:00",
+                    "trigger_reason": "3 consecutive losses",
+                    "paper_position": None,
+                    "paper_trades": [prior_trade],
+                    "consecutive_paper_wins": 1,
+                }
+            },
+            budget=1000.0,
+            current_balance=1000.0,
+            is_dry_run=True,
+            status=BotStatus.RECOVERY_MODE,
+        )
+        test_db.add(bot)
+        await test_db.flush()
+        bot_id = bot.id
+
+        engine = TradingEngine()
+
+        fake_exchange = AsyncMock()
+        fake_exchange.connect = AsyncMock(return_value=True)
+        fake_exchange.disconnect = AsyncMock(return_value=None)
+        fake_exchange.get_ticker = AsyncMock(return_value=Mock(last=50000.0))
+        # export_state must return a JSON-serializable dict like the real
+        # SimulatedExchangeService — a bare AsyncMock return value would make
+        # the checkpoint's _to_jsonable(...) raise, and that exception is
+        # swallowed by _run_bot_loop's outer handler, silently skipping the
+        # very checkpoint this test exists to exercise.
+        fake_exchange.export_state = Mock(return_value={"balances": {}, "order_counter": 0})
+
+        calls = {"n": 0}
+
+        async def fake_execute_strategy(_bot, _price, _session):
+            calls["n"] += 1
+            # Stop after one full tick: enough to exercise restore + checkpoint.
+            engine._stop_flags[bot_id] = True
+            return _signal("hold")
+
+        cont = RiskAssessment(action=RiskAction.CONTINUE, reason="ok", details={})
+
+        async def _noop(*a, **k):
+            return None
+
+        class _Ctx:
+            def __init__(self, session):
+                self._session = session
+
+            async def __aenter__(self):
+                return self._session
+
+            async def __aexit__(self, *args):
+                return False
+
+        try:
+            with (
+                patch(
+                    "app.services.trading_engine.async_session_maker",
+                    return_value=_Ctx(test_db),
+                ),
+                patch.object(
+                    TradingEngine, "_make_simulated_exchange",
+                    return_value=fake_exchange,
+                ),
+                patch.object(TradingEngine, "_recover_bot_orders", new=AsyncMock()),
+                patch("app.services.trading_engine.BotLoggingService"),
+                patch("app.services.trading_engine.ensure_bot_log_directory"),
+                patch.object(
+                    RiskManagementService, "full_risk_check",
+                    AsyncMock(return_value=cont),
+                ),
+                patch.object(TradingEngine, "_check_positions_stop_loss", new=_noop),
+                patch.object(TradingEngine, "_take_pnl_snapshot", new=_noop),
+                patch.object(TradingEngine, "_resolve_pending_orders", new=_noop),
+                patch.object(TradingEngine, "_reconcile_live_account", new=_noop),
+                patch("app.services.trading_engine.asyncio.sleep", new=AsyncMock()),
+            ):
+                # Instance attribute (not patch.object on the class): a plain
+                # function stored on the instance is called as-is, with no
+                # descriptor binding self as an extra argument.
+                engine._execute_strategy = fake_execute_strategy
+
+                resumed = await engine.resume_bots_on_startup()
+                assert resumed == 1, "RECOVERY_MODE bot must be resumed on startup"
+
+                task = engine._running_bots[bot_id]
+                await asyncio.wait_for(task, timeout=5.0)
+
+            # Restore populated the in-memory fast path from the persisted JSON.
+            assert bot_id in engine._recovery_states
+            restored = engine._recovery_states[bot_id]
+            assert restored["consecutive_paper_wins"] == 1
+            assert len(restored["paper_trades"]) == 1
+
+            # The checkpoint that fires on this first tick (_save_bot_state) must
+            # not reset the counters it just restored back to empty/zero.
+            refreshed = await test_db.get(Bot, bot_id)
+            rm = refreshed.strategy_state.get("recovery_mode")
+            assert rm is not None, (
+                "post-restore checkpoint erased recovery_mode from the DB"
+            )
+            assert rm["consecutive_paper_wins"] == 1, (
+                "recovery counters were reset instead of continuing from the "
+                "persisted value"
+            )
+            assert len(rm["paper_trades"]) == 1
+        finally:
+            task = engine._running_bots.pop(bot_id, None)
+            if task is not None:
+                task.cancel()
+            engine._exchange_services.pop(bot_id, None)
+            engine._stop_flags.pop(bot_id, None)
+            engine._bot_loggers.pop(bot_id, None)
+            engine._recovery_states.pop(bot_id, None)
+            engine.cleanup_bot_state(bot_id)
+
+
+class TestNoStrategyStateAssignmentErasesRecoveryMode:
+    """Required test (C): no assignment to strategy_state can erase
+    recovery_mode — including the edge case where a checkpoint runs before
+    this process has restored self._recovery_states into memory (e.g. a save
+    sandwiched between resume_bots_on_startup and the loop's first tick)."""
+
+    @pytest.mark.asyncio
+    async def test_save_bot_state_preserves_recovery_mode_absent_from_memory(
+        self, test_db
+    ):
+        persisted_rm = {
+            "active": True,
+            "entered_at": "2026-06-24T10:00:00",
+            "trigger_reason": "3 consecutive losses",
+            "paper_position": None,
+            "paper_trades": [],
+            "consecutive_paper_wins": 0,
+        }
+        bot = Bot(
+            name="edge-case-bot",
+            trading_pair="BTC/USDT",
+            strategy="dca_accumulator",
+            strategy_params={},
+            strategy_state={"recovery_mode": persisted_rm},
+            budget=1000.0,
+            current_balance=1000.0,
+            is_dry_run=True,
+            status=BotStatus.RECOVERY_MODE,
+        )
+        test_db.add(bot)
+        await test_db.flush()
+        bot_id = bot.id
+
+        # Fresh engine: self._recovery_states has NO entry for this bot, exactly
+        # as it would be immediately after a restart before the loop's first
+        # tick has run its restore step.
+        engine = TradingEngine()
+        assert bot_id not in engine._recovery_states
+
+        # Also give it unrelated runtime state to persist, to prove the merge
+        # doesn't just skip the whole save.
+        engine._twap_states = {bot_id: {"slices_remaining": 3}}
+
+        await engine._save_bot_state(bot_id, test_db)
+        await test_db.commit()
+
+        refreshed = await test_db.get(Bot, bot_id)
+        assert refreshed.strategy_state.get("recovery_mode") == persisted_rm, (
+            "a strategy-state save with no in-memory recovery state must fall "
+            "back to preserving whatever was already persisted, not erase it"
+        )
+        assert refreshed.strategy_state["_twap_states"]["slices_remaining"] == 3

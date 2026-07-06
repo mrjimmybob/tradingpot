@@ -7296,6 +7296,16 @@ class TradingEngine:
         if exchange is not None and hasattr(exchange, "export_state"):
             state["_sim_state"] = exchange.export_state()
 
+        # Recovery state lives in its own in-memory dict (self._recovery_states),
+        # not in _PERSISTED_STATE_ATTRS, because it is written eagerly by
+        # _enter_recovery_mode/_process_paper_trade on every transition rather
+        # than collected here. It must still ride along in this snapshot: this
+        # dict wholesale-replaces Bot.strategy_state (see _save_bot_state), so
+        # omitting it would erase recovery_mode on the very next checkpoint.
+        recovery = self._recovery_states.get(bot_id)
+        if recovery is not None:
+            state["recovery_mode"] = recovery
+
         return _to_jsonable(state)
 
     def _restore_bot_state(self, bot_id: int, strategy_state: dict) -> None:
@@ -7407,7 +7417,19 @@ class TradingEngine:
 
         # Persist ALL strategy runtime state (trailing stops, locked entry ATR,
         # cooldowns, price history) into the dedicated strategy_state column.
-        bot.strategy_state = self._collect_bot_state(bot_id)
+        new_state = self._collect_bot_state(bot_id)
+
+        # _collect_bot_state already carries recovery_mode when this process has
+        # a live in-memory copy (self._recovery_states). In the narrow window
+        # right after a restart — bot resumed into RECOVERY_MODE but the loop's
+        # first-tick restore (see _run_bot_loop) hasn't repopulated
+        # self._recovery_states yet — fall back to whatever is already
+        # persisted so this checkpoint cannot erase it.
+        existing = bot.strategy_state or {}
+        if "recovery_mode" not in new_state and "recovery_mode" in existing:
+            new_state["recovery_mode"] = existing["recovery_mode"]
+
+        bot.strategy_state = new_state
 
         # M5: strategy_params is user config only. Strip any runtime state that
         # older builds may have embedded there so it cannot pollute config or
