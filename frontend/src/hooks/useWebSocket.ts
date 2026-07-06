@@ -92,7 +92,9 @@ interface UseWebSocketReturn {
   reconnect: () => void
 }
 
-const DEFAULT_WS_URL = `ws://${window.location.hostname}:8000/api/ws`
+// const DEFAULT_WS_URL = `ws://${window.location.hostname}:8000/api/ws`
+const protocol = window.location.protocol === "https:" ? "wss" : "ws";
+const DEFAULT_WS_URL = `${protocol}://${window.location.host}/api/ws`;
 
 export function useWebSocket(options: UseWebSocketOptions = {}): UseWebSocketReturn {
   const {
