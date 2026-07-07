@@ -63,6 +63,13 @@ MIN_ORDER_USD = 10.0
 # 0.998 comfortably covers 0.1 % fee + up to ~0.1 % spread.
 _BUY_BALANCE_FRACTION = 0.998
 
+# Minimum safety buffer (fraction of notional) added on top of round-trip fees
+# when the central trade viability gate evaluates a BUY signal.  Ensures the
+# trade must beat the fee hurdle by a small margin rather than just break even
+# at the theoretical minimum.  0.05 % is intentionally conservative — the gate
+# is a catastrophe filter, not a profitability predictor.
+_VIABILITY_SAFETY_MARGIN_PCT = 0.0005
+
 
 # Repeated-rejection circuit breaker. When the SAME executable trade is rejected
 # or fails for the SAME reason this many consecutive times, the bot is paused and
@@ -186,6 +193,14 @@ class TradeSignal:
     # detail "Decision Status" panel when a strategy chooses to populate them.
     score: Optional[float] = None
     threshold: Optional[float] = None
+
+    # Expected price move as a fraction of current price (e.g. 0.005 = 0.5%).
+    # Set by strategies that can estimate the distance to their profit target.
+    # The central viability gate in _execute_trade uses this to verify that
+    # expected_move > round_trip_fees + safety_margin before executing a BUY.
+    # None means the strategy provides no estimate and the gate is skipped
+    # (backward-compatible with strategies that have no profit-target model).
+    expected_move_pct: Optional[float] = None
 
 
 def validate_funding_carry_params(params: dict) -> list:
@@ -2463,6 +2478,38 @@ class TradingEngine:
 
         # Entry condition: bar close <= lower Bollinger Band
         if last_bar_close <= lower_band:
+            # Expected profit: from current execution price to the SMA (MR's
+            # profit target). Using current_price (not last_bar_close) reflects
+            # the actual cost basis at which the order would fill.
+            expected_move_pct = max(
+                0.0,
+                (sma - current_price) / current_price if current_price > 0 else 0.0,
+            )
+
+            # Pre-flight viability: verify the band is wide enough to cover
+            # round-trip fees BEFORE we mutate state.  MR writes entry_price and
+            # hard_stop before returning the BUY signal; if the central viability
+            # gate in _execute_trade later rejects the order (fees exceed the
+            # expected move), MR's in-memory state would record an entry that has
+            # no matching DB position, causing re-entry attempts every loop.
+            # isinstance guard: tests where bot.exchange_fee is a Mock use 0.1 %
+            # default rather than propagating a non-numeric value into the check.
+            _fee_raw = getattr(bot, 'exchange_fee', 0.1)
+            _mr_fee_pct = (
+                (float(_fee_raw) if isinstance(_fee_raw, (int, float)) else 0.1) or 0.1
+            ) / 100.0
+            _mr_min_move = 2.0 * _mr_fee_pct + _VIABILITY_SAFETY_MARGIN_PCT
+            if expected_move_pct < _mr_min_move:
+                self._mean_reversion_states[bot.id] = state
+                return TradeSignal(
+                    action="hold",
+                    amount=0,
+                    reason=(
+                        f"Mean Reversion: Band too narrow for fees "
+                        f"({expected_move_pct * 100:.3f}% < {_mr_min_move * 100:.3f}%)"
+                    ),
+                )
+
             # Fixed percentage position sizing, capped at _BUY_BALANCE_FRACTION
             # of balance so the simulated exchange fee cannot push cost + fee
             # over available funds, then floored to the executable minimum.
@@ -2503,6 +2550,7 @@ class TradingEngine:
                 amount=buy_amount,
                 order_type="market",
                 reason=f"Mean Reversion: Entry at lower band (${lower_band:.2f})",
+                expected_move_pct=expected_move_pct,
             )
 
         # Update state and hold
@@ -2711,45 +2759,16 @@ class TradingEngine:
 
             return ema
 
-        # Calculate ATR proxy (Average True Range approximation)
-        def calculate_atr_proxy(prices: list, period: int) -> float:
-            """Calculate ATR proxy from price-only data.
-
-            Since only prices are available (no OHLC), we approximate True Range
-            as the absolute difference between consecutive prices.
-            This is NOT a true ATR but serves as a reasonable volatility proxy
-            for tick-based data.
-
-            Returns 0 if insufficient data.
-            """
-            if len(prices) < period + 1:
-                return 0.0
-
-            # Calculate true range approximations: |current_price - previous_price|
-            true_ranges = []
-            for i in range(1, len(prices)):
-                tr = abs(prices[i] - prices[i-1])
-                true_ranges.append(tr)
-
-            # Return rolling average over last 'period' true ranges
-            if len(true_ranges) < period:
-                return 0.0
-
-            recent_trs = true_ranges[-period:]
-            return sum(recent_trs) / len(recent_trs)
-
         # Calculate indicators
         ema_short = calculate_ema(price_history, short_period)
         ema_long = calculate_ema(price_history, long_period)
-        atr = calculate_atr_proxy(price_history, atr_period)
 
         # Get current positions
         positions = await self._get_bot_positions(bot.id, session)
         has_position = len(positions) > 0
 
-        # Get or initialize trend-following state
-        # State tracks: trailing stop, entry ATR (locked at entry to prevent risk expansion),
-        # entry/exit confirmation counters (noise defense), and cooldown timer (anti-churn)
+        # Get or initialize trend-following state.
+        # tf_bars / tf_current_bar accumulate 60-second OHLC bars for bar ATR.
         if not hasattr(self, "_trend_states"):
             self._trend_states = {}
 
@@ -2761,7 +2780,54 @@ class TradingEngine:
             "last_exit_time": None,
             "entry_confirmation_count": 0,  # Consecutive loops with entry conditions met
             "exit_confirmation_count": 0,   # Consecutive loops with exit conditions met
+            "tf_bars": [],        # Completed 60-second OHLC bars for bar ATR
+            "tf_current_bar": None,  # In-progress bar being accumulated
         })
+
+        # === BAR ATR ACCUMULATION ===
+        # Replace tick-level ATR with bar-based ATR.  The original code computed
+        # |price[i] − price[i-1]| at 1 Hz → ATR ≈ $1-3 on BTC, placing stops
+        # well inside the fee hurdle (guaranteed loss on every trade).
+        # 60-second bar H-L ranges (~$50-200 on BTC) reflect actual volatility.
+        bar_interval_seconds = params.get("bar_interval_seconds", 60)
+        _now = datetime.utcnow()
+        if state.get("tf_current_bar") is None:
+            state["tf_current_bar"] = {
+                "high": current_price, "low": current_price,
+                "close": current_price, "start_ts": _now,
+            }
+        _cb = state["tf_current_bar"]
+        _cb["high"] = max(_cb["high"], current_price)
+        _cb["low"] = min(_cb["low"], current_price)
+        _cb["close"] = current_price
+        if (_now - _cb["start_ts"]).total_seconds() >= bar_interval_seconds:
+            state["tf_bars"].append(dict(_cb))
+            state["tf_bars"] = state["tf_bars"][-100:]
+            state["tf_current_bar"] = {
+                "high": current_price, "low": current_price,
+                "close": current_price, "start_ts": _now,
+            }
+        self._trend_states[bot.id] = state
+
+        def _calc_bar_atr(bars: list, period: int) -> float:
+            if len(bars) < period:
+                return 0.0
+            return sum(b["high"] - b["low"] for b in bars[-period:]) / period
+
+        tf_bars = state.get("tf_bars", [])
+        bar_atr = _calc_bar_atr(tf_bars, atr_period)
+
+        # Fee-coverage floor: when bar ATR is zero (not enough bars collected yet),
+        # use a stop distance that at minimum covers the round-trip fee + safety.
+        # This prevents microscopic stops during the bar warmup window AND fixes
+        # the original tick-ATR bug (1-second tick diffs ~$1-3 on BTC, well inside
+        # the fee hurdle).  Once bars are ready, the larger bar ATR takes over.
+        _fee_raw_tf = getattr(bot, 'exchange_fee', 0.1)
+        _fee_pct_tf = (
+            (float(_fee_raw_tf) if isinstance(_fee_raw_tf, (int, float)) else 0.1) or 0.1
+        ) / 100.0
+        _min_stop_pct = 2.0 * _fee_pct_tf + _VIABILITY_SAFETY_MARGIN_PCT
+        atr = max(bar_atr, current_price * _min_stop_pct)
 
         logger.debug(
             f"Bot {bot.id}: Trend Following - Price: ${current_price:.2f}, "
@@ -2947,6 +3013,9 @@ class TradingEngine:
                     amount=buy_amount,
                     order_type="market",
                     reason=f"Trend Following: Bullish trend confirmed ({entry_confirmation_loops} loops)",
+                    expected_move_pct=(
+                        (atr * atr_multiplier) / current_price if current_price > 0 else None
+                    ),
                 )
             else:
                 # Entry conditions not met - reset confirmation counter
@@ -6339,9 +6408,17 @@ class TradingEngine:
                 )
 
         # === STEP 5: EXECUTION COST ESTIMATION ===
-        # Get cost model (defaults to 0 cost, preserving current behavior)
+        # bot.exchange_fee is a persisted column (default 0.1 %).  The getattr
+        # fallback covers the window between a deploy and migration run.  The
+        # isinstance guard ensures tests that use Mock bots (where attribute
+        # access returns a non-numeric Mock) fall back to 0.1 % rather than
+        # propagating a non-numeric value into the cost model arithmetic.
+        _exec_fee_raw = getattr(bot, 'exchange_fee', 0.1)
+        _exec_fee_pct = (
+            (float(_exec_fee_raw) if isinstance(_exec_fee_raw, (int, float)) else 0.1) or 0.1
+        )
         cost_model = get_cost_model(
-            exchange_fee_pct=getattr(bot, 'exchange_fee', 0.0) or 0.0,
+            exchange_fee_pct=_exec_fee_pct,
             market_spread_pct=0.0,  # TODO: Make configurable per bot
             slippage_pct=0.0,       # TODO: Make configurable per bot
             impact_pct=0.0,         # Not used for spot
@@ -6360,6 +6437,33 @@ class TradingEngine:
             f"spread=${cost_estimate.spread_cost:.4f}, "
             f"slip=${cost_estimate.slippage_cost:.4f})"
         )
+
+        # === STEP 5.5: TRADE VIABILITY GATE ===
+        # Blocks BUY signals where the expected price move cannot cover round-trip
+        # fees + a small safety margin.  Sells are never blocked — they close open
+        # positions and must always be allowed to settle.
+        # Opt-in: only fires when the strategy supplies a real float expected_move_pct.
+        # Strategies without a profit-target model (DCA, grid, …) leave it None
+        # and bypass the gate, preserving their existing behavior.
+        # isinstance guard: tests that use Mock signals bypass this automatically.
+        if signal.action == "buy" and isinstance(signal.expected_move_pct, (int, float)):
+            rt_cost_usd = cost_model.estimate_roundtrip_cost(
+                notional_usd=signal.amount,
+                price=current_price,
+            )
+            rt_cost_pct = rt_cost_usd / signal.amount if signal.amount > 0 else 0.0
+            min_viable_pct = rt_cost_pct + _VIABILITY_SAFETY_MARGIN_PCT
+            if signal.expected_move_pct < min_viable_pct:
+                reason = (
+                    f"expected move {signal.expected_move_pct * 100:.3f}% < "
+                    f"round-trip {rt_cost_pct * 100:.3f}% + "
+                    f"margin {_VIABILITY_SAFETY_MARGIN_PCT * 100:.3f}% "
+                    f"= min {min_viable_pct * 100:.3f}%"
+                )
+                logger.warning(f"Bot {bot.id}: Trade REJECTED (viability) - {reason}")
+                diagnostics_store.record_blocked(bot.id, BLOCK_OTHER, reason)
+                await self._record_trade_outcome(bot, "viability_gate_rejected", reason)
+                return None
 
         # === STEP 6: ORDER SIZE VALIDATION ===
         # Ensure order size is still meaningful after adjustments.
