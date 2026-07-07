@@ -818,10 +818,27 @@ async def get_bot_diagnostics(
         data["pause"]["reason"] if bot.status == BotStatus.PAUSED else None
     )
     if bot.status == BotStatus.PAUSED and not data["paused_reason"]:
-        data["paused_reason"] = (
-            (decision.reason if decision else None)
-            or "Paused (reason not captured this runtime — check alerts/logs)"
-        )
+        # In-memory reason is lost on restart. Fall back to decision_status_store,
+        # then to the persistent alerts_log which circuit breakers always write.
+        in_memory_reason = decision.reason if decision else None
+        if in_memory_reason:
+            data["paused_reason"] = in_memory_reason
+        else:
+            from ..models.alert import Alert
+            alert_result = await session.execute(
+                select(Alert)
+                .where(Alert.bot_id == bot_id)
+                .where(Alert.alert_type.in_([
+                    "repeated_rejection_breaker", "failure_circuit_breaker"
+                ]))
+                .order_by(Alert.created_at.desc())
+                .limit(1)
+            )
+            last_alert = alert_result.scalar_one_or_none()
+            data["paused_reason"] = (
+                last_alert.message if last_alert
+                else "Paused (reason not found in audit log)"
+            )
 
     # Recovery diagnostics: merge in-memory event log (diag.recovery) with
     # persisted paper-trade state (bot.strategy_state["recovery_mode"]).  The

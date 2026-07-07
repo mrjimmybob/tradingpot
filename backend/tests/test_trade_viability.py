@@ -669,16 +669,17 @@ class TestDipRecoveryProvidesExpectedMove:
             )
 
 
-# ---- DCA — honestly reports no expected move, gate blocks it ----
+# ---- DCA — accumulation strategy with is_accumulation=True ----
 
 class TestDCAHonestlyReportsNoExpectedMove:
     @pytest.mark.asyncio
     async def test_D_dca_buy_has_none_expected_move(self):
-        """DCA has no profit-target model and must not fake expected_move_pct.
+        """DCA has no profit-target model: expected_move_pct must stay None.
 
-        The strategy returns a BUY signal with expected_move_pct=None.
-        The fail-closed central gate will block this signal in _execute_trade.
-        This test verifies the strategy itself is honest (None, not a fake value).
+        DCA is an accumulation strategy: it sets is_accumulation=True on its
+        BUY signals so the viability gate applies a fee sanity check instead of
+        requiring a directional edge estimate. expected_move_pct remains None
+        (no fake value), and the gate passes the trade through.
         """
         engine = TradingEngine()
         engine._get_bot_positions = AsyncMock(return_value=[])
@@ -705,20 +706,24 @@ class TestDCAHonestlyReportsNoExpectedMove:
         assert signal is not None
         assert signal.action == "buy", "DCA should still generate a BUY signal"
         assert signal.expected_move_pct is None, (
-            "DCA must NOT fake expected_move_pct — it has no profit-target model. "
-            "The central gate will reject this trade with an explicit diagnostic reason."
+            "DCA must NOT fake expected_move_pct — it has no profit-target model."
+        )
+        assert signal.is_accumulation is True, (
+            "DCA must set is_accumulation=True so the gate uses fee-sanity check, "
+            "not the directional edge check."
         )
 
 
-# ---- Funding Carry — honestly reports no expected move, gate blocks it ----
+# ---- Funding Carry — accumulation strategy with is_accumulation=True ----
 
 class TestFundingCarryHonestlyReportsNoExpectedMove:
     @pytest.mark.asyncio
     async def test_D_funding_carry_buy_has_none_expected_move(self):
-        """Funding Carry uses funding rate as a filter, not a price target.
+        """Funding Carry spots an opportunity via funding rate, not a price target.
 
-        The strategy returns BUY with expected_move_pct=None. The fail-closed
-        gate blocks it. This verifies FC does not fake a value.
+        FC sets is_accumulation=True: it builds a spot long position when conditions
+        are favourable, without a per-trade price-move target. expected_move_pct
+        remains None (no fake value). The gate uses the accumulation fee check.
         """
         engine = TradingEngine()
         engine._get_bot_positions = AsyncMock(return_value=[])
@@ -746,8 +751,11 @@ class TestFundingCarryHonestlyReportsNoExpectedMove:
 
         if signal is not None and signal.action == "buy":
             assert signal.expected_move_pct is None, (
-                "Funding Carry must NOT fake expected_move_pct — it has no price target. "
-                "The central gate will block this with 'missing expected move estimate'."
+                "Funding Carry must NOT fake expected_move_pct — it has no price target."
+            )
+            assert signal.is_accumulation is True, (
+                "Funding Carry must set is_accumulation=True so the gate applies "
+                "fee-sanity check instead of requiring a directional edge estimate."
             )
 
 
@@ -838,4 +846,166 @@ class TestPaperTradeFeeUsesBot:
         )
         assert trade["gain_loss_usd"] < 0, (
             f"gain_loss_usd={trade['gain_loss_usd']:.4f} should be negative at 2% fees"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Test F: Viability rejections are NOT failures — bot must not be paused
+# ---------------------------------------------------------------------------
+
+class TestViabilityGateDoesNotPauseBot:
+    """Regression: 1000 consecutive viability rejections must not pause a bot.
+
+    Root cause (fixed): _record_trade_outcome was called with "viability_gate_rejected"
+    inside the gate, feeding the repeated-rejection circuit breaker. After 5
+    consecutive identical keys the bot was paused. Viability rejections are valid
+    no-trade decisions, not system failures. The fix removes the counter calls.
+    """
+
+    @pytest.mark.asyncio
+    async def test_F_1000_viability_rejections_do_not_pause(self):
+        """1000 consecutive viability rejections must leave _exec_rejections empty."""
+        engine = TradingEngine()
+        engine._record_trade_outcome = AsyncMock()
+
+        pause_calls = []
+        async def _fake_pause(bot_id, count, reason_text):
+            pause_calls.append((bot_id, count, reason_text))
+        engine._pause_bot_for_repeated_rejection = _fake_pause
+
+        # expected_move_pct impossibly small — viability gate always blocks this
+        signal = TradeSignal(
+            action="buy",
+            amount=100.0,
+            order_type="market",
+            expected_move_pct=0.000001,
+        )
+        bot = _execute_trade_bot(exchange_fee=0.1)
+        passing = _passing_check()
+
+        with patch("app.services.trading_engine.PortfolioRiskService") as mock_prs, \
+             patch("app.services.trading_engine.StrategyCapacityService") as mock_scs:
+            mock_prs.return_value.check_portfolio_risk = AsyncMock(return_value=passing)
+            mock_scs.return_value.check_capacity_for_trade = AsyncMock(return_value=passing)
+            for _ in range(1000):
+                result = await engine._execute_trade(
+                    bot, MagicMock(), signal, 64_000.0, AsyncMock()
+                )
+                assert result is None, "Viability gate must block this trade"
+
+        # _record_trade_outcome must NOT have been called with viability_gate_rejected
+        for call in engine._record_trade_outcome.await_args_list:
+            key = call.args[1] if len(call.args) > 1 else call.kwargs.get("reason_key")
+            assert key != "viability_gate_rejected", (
+                "viability_gate_rejected must NOT feed the repeated-rejection counter."
+            )
+        assert pause_calls == [], (
+            "Bot paused after viability rejections — gate must not increment failure counter."
+        )
+
+    @pytest.mark.asyncio
+    async def test_F_accumulation_signal_passes_gate(self):
+        """An accumulation signal (is_accumulation=True) with normal fee passes the gate."""
+        sentinel_exchange = MagicMock()
+        sentinel_exchange.place_market_order = AsyncMock(return_value=MagicMock(
+            id="ord1", amount=0.0015, filled=0.0015,
+            price=64000.0, cost=100.0, fee=0.1, fee_currency=None, status="closed",
+        ))
+
+        engine = TradingEngine()
+        outcome_keys: list = []
+        _orig = engine._record_trade_outcome
+        async def _spy(b, key, *args, **kwargs):
+            outcome_keys.append(key)
+            return await _orig(b, key, *args, **kwargs)
+        engine._record_trade_outcome = _spy
+
+        bot = _execute_trade_bot(exchange_fee=0.1)
+        signal = TradeSignal(
+            action="buy",
+            amount=100.0,
+            order_type="market",
+            is_accumulation=True,
+        )
+
+        passing = _passing_check()
+        with patch("app.services.trading_engine.PortfolioRiskService") as mock_prs, \
+             patch("app.services.trading_engine.StrategyCapacityService") as mock_scs:
+            mock_prs.return_value.check_portfolio_risk = AsyncMock(return_value=passing)
+            mock_scs.return_value.check_capacity_for_trade = AsyncMock(return_value=passing)
+            try:
+                await engine._execute_trade(
+                    bot, sentinel_exchange, signal, 64_000.0, AsyncMock()
+                )
+            except Exception:
+                pass  # Post-gate failures are fine; we only check the gate passed
+
+        assert sentinel_exchange.place_market_order.called, (
+            "Accumulation signal with 0.1% fee must pass viability gate and reach exchange."
+        )
+        assert "viability_gate_rejected" not in outcome_keys, (
+            "Accumulation signal must not produce a viability_gate_rejected outcome key."
+        )
+
+
+# ---------------------------------------------------------------------------
+# Test G: tf_bars KeyError — restored trend state missing the key
+# ---------------------------------------------------------------------------
+
+class TestTrendStateMissingTfBars:
+    """Regression: _strategy_trend_following crashed with KeyError: 'tf_bars'
+    when resuming from persisted state that predates the tf_bars key.
+
+    Fix: _normalize_trend_state backfills missing keys before use.
+    """
+
+    @pytest.mark.asyncio
+    async def test_G_missing_tf_bars_does_not_crash(self):
+        engine = TradingEngine()
+        engine._get_bot_positions = AsyncMock(return_value=[])
+
+        bot = MagicMock()
+        bot.id = 913
+        bot.strategy = "trend_following"
+        bot.trading_pair = "BTC/USDT"
+        bot.current_balance = 1_000.0
+        bot.budget = 1_000.0
+        bot.exchange_fee = 0.1
+
+        # Simulate old persisted state: tf_bars key is absent
+        engine._trend_states = {
+            913: {
+                "trailing_stop": None,
+                "highest_price": None,
+                "entry_atr": None,
+                "entry_time": None,
+                "last_exit_time": None,
+                "entry_confirmation_count": 0,
+                "exit_confirmation_count": 0,
+                # tf_bars intentionally missing (old persisted state)
+                "tf_current_bar": None,
+            }
+        }
+
+        params = {
+            "short_period": 5,
+            "long_period": 20,
+            "atr_period": 14,
+            "atr_multiplier": 2.0,
+            "max_allocation_percent": 50,
+        }
+
+        # Must NOT raise KeyError
+        try:
+            signal = await engine._strategy_trend_following(
+                bot, 64_000.0, params, AsyncMock()
+            )
+        except KeyError as e:
+            pytest.fail(
+                f"KeyError {e!r} raised — _normalize_trend_state must backfill 'tf_bars'."
+            )
+
+        # After normalization, tf_bars must exist
+        assert "tf_bars" in engine._trend_states[913], (
+            "_normalize_trend_state must add tf_bars to restored state."
         )

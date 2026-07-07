@@ -79,6 +79,33 @@ _VIABILITY_SAFETY_MARGIN_PCT = 0.0005
 # exceptions); a rejection is a clean None return, not an exception.
 MAX_CONSECUTIVE_REJECTIONS = 5
 
+# Accumulation strategies (DCA, grid-like) have no per-trade directional target.
+# Gate applies a fee sanity check only: one-way fee must not exceed this fraction.
+_MAX_ACCUMULATION_FEE_PCT = 0.05
+
+
+def _normalize_trend_state(state: dict) -> dict:
+    """Fill any keys missing from a restored trend-following state dict.
+
+    Called on every access so state persisted before a key was added continues
+    to work.  This is the single canonical source of valid trend state shape.
+    """
+    defaults: Dict[str, Any] = {
+        "trailing_stop": None,
+        "highest_price": None,
+        "entry_atr": None,
+        "entry_time": None,
+        "last_exit_time": None,
+        "entry_confirmation_count": 0,
+        "exit_confirmation_count": 0,
+        "tf_bars": [],
+        "tf_current_bar": None,
+    }
+    for key, val in defaults.items():
+        if key not in state:
+            state[key] = list(val) if isinstance(val, list) else val
+    return state
+
 
 # === STRATEGY STATE PERSISTENCE (C3/H1, M5) ===
 # Per-bot, in-memory strategy state attributes that must survive a restart so
@@ -195,14 +222,18 @@ class TradeSignal:
     threshold: Optional[float] = None
 
     # Expected price move as a fraction of current price (e.g. 0.005 = 0.5%).
-    # Set by strategies that can estimate the distance to their profit target.
-    # The central viability gate in _execute_trade uses this to verify that
-    # expected_move > round_trip_fees + safety_margin before executing a BUY.
-    # REQUIRED for BUY signals (fail-closed gate): None causes the gate to
-    # reject the order with "missing expected move estimate". Strategies that
-    # have no quantitative profit-target model should not set this field; the
-    # gate will surface why the trade was blocked rather than allowing a blind buy.
+    # Set by directional strategies that can estimate the distance to their
+    # profit target. The viability gate checks expected_move > round_trip_fees +
+    # safety_margin before executing a BUY on directional signals.
+    # Leave as None when is_accumulation=True — the gate uses a fee sanity check
+    # instead of requiring a price-target estimate.
     expected_move_pct: Optional[float] = None
+
+    # True for accumulation strategies (DCA, grid-like) that build position
+    # without a per-trade directional price target. The viability gate applies
+    # a fee sanity check (fee % < _MAX_ACCUMULATION_FEE_PCT) instead of the
+    # directional edge check used for is_accumulation=False signals.
+    is_accumulation: bool = False
 
 
 def validate_funding_carry_params(params: dict) -> list:
@@ -1286,6 +1317,7 @@ class TradingEngine:
             amount=buy_amount,
             order_type="market",
             reason=f"DCA buy #{order_count + 1}: ${buy_amount:.2f} @ ${current_price:.2f}",
+            is_accumulation=True,
         )
 
     async def _strategy_grid(
@@ -2750,6 +2782,13 @@ class TradingEngine:
         exit_confirmation_loops = params.get("exit_confirmation_loops", 2)
         cooldown_seconds = params.get("cooldown_seconds", 300)  # 5 minutes default
 
+        # Normalize persisted state before any early-return so missing keys added
+        # after state was first saved (e.g. tf_bars) are backfilled on every tick,
+        # including the warmup ticks that return before reaching the trading logic.
+        if not hasattr(self, "_trend_states"):
+            self._trend_states = {}
+        state = _normalize_trend_state(self._trend_states.get(bot.id, {}))
+
         # Get price history
         price_history = self._get_price_history(bot.id)
 
@@ -2759,6 +2798,7 @@ class TradingEngine:
 
         # Need enough data for EMA calculation
         if len(price_history) < long_period:
+            self._trend_states[bot.id] = state  # Persist normalization even on early return
             self._explain(bot.id).state("WARMING_UP").metric("current_price", current_price).check(
                 "Data collected", len(price_history), f">= {long_period}", False,
                 detail="warming up EMA window",
@@ -2792,23 +2832,6 @@ class TradingEngine:
         # Get current positions
         positions = await self._get_bot_positions(bot.id, session)
         has_position = len(positions) > 0
-
-        # Get or initialize trend-following state.
-        # tf_bars / tf_current_bar accumulate 60-second OHLC bars for bar ATR.
-        if not hasattr(self, "_trend_states"):
-            self._trend_states = {}
-
-        state = self._trend_states.get(bot.id, {
-            "trailing_stop": None,
-            "highest_price": None,
-            "entry_atr": None,  # Locked at entry - risk must never increase
-            "entry_time": None,
-            "last_exit_time": None,
-            "entry_confirmation_count": 0,  # Consecutive loops with entry conditions met
-            "exit_confirmation_count": 0,   # Consecutive loops with exit conditions met
-            "tf_bars": [],        # Completed 60-second OHLC bars for bar ATR
-            "tf_current_bar": None,  # In-progress bar being accumulated
-        })
 
         # === BAR ATR ACCUMULATION ===
         # Replace tick-level ATR with bar-based ATR.  The original code computed
@@ -3436,6 +3459,7 @@ class TradingEngine:
                     f"Funding Carry: favourable funding ({funding_pct:.5f}%) "
                     f"and regime ({trend_regime_name})"
                 ),
+                is_accumulation=True,
             )
 
         # --- Exit path: leave when either condition stops being favourable ---
@@ -6512,36 +6536,53 @@ class TradingEngine:
         )
 
         # === STEP 5.5: TRADE VIABILITY GATE (fail-closed) ===
-        # Every BUY must supply a numeric expected_move_pct that clears round-trip
-        # fees + safety margin. Sells are never blocked — they close positions.
-        # Fail-closed: missing expected_move_pct is itself a rejection reason.
-        # Strategies that cannot quantify their edge should not be buying blind;
-        # the gate surfaces this as a diagnostic rather than silently allowing it.
+        # Sells are never blocked — they close positions, not open risk.
+        # BUYs are checked differently by strategy type:
+        #   Accumulation (is_accumulation=True): fee sanity check only.
+        #   Directional (is_accumulation=False): expected_move > round_trip + margin.
+        # Viability rejections are VALID no-trade decisions, not failures.
+        # They do NOT increment the repeated-rejection circuit breaker counter.
         if signal.action == "buy":
-            if not isinstance(signal.expected_move_pct, (int, float)):
-                reason = "missing expected move estimate — strategy did not provide expected_move_pct"
-                logger.warning(f"Bot {bot.id}: Trade REJECTED (viability) - {reason}")
-                diagnostics_store.record_blocked(bot.id, BLOCK_OTHER, reason)
-                await self._record_trade_outcome(bot, "viability_gate_rejected", reason)
-                return None
+            _fee_raw_gate = getattr(bot, 'exchange_fee', 0.1)
+            _fee_pct_gate = (
+                float(_fee_raw_gate) if isinstance(_fee_raw_gate, (int, float)) else 0.1
+            ) / 100.0
 
-            rt_cost_usd = cost_model.estimate_roundtrip_cost(
-                notional_usd=signal.amount,
-                price=current_price,
-            )
-            rt_cost_pct = rt_cost_usd / signal.amount if signal.amount > 0 else 0.0
-            min_viable_pct = rt_cost_pct + _VIABILITY_SAFETY_MARGIN_PCT
-            if signal.expected_move_pct < min_viable_pct:
-                reason = (
-                    f"expected move {signal.expected_move_pct * 100:.3f}% < "
-                    f"round-trip {rt_cost_pct * 100:.3f}% + "
-                    f"margin {_VIABILITY_SAFETY_MARGIN_PCT * 100:.3f}% "
-                    f"= min {min_viable_pct * 100:.3f}%"
+            if signal.is_accumulation:
+                # Accumulation strategies have no per-trade price target.
+                # Sanity-check only: reject if exchange fee is absurdly high.
+                if _fee_pct_gate > _MAX_ACCUMULATION_FEE_PCT:
+                    reason = (
+                        f"exchange fee {_fee_pct_gate * 100:.2f}% exceeds "
+                        f"accumulation maximum {_MAX_ACCUMULATION_FEE_PCT * 100:.0f}%"
+                    )
+                    logger.warning(f"Bot {bot.id}: Trade REJECTED (viability/accumulation) - {reason}")
+                    diagnostics_store.record_blocked(bot.id, BLOCK_OTHER, reason)
+                    return None
+            else:
+                # Directional strategies must prove edge clears round-trip fees.
+                if not isinstance(signal.expected_move_pct, (int, float)):
+                    reason = "missing expected move estimate — strategy did not provide expected_move_pct"
+                    logger.warning(f"Bot {bot.id}: Trade REJECTED (viability) - {reason}")
+                    diagnostics_store.record_blocked(bot.id, BLOCK_OTHER, reason)
+                    return None
+
+                rt_cost_usd = cost_model.estimate_roundtrip_cost(
+                    notional_usd=signal.amount,
+                    price=current_price,
                 )
-                logger.warning(f"Bot {bot.id}: Trade REJECTED (viability) - {reason}")
-                diagnostics_store.record_blocked(bot.id, BLOCK_OTHER, reason)
-                await self._record_trade_outcome(bot, "viability_gate_rejected", reason)
-                return None
+                rt_cost_pct = rt_cost_usd / signal.amount if signal.amount > 0 else 0.0
+                min_viable_pct = rt_cost_pct + _VIABILITY_SAFETY_MARGIN_PCT
+                if signal.expected_move_pct < min_viable_pct:
+                    reason = (
+                        f"expected move {signal.expected_move_pct * 100:.3f}% < "
+                        f"round-trip {rt_cost_pct * 100:.3f}% + "
+                        f"margin {_VIABILITY_SAFETY_MARGIN_PCT * 100:.3f}% "
+                        f"= min {min_viable_pct * 100:.3f}%"
+                    )
+                    logger.warning(f"Bot {bot.id}: Trade REJECTED (viability) - {reason}")
+                    diagnostics_store.record_blocked(bot.id, BLOCK_OTHER, reason)
+                    return None
 
         # === STEP 6: ORDER SIZE VALIDATION ===
         # Ensure order size is still meaningful after adjustments.

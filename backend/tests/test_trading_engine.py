@@ -2090,7 +2090,9 @@ class TestRepeatedRejectionBreaker:
         looping. No order is ever placed."""
         trading_engine._pause_bot_for_repeated_rejection = AsyncMock()
         mock_exchange = MockExchangeService()
-        signal = TradeSignal(action="buy", amount=5.0, order_type="market")
+        # expected_move_pct=0.01 so the signal clears the viability gate and reaches
+        # the min-order check where it is correctly blocked by buy_below_min.
+        signal = TradeSignal(action="buy", amount=5.0, order_type="market", expected_move_pct=0.01)
 
         with patch(
             "app.services.trading_engine.PortfolioRiskService",
@@ -2103,7 +2105,7 @@ class TestRepeatedRejectionBreaker:
                 # Fresh signal each tick (the engine may mutate signal.amount).
                 order = await trading_engine._execute_trade(
                     mock_bot, mock_exchange,
-                    TradeSignal(action="buy", amount=5.0, order_type="market"),
+                    TradeSignal(action="buy", amount=5.0, order_type="market", expected_move_pct=0.01),
                     50000.0, mock_session,
                 )
                 assert order is None
