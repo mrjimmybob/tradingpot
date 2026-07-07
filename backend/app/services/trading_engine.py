@@ -88,6 +88,7 @@ _PERSISTED_STATE_ATTRS = (
     "_twap_states",
     "_vwap_states",
     "_auto_states",
+    "_dip_recovery_states",
 )
 
 # Largest price-history window any strategy needs (trend_following long EMA).
@@ -231,6 +232,91 @@ def validate_funding_carry_params(params: dict) -> list:
         errors.append("allowed_regimes must be a list of regime strings")
 
     return errors
+
+
+def validate_dip_recovery_params(params: dict) -> list:
+    """Validate dip_recovery strategy parameters.
+
+    Returns a list of human-readable error strings (empty when valid). Kept as a
+    pure function so it can be reused by configuration checks and tests without
+    constructing an engine, mirroring validate_funding_carry_params.
+
+    Args:
+        params: The bot's strategy_params dict.
+    """
+    errors = []
+
+    def _positive(name: str, allow_zero: bool = False) -> None:
+        value = params.get(name)
+        if value is None:
+            return
+        if not isinstance(value, (int, float)):
+            errors.append(f"{name} must be a number")
+            return
+        if allow_zero and value < 0:
+            errors.append(f"{name} must be >= 0")
+        elif not allow_zero and value <= 0:
+            errors.append(f"{name} must be > 0")
+
+    for field in (
+        "min_drop_percent", "drop_atr_multiplier",
+        "min_recovery_percent", "recovery_atr_multiplier",
+        "take_profit_atr_multiplier", "trailing_stop_atr_multiplier",
+        "emergency_stop_atr_multiplier", "max_position_duration_minutes",
+        "setup_expiry_minutes", "risk_percent", "spike_guard_atr_multiplier",
+        "reference_high_lookback_ticks", "atr_period", "ema_slope_period",
+    ):
+        _positive(field)
+
+    for field in ("cooldown_seconds", "loss_cooldown_seconds", "min_ticks_without_new_low"):
+        _positive(field, allow_zero=True)
+
+    trailing_mult = params.get("trailing_stop_atr_multiplier")
+    emergency_mult = params.get("emergency_stop_atr_multiplier")
+    if (
+        isinstance(trailing_mult, (int, float))
+        and isinstance(emergency_mult, (int, float))
+        and emergency_mult <= trailing_mult
+    ):
+        errors.append(
+            f"emergency_stop_atr_multiplier ({emergency_mult}) must be greater than "
+            f"trailing_stop_atr_multiplier ({trailing_mult}) - it is meant to be a wider, "
+            "last-resort safety net beyond the trailing stop"
+        )
+
+    cooldown = params.get("cooldown_seconds")
+    loss_cooldown = params.get("loss_cooldown_seconds")
+    if (
+        isinstance(cooldown, (int, float))
+        and isinstance(loss_cooldown, (int, float))
+        and loss_cooldown < cooldown
+    ):
+        errors.append(
+            f"loss_cooldown_seconds ({loss_cooldown}) must be >= cooldown_seconds ({cooldown})"
+        )
+
+    risk_percent = params.get("risk_percent")
+    if isinstance(risk_percent, (int, float)) and not (0 < risk_percent <= 100):
+        errors.append("risk_percent must be in (0, 100]")
+
+    return errors
+
+
+class _DipRecoveryState:
+    """String constants for Dip Recovery's lifecycle state machine.
+
+    Persisted as a plain string under state["state"] (JSON-compatible, matching
+    the dict-based persistence every other strategy uses - no separate typed
+    state system). ENTRY_ARMED is transient: it is only ever reported via
+    ExplanationBuilder.state() on the tick a BUY is emitted, and is never itself
+    written to the persisted dict (the next persisted value is LONG_OPEN).
+    """
+    IDLE = "IDLE"
+    TRACKING_DROP = "TRACKING_DROP"
+    WAITING_REVERSAL = "WAITING_REVERSAL"
+    ENTRY_ARMED = "ENTRY_ARMED"
+    LONG_OPEN = "LONG_OPEN"
+    COOLDOWN = "COOLDOWN"
 
 
 class _VirtualPosition:
@@ -930,6 +1016,7 @@ class TradingEngine:
             "trend_following": self._strategy_trend_following,
             "volatility_breakout": self._strategy_volatility_breakout,
             "funding_carry": self._strategy_funding_carry,
+            "dip_recovery": self._strategy_dip_recovery,
                     "auto_mode": self._strategy_auto,
         }
 
@@ -2527,6 +2614,30 @@ class TradingEngine:
         # Keep only the last max_len prices
         self._price_histories[bot_id] = history[-max_len:]
 
+    def _calc_price_atr_proxy(self, prices: list, period: int) -> float:
+        """Calculate an ATR proxy from a plain (tick/close) price series.
+
+        Same formula as trend_following's inline calculate_atr_proxy: True Range
+        is approximated as the absolute difference between consecutive prices
+        (no OHLC available for tick data), averaged over the last `period`
+        differences. Extracted here as a shared, reusable method - rather than
+        duplicating trend_following's private closure or modifying it to call
+        out to this method - specifically so dip_recovery (and any future
+        tick-based strategy) does not reimplement the math, while leaving
+        trend_following's own pinned implementation completely untouched.
+
+        Returns 0.0 if insufficient data.
+        """
+        if len(prices) < period + 1:
+            return 0.0
+
+        true_ranges = [abs(prices[i] - prices[i - 1]) for i in range(1, len(prices))]
+        if len(true_ranges) < period:
+            return 0.0
+
+        recent_trs = true_ranges[-period:]
+        return sum(recent_trs) / len(recent_trs)
+
     # Note: _strategy_momentum (breakdown_momentum) was removed (stub implementation, overlaps with other strategies)
 
     async def _strategy_trend_following(
@@ -3894,6 +4005,609 @@ class TradingEngine:
 
     # Note: _strategy_arbitrage and _strategy_event were removed (placeholders without implementation)
 
+    def _dip_recovery_default_state(self) -> dict:
+        """Fresh default runtime state for a Dip Recovery bot.
+
+        Single source of truth for the shape of dip_recovery state - reused by
+        the live strategy, restart-restore (generic _restore_bot_state), and
+        tests, so there is exactly one place that defines what this strategy
+        persists.
+        """
+        return {
+            "state": _DipRecoveryState.IDLE,
+            "reference_high": None,
+            "reference_high_time": None,
+            "lowest_price": None,
+            "lowest_price_time": None,
+            "tracking_started_at": None,
+            "ticks_since_new_low": 0,
+            "entry_price": None,
+            "entry_time": None,
+            "entry_atr": None,
+            "highest_price_since_entry": None,
+            "trailing_stop": None,
+            "take_profit": None,
+            "emergency_stop": None,
+            "cooldown_until": None,
+            "last_exit_was_loss": None,
+        }
+
+    async def _strategy_dip_recovery(
+        self,
+        bot: Bot,
+        current_price: float,
+        params: dict,
+        session: AsyncSession,
+    ) -> Optional[TradeSignal]:
+        """Dip Recovery / Reversal Momentum strategy.
+
+        Captures the bounce AFTER a significant decline, not the decline
+        itself: a drop only ARMS monitoring; a BUY additionally requires price
+        to have already reversed off a confirmed local low by an adaptive
+        margin, with optional momentum confirmation. This intentionally
+        accepts a later entry than a pure dip-buyer in exchange for materially
+        reduced downside risk - it never buys into a market that is still
+        falling.
+
+        Lifecycle (persisted in bot.strategy_state via _dip_recovery_states):
+            IDLE -> TRACKING_DROP -> WAITING_REVERSAL -> LONG_OPEN -> COOLDOWN -> IDLE
+        ENTRY_ARMED is reported only in the explanation on the single tick a
+        BUY fires - see _DipRecoveryState for why it is never itself persisted.
+
+        All thresholds adapt to current volatility via an ATR-percent proxy
+        (_calc_price_atr_proxy) computed from the bot's own tick price
+        history - the same shared source trend_following uses. No OHLC candles
+        are available for tick-driven bots, so True Range is approximated as
+        the absolute tick-to-tick price change, exactly like trend_following.
+        This makes every threshold pair-and-volatility agnostic (no BTC-
+        specific assumptions): a 2% move only matters relative to what THIS
+        pair's recent ATR% says is normal for it.
+
+        Parameters (sane crypto defaults; also documented in
+        validate_dip_recovery_params and app/routers/config.py STRATEGIES):
+            atr_period (14): ticks in the ATR proxy window.
+            reference_high_lookback_ticks (60): rolling window used to derive
+                the "recent high" a decline is measured against.
+            min_drop_percent / drop_atr_multiplier (1.5 / 2.5): adaptive drop
+                threshold = max(min_drop_percent, atr_percent * drop_atr_multiplier).
+            min_recovery_percent / recovery_atr_multiplier (0.5 / 0.8): adaptive
+                recovery confirmation = max(min_recovery_percent, atr_percent * recovery_atr_multiplier).
+            require_ema_slope_confirmation / ema_slope_period (True / 5): the
+                short EMA over price history must be rising.
+            require_no_new_low_confirmation / min_ticks_without_new_low (True / 2):
+                no new low for N ticks.
+            take_profit_atr_multiplier / trailing_stop_atr_multiplier /
+                emergency_stop_atr_multiplier (3.0 / 1.5 / 5.0): ATR-based
+                exits, locked at entry (risk never expands, matching
+                trend_following/volatility_breakout convention).
+            max_position_duration_minutes (720): force-exit after this long
+                regardless of P&L.
+            setup_expiry_minutes (240): abandon an unresolved TRACKING_DROP /
+                WAITING_REVERSAL setup after this long with no confirmed
+                reversal, back to IDLE.
+            cooldown_seconds / loss_cooldown_seconds (300 / 1800): pause after
+                any exit, extended after a losing exit.
+            risk_percent (1.0): % of balance risked per trade, sized off the
+                trailing-stop distance (same sizing formula as trend_following).
+            spike_guard_atr_multiplier (6.0): a single-tick move bigger than
+                this many ATRs is treated as noise and ignored when updating
+                the tracked high/low, so one bad tick cannot anchor an
+                unrealistic reference point.
+        """
+        atr_period = int(params.get("atr_period", 14))
+        ref_high_lookback = int(params.get("reference_high_lookback_ticks", 60))
+        min_drop_pct = params.get("min_drop_percent", 1.5)
+        drop_atr_mult = params.get("drop_atr_multiplier", 2.5)
+        min_recovery_pct = params.get("min_recovery_percent", 0.5)
+        recovery_atr_mult = params.get("recovery_atr_multiplier", 0.8)
+        require_ema_slope = params.get("require_ema_slope_confirmation", True)
+        ema_slope_period = int(params.get("ema_slope_period", 5))
+        require_no_new_low = params.get("require_no_new_low_confirmation", True)
+        min_ticks_no_new_low = int(params.get("min_ticks_without_new_low", 2))
+        take_profit_atr_mult = params.get("take_profit_atr_multiplier", 3.0)
+        trailing_atr_mult = params.get("trailing_stop_atr_multiplier", 1.5)
+        emergency_atr_mult = params.get("emergency_stop_atr_multiplier", 5.0)
+        max_duration_min = params.get("max_position_duration_minutes", 720)
+        setup_expiry_min = params.get("setup_expiry_minutes", 240)
+        cooldown_seconds = params.get("cooldown_seconds", 300)
+        loss_cooldown_seconds = params.get("loss_cooldown_seconds", 1800)
+        risk_percent = params.get("risk_percent", 1.0) / 100
+        spike_guard_mult = params.get("spike_guard_atr_multiplier", 6.0)
+
+        now = datetime.utcnow()
+
+        # === Price history (shared tick history, same source as trend_following) ===
+        price_history = self._get_price_history(bot.id)
+        previous_price = price_history[-1] if price_history else current_price
+        price_history.append(current_price)
+        self._save_price_history(bot.id, price_history, max_len=max(ref_high_lookback + 50, 250))
+
+        if not hasattr(self, "_dip_recovery_states"):
+            self._dip_recovery_states = {}
+        state = self._dip_recovery_states.get(bot.id) or self._dip_recovery_default_state()
+
+        exp = self._explain(bot.id)
+
+        # Warm-up gate: need enough ticks for a meaningful ATR proxy.
+        if len(price_history) < atr_period + 1:
+            self._dip_recovery_states[bot.id] = state
+            exp.state(state["state"]).metric("current_price", current_price).check(
+                "History collected", len(price_history), f">= {atr_period + 1}", False,
+                detail="warming up ATR window",
+            )
+            return TradeSignal(
+                action="hold",
+                amount=0,
+                reason=f"Dip Recovery: Collecting data ({len(price_history)}/{atr_period + 1})"
+            )
+
+        atr = self._calc_price_atr_proxy(price_history, atr_period)
+        atr_percent = (atr / current_price * 100.0) if current_price > 0 else 0.0
+        is_spike = atr > 0 and abs(current_price - previous_price) > (atr * spike_guard_mult)
+
+        positions = await self._get_bot_positions(bot.id, session)
+        has_position = len(positions) > 0
+
+        if not has_position and state["state"] == _DipRecoveryState.LONG_OPEN:
+            # Defensive: persisted state says a position is open but none
+            # exists (closed outside this strategy's knowledge, or a crash
+            # between execution and the next state save). There is nothing to
+            # manage and no valid TRACKING_DROP/WAITING_REVERSAL context either
+            # (those fields were cleared on entry) - reset cleanly to IDLE
+            # rather than falling into the setup-tracking branch below with
+            # stale/absent low/high fields.
+            state = self._dip_recovery_default_state()
+            self._dip_recovery_states[bot.id] = state
+
+        if has_position:
+            return self._dip_recovery_manage_exit(
+                bot, state, positions, current_price, atr, now,
+                take_profit_atr_mult, trailing_atr_mult, emergency_atr_mult,
+                max_duration_min, cooldown_seconds, loss_cooldown_seconds, exp,
+            )
+
+        # === COOLDOWN ===
+        if state["state"] == _DipRecoveryState.COOLDOWN:
+            cooldown_until = state.get("cooldown_until")
+            if cooldown_until and now < cooldown_until:
+                remaining = (cooldown_until - now).total_seconds()
+                exp.state(_DipRecoveryState.COOLDOWN).update({
+                    "current_price": current_price, "atr": atr, "atr_percent": atr_percent,
+                    "cooldown_remaining_s": remaining,
+                    "last_exit_was_loss": state.get("last_exit_was_loss"),
+                })
+                exp.check("Cooldown elapsed", f"{remaining:.0f}s remaining", "0s remaining", False)
+                exp.next_trade(
+                    current=remaining, current_label="Cooldown remaining (s)",
+                    target=0, target_label="Ready", distance=remaining,
+                    status=f"{remaining:.0f}s until monitoring resumes",
+                )
+                self._dip_recovery_states[bot.id] = state
+                return TradeSignal(
+                    action="hold", amount=0,
+                    reason=f"Dip Recovery: Cooldown active ({remaining:.0f}s remaining)"
+                )
+            # Cooldown elapsed - fall through to IDLE this same tick.
+            state["state"] = _DipRecoveryState.IDLE
+            state["cooldown_until"] = None
+
+        drop_threshold = max(min_drop_pct, atr_percent * drop_atr_mult)
+        recovery_threshold = max(min_recovery_pct, atr_percent * recovery_atr_mult)
+
+        # === IDLE: watch for a significant decline ===
+        if state["state"] == _DipRecoveryState.IDLE:
+            window = price_history[-ref_high_lookback:]
+            # A single-tick spike must not anchor the reference high.
+            if is_spike and len(window) > 1:
+                window = window[:-1]
+            reference_high = max(window) if window else current_price
+            drawdown_percent = (
+                (current_price - reference_high) / reference_high * 100.0
+                if reference_high > 0 else 0.0
+            )
+            decline_ratio = abs(drawdown_percent) / atr_percent if atr_percent > 0 else 0.0
+            opportunity_score = self._dip_recovery_score_from_ratios(decline_ratio, 0.0)
+
+            exp.state(_DipRecoveryState.IDLE).update({
+                "current_price": current_price, "reference_high": reference_high,
+                "atr": atr, "atr_percent": atr_percent,
+                "drawdown_percent": drawdown_percent, "drop_threshold_percent": drop_threshold,
+                "opportunity_score": opportunity_score * 10.0,
+            })
+            exp.check(
+                "Decline vs adaptive threshold", f"{abs(drawdown_percent):.3f}%",
+                f">= {drop_threshold:.3f}%", abs(drawdown_percent) >= drop_threshold,
+            )
+
+            if drawdown_percent < 0 and abs(drawdown_percent) >= drop_threshold:
+                state.update({
+                    "state": _DipRecoveryState.TRACKING_DROP,
+                    "reference_high": reference_high,
+                    "reference_high_time": now,
+                    "lowest_price": current_price,
+                    "lowest_price_time": now,
+                    "tracking_started_at": now,
+                    "ticks_since_new_low": 0,
+                })
+                self._dip_recovery_states[bot.id] = state
+                exp.state(_DipRecoveryState.TRACKING_DROP).next_trade(
+                    current=abs(drawdown_percent), current_label="Decline so far (%)",
+                    target=drop_threshold, target_label="Drop threshold (%)",
+                    distance=0.0, status="drop confirmed - tracking bottom for a reversal",
+                )
+                return TradeSignal(
+                    action="hold", amount=0,
+                    reason=(
+                        f"Dip Recovery: Significant decline detected "
+                        f"({abs(drawdown_percent):.2f}% >= {drop_threshold:.2f}%) - tracking bottom"
+                    )
+                )
+
+            needed = max(0.0, drop_threshold - abs(drawdown_percent))
+            exp.next_trade(
+                current=abs(drawdown_percent), current_label="Current drawdown (%)",
+                target=drop_threshold, target_label="Required (%)", distance=needed,
+                status=f"{needed:.2f}% further decline needed to arm monitoring",
+            )
+            self._dip_recovery_states[bot.id] = state
+            return TradeSignal(
+                action="hold", amount=0,
+                reason=(
+                    f"Dip Recovery: No significant decline "
+                    f"({abs(drawdown_percent):.2f}% < {drop_threshold:.2f}%)"
+                )
+            )
+
+        # === TRACKING_DROP / WAITING_REVERSAL ===
+        return self._dip_recovery_manage_setup(
+            bot, state, price_history, current_price, atr, atr_percent, is_spike, now,
+            recovery_threshold, require_ema_slope, ema_slope_period,
+            require_no_new_low, min_ticks_no_new_low, setup_expiry_min,
+            risk_percent, take_profit_atr_mult, trailing_atr_mult, emergency_atr_mult,
+            exp,
+        )
+
+    def _dip_recovery_manage_setup(
+        self,
+        bot: Bot,
+        state: dict,
+        price_history: list,
+        current_price: float,
+        atr: float,
+        atr_percent: float,
+        is_spike: bool,
+        now: datetime,
+        recovery_threshold: float,
+        require_ema_slope: bool,
+        ema_slope_period: int,
+        require_no_new_low: bool,
+        min_ticks_no_new_low: int,
+        setup_expiry_min: float,
+        risk_percent: float,
+        take_profit_atr_mult: float,
+        trailing_atr_mult: float,
+        emergency_atr_mult: float,
+        exp: ExplanationBuilder,
+    ) -> TradeSignal:
+        """Handle TRACKING_DROP / WAITING_REVERSAL: track the bottom, then
+        confirm and arm a BUY once price has genuinely reversed off it.
+
+        Never buys on the way down - only once recovery_percent clears the
+        adaptive threshold AND every enabled confirmation filter passes.
+        """
+        reference_high = state.get("reference_high")
+        tracking_started_at = state.get("tracking_started_at")
+
+        # Invalidation: setup has gone stale without confirming a reversal.
+        elapsed_minutes = (
+            (now - tracking_started_at).total_seconds() / 60.0 if tracking_started_at else 0.0
+        )
+        if elapsed_minutes >= setup_expiry_min:
+            self._dip_recovery_states[bot.id] = self._dip_recovery_default_state()
+            exp.state(_DipRecoveryState.IDLE).check(
+                "Setup expiry", f"{elapsed_minutes:.1f} min", f"< {setup_expiry_min} min", False,
+            )
+            return TradeSignal(
+                action="hold", amount=0,
+                reason=(
+                    f"Dip Recovery: Setup expired after {elapsed_minutes:.1f} min "
+                    "without a confirmed reversal - back to IDLE"
+                )
+            )
+
+        # Invalidation: price fully round-tripped past the original high
+        # without ever confirming entry - no longer "the dip"; reset and re-watch.
+        if reference_high and current_price >= reference_high:
+            self._dip_recovery_states[bot.id] = self._dip_recovery_default_state()
+            exp.state(_DipRecoveryState.IDLE)
+            return TradeSignal(
+                action="hold", amount=0,
+                reason=(
+                    "Dip Recovery: Price recovered past the original reference high "
+                    "without confirmation - resetting"
+                )
+            )
+
+        lowest_price = state.get("lowest_price", current_price)
+        is_new_low = (not is_spike) and current_price < lowest_price
+
+        if is_new_low:
+            state["lowest_price"] = current_price
+            state["lowest_price_time"] = now
+            state["ticks_since_new_low"] = 0
+            lowest_price = current_price
+        else:
+            state["ticks_since_new_low"] = state.get("ticks_since_new_low", 0) + 1
+
+        recovery_percent = (
+            (current_price - lowest_price) / lowest_price * 100.0 if lowest_price > 0 else 0.0
+        )
+
+        if recovery_percent <= 0:
+            # Still at/below the tracked low - no reversal yet, nothing to confirm.
+            state["state"] = _DipRecoveryState.TRACKING_DROP
+            self._dip_recovery_states[bot.id] = state
+            exp.state(_DipRecoveryState.TRACKING_DROP).update({
+                "current_price": current_price, "lowest_price": lowest_price,
+                "atr": atr, "atr_percent": atr_percent, "recovery_percent": recovery_percent,
+                "recovery_threshold_percent": recovery_threshold,
+            })
+            exp.check("New low tracking", current_price, f"<= {lowest_price:.4f}", True)
+            return TradeSignal(
+                action="hold", amount=0,
+                reason=f"Dip Recovery: Still declining, tracking bottom (${lowest_price:.4f})"
+            )
+
+        # Price has bounced off the low - evaluate reversal confirmation.
+        ema_series = self._calculate_ema(price_history, ema_slope_period)
+        ema_slope_positive = len(ema_series) >= 2 and ema_series[-1] > ema_series[-2]
+        ema_ok = (not require_ema_slope) or ema_slope_positive
+
+        no_new_low_ok = (
+            (not require_no_new_low) or state["ticks_since_new_low"] >= min_ticks_no_new_low
+        )
+
+        recovery_ok = recovery_percent >= recovery_threshold
+        entry_ready = recovery_ok and ema_ok and no_new_low_ok
+
+        decline_ratio = (
+            abs((reference_high - lowest_price) / reference_high * 100.0) / atr_percent
+            if reference_high and atr_percent > 0 else 0.0
+        )
+        recovery_ratio = recovery_percent / atr_percent if atr_percent > 0 else 0.0
+        opportunity_score = self._dip_recovery_score_from_ratios(decline_ratio, recovery_ratio)
+
+        exp.update({
+            "current_price": current_price, "lowest_price": lowest_price,
+            "atr": atr, "atr_percent": atr_percent,
+            "recovery_percent": recovery_percent, "recovery_threshold_percent": recovery_threshold,
+            "ticks_since_new_low": state["ticks_since_new_low"],
+            "ema_slope_positive": ema_slope_positive,
+            "opportunity_score": opportunity_score * 10.0,
+        })
+        exp.check(
+            "Recovery from bottom", f"{recovery_percent:.3f}%",
+            f">= {recovery_threshold:.3f}%", recovery_ok,
+        )
+        if require_ema_slope:
+            exp.check("Short EMA slope positive", ema_slope_positive, "True", ema_slope_positive)
+        if require_no_new_low:
+            exp.check(
+                "No new low", state["ticks_since_new_low"],
+                f">= {min_ticks_no_new_low} ticks", no_new_low_ok,
+            )
+
+        if not entry_ready:
+            state["state"] = _DipRecoveryState.WAITING_REVERSAL
+            self._dip_recovery_states[bot.id] = state
+            needed = max(0.0, recovery_threshold - recovery_percent)
+            exp.state(_DipRecoveryState.WAITING_REVERSAL).next_trade(
+                current=recovery_percent, current_label="Recovery from bottom (%)",
+                target=recovery_threshold, target_label="Required (%)", distance=needed,
+                status="waiting for full reversal confirmation",
+            )
+            return TradeSignal(
+                action="hold", amount=0,
+                reason=(
+                    f"Dip Recovery: Reversal forming ({recovery_percent:.2f}%/"
+                    f"{recovery_threshold:.2f}% required) - awaiting confirmation"
+                )
+            )
+
+        # === ENTRY ARMED -> BUY ===
+        exp.state(_DipRecoveryState.ENTRY_ARMED)
+
+        risk_amount = bot.current_balance * risk_percent
+        trailing_distance = atr * trailing_atr_mult
+        if trailing_distance > 0:
+            position_coins = risk_amount / trailing_distance
+            position_size = position_coins * current_price
+        else:
+            position_size = risk_amount
+
+        buy_amount = min(position_size, bot.current_balance * _BUY_BALANCE_FRACTION)
+        if buy_amount < MIN_ORDER_USD:
+            if bot.current_balance >= MIN_ORDER_USD:
+                buy_amount = MIN_ORDER_USD
+            else:
+                self._dip_recovery_states[bot.id] = state
+                return TradeSignal(
+                    action="hold", amount=0,
+                    reason=(
+                        f"Dip Recovery: balance ${bot.current_balance:.2f} below "
+                        f"${MIN_ORDER_USD:.0f} minimum order"
+                    ),
+                )
+
+        entry_price = current_price
+        self._dip_recovery_states[bot.id] = {
+            **self._dip_recovery_default_state(),
+            "state": _DipRecoveryState.LONG_OPEN,
+            "entry_price": entry_price,
+            "entry_time": now,
+            "entry_atr": atr,
+            "highest_price_since_entry": entry_price,
+            "trailing_stop": entry_price - (atr * trailing_atr_mult),
+            "take_profit": entry_price + (atr * take_profit_atr_mult),
+            "emergency_stop": entry_price - (atr * emergency_atr_mult),
+        }
+
+        logger.info(
+            f"Bot {bot.id}: Dip Recovery ENTRY - Price ${entry_price:.4f}, "
+            f"recovery {recovery_percent:.2f}% (required {recovery_threshold:.2f}%), "
+            f"ATR ${atr:.4f}, Position ${buy_amount:.2f}"
+        )
+
+        return TradeSignal(
+            action="buy", amount=buy_amount, order_type="market",
+            reason=(
+                f"Dip Recovery: Reversal confirmed ({recovery_percent:.2f}% >= "
+                f"{recovery_threshold:.2f}%) after decline - entering"
+            ),
+        )
+
+    def _dip_recovery_exit_signal(
+        self,
+        bot: Bot,
+        pos,
+        current_price: float,
+        entry_price: float,
+        unrealized_pnl_pct: float,
+        reason: str,
+        cooldown_secs: float,
+        now: datetime,
+    ) -> TradeSignal:
+        """Build the SELL signal for a Dip Recovery exit and reset state to
+        COOLDOWN. Single source of truth for the cooldown-reset behaviour so
+        every exit path (take-profit, trailing stop, emergency stop, max
+        duration) resets state identically.
+        """
+        sell_amount = pos.amount * current_price
+        is_loss = current_price < entry_price
+        self._dip_recovery_states[bot.id] = {
+            **self._dip_recovery_default_state(),
+            "state": _DipRecoveryState.COOLDOWN,
+            "cooldown_until": now + timedelta(seconds=cooldown_secs),
+            "last_exit_was_loss": is_loss,
+        }
+        logger.info(
+            f"Bot {bot.id}: Dip Recovery EXIT ({reason}) - Price ${current_price:.4f}, "
+            f"Entry ${entry_price:.4f}, PnL {unrealized_pnl_pct:+.2f}%"
+        )
+        return TradeSignal(
+            action="sell", amount=sell_amount, order_type="market",
+            reason=f"Dip Recovery: Exit ({reason}), PnL {unrealized_pnl_pct:+.2f}%",
+        )
+
+    def _dip_recovery_manage_exit(
+        self,
+        bot: Bot,
+        state: dict,
+        positions: list,
+        current_price: float,
+        atr: float,
+        now: datetime,
+        take_profit_atr_mult: float,
+        trailing_atr_mult: float,
+        emergency_atr_mult: float,
+        max_duration_min: float,
+        cooldown_seconds: float,
+        loss_cooldown_seconds: float,
+        exp: ExplanationBuilder,
+    ) -> TradeSignal:
+        """Manage an open Dip Recovery position: take-profit, monotonic
+        trailing stop, emergency stop, and max-duration exits, each routed
+        through a loss-aware cooldown (see _dip_recovery_exit_signal).
+        """
+        entry_price = state.get("entry_price")
+        entry_atr_locked = state.get("entry_atr") or atr  # fallback for legacy/corrupted state
+        entry_time = state.get("entry_time") or now
+        if entry_price is None:
+            # Defensive: a position exists but entry was never recorded (state
+            # lost before restart-restore). Adopt current price as entry so
+            # exits still function instead of crashing or buying again.
+            entry_price = current_price
+            entry_atr_locked = atr
+
+        previous_highest = state.get("highest_price_since_entry") or entry_price
+        highest = max(previous_highest, current_price)
+        trailing_stop = state.get("trailing_stop")
+        if trailing_stop is None or highest > previous_highest:
+            # Monotonic tightening only - risk never expands (same convention
+            # as trend_following / volatility_breakout).
+            trailing_stop = highest - (entry_atr_locked * trailing_atr_mult)
+        take_profit = state.get("take_profit") or (
+            entry_price + entry_atr_locked * take_profit_atr_mult
+        )
+        emergency_stop = state.get("emergency_stop") or (
+            entry_price - entry_atr_locked * emergency_atr_mult
+        )
+
+        duration_minutes = (now - entry_time).total_seconds() / 60.0
+        unrealized_pnl_pct = (
+            (current_price - entry_price) / entry_price * 100.0 if entry_price > 0 else 0.0
+        )
+
+        state.update({
+            "state": _DipRecoveryState.LONG_OPEN, "entry_price": entry_price,
+            "entry_time": entry_time, "entry_atr": entry_atr_locked,
+            "highest_price_since_entry": highest, "trailing_stop": trailing_stop,
+            "take_profit": take_profit, "emergency_stop": emergency_stop,
+        })
+
+        exp.state(_DipRecoveryState.LONG_OPEN).update({
+            "current_price": current_price, "entry_price": entry_price, "highest_price": highest,
+            "trailing_stop": trailing_stop, "take_profit": take_profit,
+            "emergency_stop": emergency_stop, "unrealized_pnl_percent": unrealized_pnl_pct,
+            "position_duration_minutes": duration_minutes,
+        })
+        exp.check("Take profit hit", current_price, f">= {take_profit:.4f}", current_price >= take_profit)
+        exp.check("Trailing stop hit", current_price, f"<= {trailing_stop:.4f}", current_price <= trailing_stop)
+        exp.check(
+            "Max duration", f"{duration_minutes:.1f} min",
+            f"< {max_duration_min} min", duration_minutes < max_duration_min,
+        )
+        exp.next_trade(
+            current=current_price, current_label="Current price",
+            target=(take_profit if unrealized_pnl_pct >= 0 else trailing_stop),
+            target_label=("Take profit" if unrealized_pnl_pct >= 0 else "Trailing stop"),
+            distance=(take_profit - current_price),
+            status="holding - exits on take-profit, trailing stop, emergency stop, or max duration",
+        )
+
+        for pos in positions:
+            if current_price >= take_profit:
+                return self._dip_recovery_exit_signal(
+                    bot, pos, current_price, entry_price, unrealized_pnl_pct,
+                    "take profit", cooldown_seconds, now,
+                )
+            if current_price <= trailing_stop:
+                cd = loss_cooldown_seconds if current_price < entry_price else cooldown_seconds
+                return self._dip_recovery_exit_signal(
+                    bot, pos, current_price, entry_price, unrealized_pnl_pct,
+                    "trailing stop", cd, now,
+                )
+            if current_price <= emergency_stop:
+                return self._dip_recovery_exit_signal(
+                    bot, pos, current_price, entry_price, unrealized_pnl_pct,
+                    "emergency stop", loss_cooldown_seconds, now,
+                )
+            if duration_minutes >= max_duration_min:
+                cd = loss_cooldown_seconds if unrealized_pnl_pct < 0 else cooldown_seconds
+                return self._dip_recovery_exit_signal(
+                    bot, pos, current_price, entry_price, unrealized_pnl_pct,
+                    "max duration", cd, now,
+                )
+
+        self._dip_recovery_states[bot.id] = state
+        return TradeSignal(
+            action="hold", amount=0,
+            reason=(
+                f"Dip Recovery: Holding (PnL {unrealized_pnl_pct:+.2f}%, "
+                f"trailing stop ${trailing_stop:.4f}, take profit ${take_profit:.4f})"
+            ),
+        )
+
     async def _strategy_auto(
         self,
         bot: Bot,
@@ -4762,7 +5476,70 @@ class TradingEngine:
             # 5% drawdown → ~10 (strong accumulation opportunity)
             return _clamp(drawdown_pct * 1.4 + 3.0)
 
+        elif strategy_name == "dip_recovery":
+            # Opportunity = a decline that is LARGE relative to normal volatility
+            # AND already showing an early bounce off a local low. Mirrors the
+            # live strategy's own adaptive-threshold logic (drop vs ATR%,
+            # recovery-from-low vs ATR%, see _strategy_dip_recovery) but is
+            # computed here from auto_mode's own bar history rather than the
+            # strategy's tick-level state, since dip_recovery may not be the
+            # currently-running sub-strategy yet. Delegates the actual score
+            # curve to _dip_recovery_score_from_ratios so the math is defined
+            # exactly once and shared with the live strategy's own diagnostics.
+            atrs = _atr_series(highs, lows, 14)
+            atr = atrs[-1] if atrs else 0.0
+            atr_pct = (atr / current_price * 100.0) if current_price > 0 else 0.0
+            if atr_pct <= 0:
+                return 5.0
+
+            recent_c = closes[-min(30, n):]
+            recent_high = max(recent_c)
+            high_idx = recent_c.index(recent_high)
+            after_high = recent_c[high_idx:] or recent_c
+            lowest = min(after_high)
+
+            decline_pct = (recent_high - lowest) / recent_high * 100.0 if recent_high > 0 else 0.0
+            recovery_pct = (current_price - lowest) / lowest * 100.0 if lowest > 0 else 0.0
+
+            decline_ratio = decline_pct / atr_pct
+            recovery_ratio = max(0.0, recovery_pct) / atr_pct
+            return self._dip_recovery_score_from_ratios(decline_ratio, recovery_ratio)
+
         return 5.0  # neutral for unknown strategies
+
+    def _dip_recovery_score_from_ratios(self, decline_ratio: float, recovery_ratio: float) -> float:
+        """Dip Recovery opportunity score (0-10) from ATR-normalized ratios.
+
+        decline_ratio: how many ATR%s deep the tracked decline is (depth of
+            drop relative to normal volatility for this pair right now).
+        recovery_ratio: how many ATR%s the price has already bounced off its
+            local low.
+
+        Shared by _compute_opportunity_score's "dip_recovery" branch (fed
+        approximate ratios from auto_mode's bar history) AND
+        _strategy_dip_recovery's own explanation (fed its exact, precisely
+        tracked ratios) - one formula, two callers, so Auto Mode ranking and
+        the strategy's own "Opportunity score" diagnostic never disagree on
+        what a given setup is worth.
+
+        Low score (no real decline, e.g. sideways market): decline_ratio < 1.
+        Low score (already fully recovered / mature uptrend, nothing left to
+        catch): recovery_ratio > 3. Otherwise scales with both a real decline
+        having occurred AND an early reversal forming - the "sweet spot" this
+        strategy targets. A market still actively falling (recovery_ratio ~ 0)
+        scores low too: recovery_score is only ~2 until a bounce is underway.
+        """
+        def _clamp(v: float) -> float:
+            return max(0.0, min(10.0, v))
+
+        if decline_ratio < 1.0:
+            return _clamp(2.0)
+        if recovery_ratio > 3.0:
+            return _clamp(4.0)
+
+        decline_score = _clamp(decline_ratio * 2.0)          # ratio 2.5 -> 5, ratio 5 -> 10
+        recovery_score = _clamp(recovery_ratio * 3.0 + 2.0)  # ratio 0 -> 2, ratio 1 -> 5, ratio 2.67 -> 10
+        return _clamp(decline_score * 0.5 + recovery_score * 0.5)
 
     def _score_strategy(
         self,
@@ -5299,6 +6076,15 @@ class TradingEngine:
                 "priority": 0,
                 "typical_holding_time": "long",
                 "description": "Safe default accumulator for all market conditions"
+            },
+            "dip_recovery": {
+                # trend_down: the decline this strategy tracks a bottom during.
+                # volatility_expanding / volatility_high: sharp, fast moves are
+                #   exactly the setup it targets (pullback reversal, not a slow grind).
+                "allowed_regimes": ["trend_down", "volatility_expanding", "volatility_high"],
+                "priority": 3,
+                "typical_holding_time": "medium",
+                "description": "Buys confirmed reversals after significant declines - never buys a still-falling market"
             },
         }
 

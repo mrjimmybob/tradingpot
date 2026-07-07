@@ -67,6 +67,10 @@ STRATEGY_CAPACITY_CONFIG = {
         "max_portfolio_allocation_pct": None,  # DCA is fallback, never limited
         "max_concurrent_bots": None,
     },
+    "dip_recovery": {
+        "max_portfolio_allocation_pct": None,
+        "max_concurrent_bots": None,
+    },
 }
 
 

@@ -11,7 +11,9 @@ from ..models import (
     get_session, Bot, BotStatus, Order, Position, Trade, TaxLot, RealizedGain,
 )
 from ..services import trading_engine
-from ..services.trading_engine import BotStartError, validate_funding_carry_params
+from ..services.trading_engine import (
+    BotStartError, validate_funding_carry_params, validate_dip_recovery_params,
+)
 from ..services.decision_status import decision_status_store, DecisionState
 from ..services.diagnostics import diagnostics_store, BotDiagnostics
 from ..services.logging_service import ensure_bot_log_directory
@@ -24,6 +26,7 @@ router = APIRouter()
 # Keyed by strategy name; each returns a list of error strings.
 _STRATEGY_PARAM_VALIDATORS = {
     "funding_carry": validate_funding_carry_params,
+    "dip_recovery": validate_dip_recovery_params,
 }
 
 
