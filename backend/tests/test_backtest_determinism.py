@@ -361,6 +361,7 @@ async def run_deterministic_backtest(
                 action=action,
                 amount=trade_size * current_price,  # Amount in USDT
                 order_type="market",
+                expected_move_pct=0.01 if action == "buy" else None,
             )
 
             # Setup mock trade recorder

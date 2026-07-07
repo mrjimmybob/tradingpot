@@ -554,6 +554,7 @@ async def test_pnl_accounting_consistency():
         mock_cost_model_instance.estimate_cost = Mock(
             return_value=Mock(total_cost=0.1, exchange_fee=0.1, spread_cost=0.0, slippage_cost=0.0)
         )
+        mock_cost_model_instance.estimate_roundtrip_cost = Mock(return_value=0.1)
         MockCostModel.return_value = mock_cost_model_instance
 
         # Configure CSV export
@@ -578,7 +579,8 @@ async def test_pnl_accounting_consistency():
                     action="buy",
                     amount=trade_size_usd,
                     order_type="market",
-                    reason=f"Buy #{trade_counter[0]}"
+                    reason=f"Buy #{trade_counter[0]}",
+                    expected_move_pct=0.01,
                 )
             else:
                 # SELL - sell what we just bought
@@ -1108,8 +1110,9 @@ async def test_pnl_accounting_three_way_identity():
         mock_cost_model_instance.estimate_cost = Mock(
             return_value=Mock(total_cost=0.1, exchange_fee=0.1, spread_cost=0.0, slippage_cost=0.0)
         )
+        mock_cost_model_instance.estimate_roundtrip_cost = Mock(return_value=0.1)
         MockCostModel.return_value = mock_cost_model_instance
-        
+
         # Configure CSV export (no-op)
         mock_csv_instance = MockCSV.return_value
         mock_csv_instance.export_trade = AsyncMock()
@@ -1157,6 +1160,7 @@ async def test_pnl_accounting_three_way_identity():
             signal.action = action
             signal.symbol = bot.trading_pair
             signal.amount = btc_amount * fixed_price  # Convert BTC to USD
+            signal.expected_move_pct = 0.01 if action == "buy" else None
             
             try:
                 # Execute trade

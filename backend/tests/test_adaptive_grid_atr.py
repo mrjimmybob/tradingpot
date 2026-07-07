@@ -280,6 +280,7 @@ class TestTradeExecutionWithAtrSpacing:
         """Price closing below the ATR-derived L1 buy level must produce a buy."""
         engine = _engine()
         bot = _make_bot(55)
+        bot.exchange_fee = 0.0  # NO_FEE_PARAMS mode: match zero-fee params
         # ATR = bar_range since all bars have same range
         bar_range = 200.0
         bars = _make_bars(count=14, bar_range=bar_range)

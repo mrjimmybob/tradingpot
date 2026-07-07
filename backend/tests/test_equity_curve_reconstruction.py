@@ -447,6 +447,7 @@ async def test_equity_curve_reconstructed_from_ledger():
             signal.action = action
             signal.symbol = bot.trading_pair
             signal.amount = 20.0  # Large enough to pass minimum
+            signal.expected_move_pct = 0.01 if action == "buy" else None
 
             current_price = 100.0
 
@@ -1006,6 +1007,7 @@ async def test_equity_curve_reconstruction():
             signal.action = action
             signal.symbol = bot.trading_pair
             signal.amount = 20.0  # $20 per trade
+            signal.expected_move_pct = 0.01 if action == "buy" else None
             
             try:
                 # Execute trade

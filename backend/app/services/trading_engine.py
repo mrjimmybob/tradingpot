@@ -198,8 +198,10 @@ class TradeSignal:
     # Set by strategies that can estimate the distance to their profit target.
     # The central viability gate in _execute_trade uses this to verify that
     # expected_move > round_trip_fees + safety_margin before executing a BUY.
-    # None means the strategy provides no estimate and the gate is skipped
-    # (backward-compatible with strategies that have no profit-target model).
+    # REQUIRED for BUY signals (fail-closed gate): None causes the gate to
+    # reject the order with "missing expected move estimate". Strategies that
+    # have no quantitative profit-target model should not set this field; the
+    # gate will surface why the trade was blocked rather than allowing a blind buy.
     expected_move_pct: Optional[float] = None
 
 
@@ -1893,6 +1895,29 @@ class TradingEngine:
                     reason=f"Grid: Insufficient virtual cash for buy at level {nearest_level}"
                 )
 
+            # Viability pre-check: verify grid_spacing covers round-trip fees before
+            # mutating the virtual wallet. spacing / price = minimum profitable move
+            # from the buy level to the nearest sell level. This must exceed the
+            # configured fee threshold so the central gate does not later reject an
+            # order whose virtual state was already updated.
+            _grid_expected_move = grid_spacing / bar_close_price if bar_close_price > 0 else 0.0
+            _fee_raw_grid = getattr(bot, 'exchange_fee', 0.1)
+            _grid_fee_pct = (
+                float(_fee_raw_grid) if isinstance(_fee_raw_grid, (int, float)) else 0.1
+            ) / 100.0
+            _grid_min_move = 2.0 * _grid_fee_pct + _VIABILITY_SAFETY_MARGIN_PCT
+            if _grid_expected_move < _grid_min_move:
+                self._save_grid_state(bot.id, state)
+                return TradeSignal(
+                    action="hold",
+                    amount=0,
+                    reason=(
+                        f"Grid: spacing {_grid_expected_move * 100:.3f}% < "
+                        f"fee threshold {_grid_min_move * 100:.3f}% "
+                        f"(exchange_fee={_grid_fee_pct * 100:.2f}%)"
+                    ),
+                )
+
             # Execute virtual buy
             crypto_amount = order_size_usd / bar_close_price
             state["virtual_cash"] -= order_size_usd
@@ -1917,6 +1942,7 @@ class TradingEngine:
                 amount=order_size_usd,
                 order_type="market",
                 reason=f"Grid: Buy at level {nearest_level} (${bar_close_price:.2f}, depth={depth})",
+                expected_move_pct=_grid_expected_move,
             )
 
         else:
@@ -2496,7 +2522,7 @@ class TradingEngine:
             # default rather than propagating a non-numeric value into the check.
             _fee_raw = getattr(bot, 'exchange_fee', 0.1)
             _mr_fee_pct = (
-                (float(_fee_raw) if isinstance(_fee_raw, (int, float)) else 0.1) or 0.1
+                float(_fee_raw) if isinstance(_fee_raw, (int, float)) else 0.1
             ) / 100.0
             _mr_min_move = 2.0 * _mr_fee_pct + _VIABILITY_SAFETY_MARGIN_PCT
             if expected_move_pct < _mr_min_move:
@@ -2824,7 +2850,7 @@ class TradingEngine:
         # the fee hurdle).  Once bars are ready, the larger bar ATR takes over.
         _fee_raw_tf = getattr(bot, 'exchange_fee', 0.1)
         _fee_pct_tf = (
-            (float(_fee_raw_tf) if isinstance(_fee_raw_tf, (int, float)) else 0.1) or 0.1
+            float(_fee_raw_tf) if isinstance(_fee_raw_tf, (int, float)) else 0.1
         ) / 100.0
         _min_stop_pct = 2.0 * _fee_pct_tf + _VIABILITY_SAFETY_MARGIN_PCT
         atr = max(bar_atr, current_price * _min_stop_pct)
@@ -4019,6 +4045,29 @@ class TradingEngine:
                 rank = sorted_widths.index(min(sorted_widths, key=lambda x: abs(x - bb_width)))
                 percentile_rank = f"{int((rank / len(sorted_widths)) * 100)}th"
 
+            # Viability pre-check before state mutation: expected move = how far the
+            # price has already broken above the upper band (the measured breakout
+            # magnitude). A breakout is expected to continue at least this distance,
+            # making it the most conservative honest estimate available without
+            # inventing a price target. upper_gap is already computed above.
+            _vb_expected_move = upper_gap / current_price if current_price > 0 else 0.0
+            _fee_raw_vb = getattr(bot, 'exchange_fee', 0.1)
+            _vb_fee_pct = (
+                float(_fee_raw_vb) if isinstance(_fee_raw_vb, (int, float)) else 0.1
+            ) / 100.0
+            _vb_min_move = 2.0 * _vb_fee_pct + _VIABILITY_SAFETY_MARGIN_PCT
+            if _vb_expected_move < _vb_min_move:
+                self._volatility_breakout_states[bot.id] = state
+                return TradeSignal(
+                    action="hold",
+                    amount=0,
+                    reason=(
+                        f"Volatility Breakout: breakout {_vb_expected_move * 100:.3f}% < "
+                        f"fee threshold {_vb_min_move * 100:.3f}% "
+                        f"(exchange_fee={_vb_fee_pct * 100:.2f}%)"
+                    ),
+                )
+
             logger.info(
                 f"Bot {bot.id}: Volatility Breakout ENTRY - "
                 f"{state['compression_bars']} bars compression (BB width {percentile_rank} percentile), "
@@ -4042,6 +4091,7 @@ class TradingEngine:
                 amount=buy_amount,
                 order_type="market",
                 reason=f"Volatility Breakout: {state['compression_bars']} bars compression, breakout confirmed",
+                expected_move_pct=_vb_expected_move,
             )
 
         # Update state and hold (EXPLAINABLE REASONS)
@@ -4508,6 +4558,28 @@ class TradingEngine:
                     ),
                 )
 
+        # Viability pre-check before state mutation: expected move = distance from
+        # entry to the strategy's take-profit target (atr × take_profit_atr_mult).
+        # This is the genuine profit objective baked into the strategy — not
+        # invented — and must cover round-trip fees before we commit state.
+        _dr_expected_move = (atr * take_profit_atr_mult) / current_price if current_price > 0 else 0.0
+        _fee_raw_dr = getattr(bot, 'exchange_fee', 0.1)
+        _dr_fee_pct = (
+            float(_fee_raw_dr) if isinstance(_fee_raw_dr, (int, float)) else 0.1
+        ) / 100.0
+        _dr_min_move = 2.0 * _dr_fee_pct + _VIABILITY_SAFETY_MARGIN_PCT
+        if _dr_expected_move < _dr_min_move:
+            self._dip_recovery_states[bot.id] = state
+            return TradeSignal(
+                action="hold",
+                amount=0,
+                reason=(
+                    f"Dip Recovery: take-profit {_dr_expected_move * 100:.3f}% < "
+                    f"fee threshold {_dr_min_move * 100:.3f}% "
+                    f"(exchange_fee={_dr_fee_pct * 100:.2f}%)"
+                ),
+            )
+
         entry_price = current_price
         self._dip_recovery_states[bot.id] = {
             **self._dip_recovery_default_state(),
@@ -4533,6 +4605,7 @@ class TradingEngine:
                 f"Dip Recovery: Reversal confirmed ({recovery_percent:.2f}% >= "
                 f"{recovery_threshold:.2f}%) after decline - entering"
             ),
+            expected_move_pct=_dr_expected_move,
         )
 
     def _dip_recovery_exit_signal(
@@ -6415,7 +6488,7 @@ class TradingEngine:
         # propagating a non-numeric value into the cost model arithmetic.
         _exec_fee_raw = getattr(bot, 'exchange_fee', 0.1)
         _exec_fee_pct = (
-            (float(_exec_fee_raw) if isinstance(_exec_fee_raw, (int, float)) else 0.1) or 0.1
+            float(_exec_fee_raw) if isinstance(_exec_fee_raw, (int, float)) else 0.1
         )
         cost_model = get_cost_model(
             exchange_fee_pct=_exec_fee_pct,
@@ -6438,15 +6511,20 @@ class TradingEngine:
             f"slip=${cost_estimate.slippage_cost:.4f})"
         )
 
-        # === STEP 5.5: TRADE VIABILITY GATE ===
-        # Blocks BUY signals where the expected price move cannot cover round-trip
-        # fees + a small safety margin.  Sells are never blocked — they close open
-        # positions and must always be allowed to settle.
-        # Opt-in: only fires when the strategy supplies a real float expected_move_pct.
-        # Strategies without a profit-target model (DCA, grid, …) leave it None
-        # and bypass the gate, preserving their existing behavior.
-        # isinstance guard: tests that use Mock signals bypass this automatically.
-        if signal.action == "buy" and isinstance(signal.expected_move_pct, (int, float)):
+        # === STEP 5.5: TRADE VIABILITY GATE (fail-closed) ===
+        # Every BUY must supply a numeric expected_move_pct that clears round-trip
+        # fees + safety margin. Sells are never blocked — they close positions.
+        # Fail-closed: missing expected_move_pct is itself a rejection reason.
+        # Strategies that cannot quantify their edge should not be buying blind;
+        # the gate surfaces this as a diagnostic rather than silently allowing it.
+        if signal.action == "buy":
+            if not isinstance(signal.expected_move_pct, (int, float)):
+                reason = "missing expected move estimate — strategy did not provide expected_move_pct"
+                logger.warning(f"Bot {bot.id}: Trade REJECTED (viability) - {reason}")
+                diagnostics_store.record_blocked(bot.id, BLOCK_OTHER, reason)
+                await self._record_trade_outcome(bot, "viability_gate_rejected", reason)
+                return None
+
             rt_cost_usd = cost_model.estimate_roundtrip_cost(
                 notional_usd=signal.amount,
                 price=current_price,
@@ -6819,9 +6897,9 @@ class TradingEngine:
 
     def _cost_estimate_for(self, bot: Bot, action: str, notional: float, price: float):
         """Build a cost estimate for a recovered fill (mirrors _execute_trade)."""
-        cost_model = get_cost_model(
-            exchange_fee_pct=getattr(bot, 'exchange_fee', 0.0) or 0.0,
-        )
+        _fee_raw = getattr(bot, 'exchange_fee', 0.1)
+        _fee_pct = float(_fee_raw) if isinstance(_fee_raw, (int, float)) else 0.1
+        cost_model = get_cost_model(exchange_fee_pct=_fee_pct)
         return cost_model.estimate_cost(side=action, notional_usd=notional, price=price)
 
     async def _resolve_pending_orders(
@@ -7143,7 +7221,10 @@ class TradingEngine:
             logger.warning(f"Bot {bot_id}: _process_paper_trade called but no recovery state")
             return
 
-        taker_fee_rate = 0.001  # 0.1% per side
+        _fee_raw_pt = getattr(bot, 'exchange_fee', 0.1)
+        taker_fee_rate = (
+            float(_fee_raw_pt) if isinstance(_fee_raw_pt, (int, float)) else 0.1
+        ) / 100.0
 
         if signal.action == "buy":
             if recovery.get("paper_position") is None:

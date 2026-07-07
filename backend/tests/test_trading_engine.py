@@ -294,7 +294,7 @@ class TestMarketOrders:
         """Test market buy with explicit state transition verification."""
         # Arrange
         mock_exchange = MockExchangeService(should_fail=False)
-        signal = TradeSignal(action="buy", amount=1000.0, order_type="market")
+        signal = TradeSignal(action="buy", amount=1000.0, order_type="market", expected_move_pct=0.01)
         current_price = 50000.0
 
         # Initial state
@@ -689,7 +689,8 @@ class TestLimitOrders:
         # Arrange
         mock_exchange = MockExchangeService()
         signal = TradeSignal(
-            action="buy", amount=1000.0, order_type="limit", limit_price=49000.0
+            action="buy", amount=1000.0, order_type="limit", limit_price=49000.0,
+            expected_move_pct=0.01,
         )
         current_price = 50000.0
 
@@ -779,7 +780,7 @@ class TestPositionManagement:
         """Test that first buy creates a new position."""
         # Arrange
         mock_exchange = MockExchangeService()
-        signal = TradeSignal(action="buy", amount=1000.0, order_type="market")
+        signal = TradeSignal(action="buy", amount=1000.0, order_type="market", expected_move_pct=0.01)
         current_price = 50000.0
 
         # No existing position
@@ -839,7 +840,7 @@ class TestPositionManagement:
         """Test that second buy increases position size and updates average price."""
         # Arrange
         mock_exchange = MockExchangeService()
-        signal = TradeSignal(action="buy", amount=2000.0, order_type="market")
+        signal = TradeSignal(action="buy", amount=2000.0, order_type="market", expected_move_pct=0.01)
         current_price = 52000.0
 
         # Existing position: 0.5 BTC @ 48000
@@ -1073,7 +1074,7 @@ class TestRejectionsAndFailures:
         """Test order rejected by portfolio risk check."""
         # Arrange
         mock_exchange = MockExchangeService()
-        signal = TradeSignal(action="buy", amount=1000.0, order_type="market")
+        signal = TradeSignal(action="buy", amount=1000.0, order_type="market", expected_move_pct=0.01)
         current_price = 50000.0
 
         # Mock portfolio risk rejection
@@ -1111,7 +1112,7 @@ class TestRejectionsAndFailures:
         """Test order rejected by strategy capacity check."""
         # Arrange
         mock_exchange = MockExchangeService()
-        signal = TradeSignal(action="buy", amount=1000.0, order_type="market")
+        signal = TradeSignal(action="buy", amount=1000.0, order_type="market", expected_move_pct=0.01)
         current_price = 50000.0
 
         # Portfolio risk passes
@@ -1155,7 +1156,7 @@ class TestRejectionsAndFailures:
         """Test order rejected by exchange (returns None)."""
         # Arrange
         mock_exchange = MockExchangeService(should_fail=True)
-        signal = TradeSignal(action="buy", amount=1000.0, order_type="market")
+        signal = TradeSignal(action="buy", amount=1000.0, order_type="market", expected_move_pct=0.01)
         current_price = 50000.0
 
         with patch(
@@ -1187,7 +1188,7 @@ class TestRejectionsAndFailures:
         """Test that transaction is rolled back on invariant validation failure."""
         # Arrange
         mock_exchange = MockExchangeService()
-        signal = TradeSignal(action="buy", amount=1000.0, order_type="market")
+        signal = TradeSignal(action="buy", amount=1000.0, order_type="market", expected_move_pct=0.01)
         current_price = 50000.0
 
         mock_trade = create_mock_trade(
@@ -1335,7 +1336,7 @@ class TestPartialFills:
         """Test that partial fills are recorded correctly."""
         # Arrange - 50% fill
         mock_exchange = MockExchangeService(partial_fill_ratio=0.5)
-        signal = TradeSignal(action="buy", amount=1000.0, order_type="market")
+        signal = TradeSignal(action="buy", amount=1000.0, order_type="market", expected_move_pct=0.01)
         current_price = 50000.0
 
         # Expected: requested 0.02 BTC, filled 0.01 BTC
@@ -1400,7 +1401,7 @@ class TestLedgerIntegration:
         """Test that buy orders create tax lots via tax engine."""
         # Arrange
         mock_exchange = MockExchangeService()
-        signal = TradeSignal(action="buy", amount=1000.0, order_type="market")
+        signal = TradeSignal(action="buy", amount=1000.0, order_type="market", expected_move_pct=0.01)
         current_price = 50000.0
 
         mock_trade = create_mock_trade(
@@ -1540,7 +1541,7 @@ class TestLedgerIntegration:
         """Test that trading fees are calculated and applied."""
         # Arrange
         mock_exchange = MockExchangeService()
-        signal = TradeSignal(action="buy", amount=1000.0, order_type="market")
+        signal = TradeSignal(action="buy", amount=1000.0, order_type="market", expected_move_pct=0.01)
         current_price = 50000.0
 
         buy_amount = 1000.0 / 50000.0  # 0.02 BTC
@@ -1609,7 +1610,7 @@ class TestEdgeCases:
         # Arrange - Bot has position from old strategy
         mock_bot.strategy = "new_strategy"  # Strategy changed
         mock_exchange = MockExchangeService()
-        signal = TradeSignal(action="buy", amount=1000.0, order_type="market")
+        signal = TradeSignal(action="buy", amount=1000.0, order_type="market", expected_move_pct=0.01)
         current_price = 50000.0
 
         # Position exists from old strategy
@@ -1686,7 +1687,7 @@ class TestEdgeCases:
         mock_bot.current_balance = 100000.0  # High balance
         mock_exchange = MockExchangeService()
         signal = TradeSignal(
-            action="buy", amount=50000.0, order_type="market"
+            action="buy", amount=50000.0, order_type="market", expected_move_pct=0.01
         )  # Large order
         current_price = 50000.0
 
@@ -1742,6 +1743,7 @@ class TestEdgeCases:
         bot1.current_balance = 10000.0
         bot1.is_dry_run = True
         bot1.is_simulated = True
+        bot1.exchange_fee = 0.1
 
         bot2 = Mock(spec=Bot)
         bot2.id = 2
@@ -1751,10 +1753,11 @@ class TestEdgeCases:
         bot2.current_balance = 5000.0
         bot2.is_dry_run = True
         bot2.is_simulated = True
+        bot2.exchange_fee = 0.1
 
         mock_exchange = MockExchangeService()
-        signal1 = TradeSignal(action="buy", amount=1000.0, order_type="market")
-        signal2 = TradeSignal(action="buy", amount=500.0, order_type="market")
+        signal1 = TradeSignal(action="buy", amount=1000.0, order_type="market", expected_move_pct=0.01)
+        signal2 = TradeSignal(action="buy", amount=500.0, order_type="market", expected_move_pct=0.01)
 
         mock_trade1 = create_mock_trade(trade_id=1, bot_id=bot1.id)
         mock_trade2 = create_mock_trade(trade_id=2, bot_id=bot2.id)

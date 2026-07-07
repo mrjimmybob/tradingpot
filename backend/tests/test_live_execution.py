@@ -142,7 +142,7 @@ class TestLiveFillAccuracy:
     ):
         """Trade record and position update use filled, not requested, amount."""
         exchange = FakeExchange(filled_ratio=0.5)
-        signal = TradeSignal(action="buy", amount=1000.0, order_type="market")
+        signal = TradeSignal(action="buy", amount=1000.0, order_type="market", expected_move_pct=0.01)
 
         requested = 1000.0 / 50000.0  # 0.02
         expected_filled = requested * 0.5
@@ -170,7 +170,7 @@ class TestLiveFillAccuracy:
     ):
         """Fee asset comes from the exchange response, not assumed quote."""
         exchange = FakeExchange(fee_currency="BTC")
-        signal = TradeSignal(action="buy", amount=1000.0, order_type="market")
+        signal = TradeSignal(action="buy", amount=1000.0, order_type="market", expected_move_pct=0.01)
 
         with ExitStack() as stack:
             for p in service_patches(mock_services):
@@ -192,7 +192,7 @@ class TestLiveFillAccuracy:
     ):
         """Missing fee currency in the response falls back to the quote asset."""
         exchange = FakeExchange(fee_currency=None)
-        signal = TradeSignal(action="buy", amount=1000.0, order_type="market")
+        signal = TradeSignal(action="buy", amount=1000.0, order_type="market", expected_move_pct=0.01)
 
         with ExitStack() as stack:
             for p in service_patches(mock_services):

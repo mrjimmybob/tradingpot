@@ -653,6 +653,7 @@ async def test_trade_ledger_audit_trail():
             signal.action = action
             signal.symbol = bot.trading_pair
             signal.amount = 20.0  # Fixed amount (large enough to pass $10 minimum)
+            signal.expected_move_pct = 0.01 if action == "buy" else None
 
             current_price = 100.0
 
