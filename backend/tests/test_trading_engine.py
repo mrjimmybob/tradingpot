@@ -69,7 +69,7 @@ class MockExchangeService:
         """Mock connect method."""
         pass
 
-    async def place_market_order(self, trading_pair: str, side, amount: float):
+    async def place_market_order(self, trading_pair: str, side, amount: float, reference_price: float = None):
         """Mock market order placement with validation."""
         if self.should_fail:
             return None

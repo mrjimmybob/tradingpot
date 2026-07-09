@@ -525,6 +525,7 @@ class ExchangeService:
         symbol: str,
         side: OrderSide,
         amount: float,
+        reference_price: Optional[float] = None,
     ) -> Optional[ExchangeOrder]:
         """Place a market order.
 
@@ -532,6 +533,12 @@ class ExchangeService:
             symbol: Trading pair symbol
             side: Buy or sell
             amount: Amount to trade (in base currency)
+            reference_price: The price the caller's decision was made against.
+                Unused here — a real market order on a live exchange fills at
+                whatever price the exchange gives it, which is correct and
+                expected. Accepted only for interface parity with
+                SimulatedExchangeService.place_market_order, where it matters
+                (see that method's docstring).
 
         Returns:
             Order result or None if failed
@@ -831,15 +838,53 @@ class SimulatedExchangeService(ExchangeService):
         symbol: str,
         side: OrderSide,
         amount: float,
+        reference_price: Optional[float] = None,
     ) -> Optional[ExchangeOrder]:
-        """Place simulated market order."""
-        self.last_order_error = None
-        ticker = await self.get_ticker(symbol)
-        if not ticker:
-            self.last_order_error = f"market data unavailable for {symbol}"
-            return None
+        """Place simulated market order.
 
-        price = ticker.ask if side == OrderSide.BUY else ticker.bid
+        Args:
+            reference_price: The price the caller's trading decision was made
+                against (i.e. the same ticker.last the strategy evaluated its
+                entry/exit signal with). When provided, the fill happens AT
+                this price instead of independently re-fetching a ticker.
+
+                Root cause this closes: this method used to call
+                ``get_ticker()`` again on every order, fetching a SECOND, real,
+                independently-timed market snapshot and filling at its
+                bid/ask. That second fetch is decoupled from the decision that
+                triggered the order — separated by an unbounded number of
+                intervening awaits (portfolio risk checks, capacity checks,
+                DB writes) with a ticker cache TTL that may or may not still
+                be warm. The result: a decision made at price X could fill at
+                a materially different price with no relationship to a
+                modeled spread or slippage assumption (observed: a Dip
+                Recovery exit whose reason text quoted "PnL -0.07%" off the
+                decision price actually realized -0.55%, and another quoted
+                "-0.04%" actually realized -1.01% — both round-trip fee
+                multiples, not spread noise).
+
+                Filling at the decision's own reference price makes the
+                simulated fill deterministic and bounds it to exactly what the
+                strategy priced its decision against — "use the decision
+                tick", the safer of the two remedies for a *simulated*
+                exchange (the alternative, modeling an explicit spread/
+                slippage constant, would need a real, cited number, not one
+                invented to fit this dataset).
+
+                None (default) preserves the prior fetch-based behavior for
+                callers that have no live decision price to hand in (e.g.
+                direct/manual order placement, existing tests).
+        """
+        self.last_order_error = None
+        if reference_price is not None:
+            price = reference_price
+        else:
+            ticker = await self.get_ticker(symbol)
+            if not ticker:
+                self.last_order_error = f"market data unavailable for {symbol}"
+                return None
+            price = ticker.ask if side == OrderSide.BUY else ticker.bid
+
         cost = amount * price
         fee = cost * 0.001  # 0.1% fee
 
@@ -900,9 +945,17 @@ class SimulatedExchangeService(ExchangeService):
         amount: float,
         price: float,
     ) -> Optional[ExchangeOrder]:
-        """Place simulated limit order (immediately filled for simplicity)."""
-        # For simulation, treat limit orders as immediately filled
-        return await self.place_market_order(symbol, side, amount)
+        """Place simulated limit order (immediately filled for simplicity).
+
+        Previously ignored its own ``price`` argument entirely and fell
+        through to place_market_order's independent ticker re-fetch — the
+        same decision-vs-fill divergence bug as the market-order path (see
+        SimulatedExchangeService.place_market_order's reference_price
+        docstring), except here the caller had *already specified* the exact
+        price it wanted and it was discarded anyway. The caller's price is
+        now honored directly as the fill's reference price.
+        """
+        return await self.place_market_order(symbol, side, amount, reference_price=price)
 
     async def cancel_order(self, order_id: str, symbol: str) -> bool:
         """Cancel simulated order."""

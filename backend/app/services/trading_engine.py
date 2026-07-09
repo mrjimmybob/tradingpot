@@ -70,6 +70,15 @@ _BUY_BALANCE_FRACTION = 0.998
 # is a catastrophe filter, not a profitability predictor.
 _VIABILITY_SAFETY_MARGIN_PCT = 0.0005
 
+# Minimum acceptable reward:risk ratio for directional BUY signals that supply
+# expected_risk_pct (distance to their own locked stop). Forensic review of
+# closed trades found average losses running ~3x average wins (stops sized
+# independently of targets); this ties them together at the gate so no
+# directional strategy can risk materially more than it targets to gain.
+# Strategies without a fixed price target (no locked stop to measure risk
+# against) leave expected_risk_pct=None and are unaffected by this check.
+_MIN_REWARD_RISK_RATIO = 1.5
+
 
 # Repeated-rejection circuit breaker. When the SAME executable trade is rejected
 # or fails for the SAME reason this many consecutive times, the bot is paused and
@@ -229,11 +238,69 @@ class TradeSignal:
     # instead of requiring a price-target estimate.
     expected_move_pct: Optional[float] = None
 
+    # Expected adverse move to the strategy's own stop-loss, as a fraction of
+    # current price (same units as expected_move_pct — the "reward" side).
+    # Set by directional strategies that already compute a locked stop at
+    # entry (mean_reversion, dip_recovery). When present, the viability gate
+    # additionally enforces a minimum reward:risk ratio
+    # (expected_move_pct / expected_risk_pct >= _MIN_REWARD_RISK_RATIO).
+    # Leave as None for strategies with no fixed price target (trend_following,
+    # volatility_breakout ride a trend/breakout with no take-profit level, so a
+    # reward:risk ratio is not well-defined) or accumulation strategies — those
+    # keep the pre-existing fee-only viability check, unchanged.
+    expected_risk_pct: Optional[float] = None
+
     # True for accumulation strategies (DCA, grid-like) that build position
     # without a per-trade directional price target. The viability gate applies
     # a fee sanity check (fee % < _MAX_ACCUMULATION_FEE_PCT) instead of the
     # directional edge check used for is_accumulation=False signals.
     is_accumulation: bool = False
+
+
+def evaluate_reward_risk(
+    expected_move_pct: Optional[float],
+    expected_risk_pct: Optional[float],
+    min_ratio: float = _MIN_REWARD_RISK_RATIO,
+) -> tuple:
+    """Evaluate a directional BUY signal's reward:risk ratio for the viability gate.
+
+    Single implementation of the reward:risk check, used by the central gate in
+    _execute_trade and unit-tested independently of a running bot/engine.
+
+    Args:
+        expected_move_pct: Reward side — distance to the strategy's profit
+            target, as a fraction of price (same convention as the existing
+            fee-viability check).
+        expected_risk_pct: Risk side — distance to the strategy's own locked
+            stop, as a fraction of price. None means the strategy has no fixed
+            stop to measure risk against (e.g. a trend-following exit with no
+            price target) — the check is a no-op in that case, preserving the
+            pre-existing fee-only viability behavior.
+        min_ratio: Minimum acceptable reward:risk ratio.
+
+    Returns:
+        (ok, reason) — reason is "" when ok is True.
+    """
+    if expected_risk_pct is None:
+        return True, ""
+    if not isinstance(expected_risk_pct, (int, float)) or expected_risk_pct <= 0:
+        return False, (
+            f"invalid risk estimate ({expected_risk_pct}) — stop must be strictly "
+            "below entry for a long"
+        )
+    reward = expected_move_pct if isinstance(expected_move_pct, (int, float)) else 0.0
+    if reward <= 0:
+        return False, (
+            f"invalid reward estimate ({reward * 100:.3f}%) — target must be "
+            "strictly above entry for a long"
+        )
+    ratio = reward / expected_risk_pct
+    if ratio < min_ratio:
+        return False, (
+            f"reward:risk {ratio:.2f} (reward {reward * 100:.3f}% / "
+            f"risk {expected_risk_pct * 100:.3f}%) < minimum {min_ratio:.2f}"
+        )
+    return True, ""
 
 
 def validate_funding_carry_params(params: dict) -> list:
@@ -1102,8 +1169,12 @@ class TradingEngine:
         Regime-aware by default: Can pause during unfavorable market conditions
         (e.g., strong downtrends) to protect capital.
 
-        WARNING: Do NOT use this strategy inside auto_mode. DCA is clock-driven
-        and conflicts with regime-based strategy rotation.
+        Auto Mode may select this strategy (it is the designated fallback -
+        see _get_strategy_capabilities): that is a SUPERVISED call, routed
+        through _strategy_auto's own eligibility/regime/scoring gate, and is
+        allowed. What remains blocked is an UNSUPERVISED direct call on an
+        auto_mode bot (bypassing that gate entirely) - DCA's clock-driven,
+        never-sell behaviour is still a poor fit run that way.
 
         Parameters:
             interval_minutes: Time between buys (default: 60)
@@ -1113,16 +1184,24 @@ class TradingEngine:
             regime_filter_enabled: Enable regime filter to pause during bad conditions (default: True)
             allowed_regimes: List of allowed trend states (default: ["trend_up", "trend_flat"])
         """
-        # Defensive check: Block usage inside auto_mode
-        if bot.strategy == "auto_mode":
+        # Defensive check: block DIRECT/unsupervised use of DCA on an
+        # auto_mode bot. bot.strategy alone can't tell us that - it reads
+        # "auto_mode" for every Auto-managed bot regardless of which
+        # sub-strategy Auto has actually selected, since Auto dispatches
+        # sub-strategies using the same bot object. _strategy_auto marks its
+        # own dispatch calls explicitly via params["_invoked_by_auto"], so a
+        # supervised call (Auto selected DCA itself) is let through while a
+        # call that bypasses Auto's gate entirely is still blocked.
+        if bot.strategy == "auto_mode" and not params.get("_invoked_by_auto"):
             logger.warning(
-                f"Bot {bot.id}: DCA strategy invoked inside auto_mode. "
-                f"This is NOT recommended - DCA conflicts with regime-based rotation."
+                f"Bot {bot.id}: DCA strategy invoked directly on an auto_mode bot, "
+                f"bypassing Auto Mode's own supervision. This is NOT recommended - "
+                f"DCA conflicts with unsupervised regime-based rotation."
             )
             return TradeSignal(
                 action="hold",
                 amount=0,
-                reason="DCA: Not intended for use inside auto_mode"
+                reason="DCA: Not intended for direct/unsupervised use inside auto_mode"
             )
 
         interval_minutes = params.get("interval_minutes", 60)
@@ -2117,6 +2196,7 @@ class TradingEngine:
             "current_bar": None,  # Bar being built
             "entry_price": None,
             "entry_atr": None,  # LOCKED at entry - risk never expands
+            "target_price": None,  # LOCKED at entry - profit target never moves
             "hard_stop": None,  # ATR-based hard stop
             "bars_since_entry": 0,  # Time stop counter
             "last_exit_time": None,  # For cooldown
@@ -2402,6 +2482,7 @@ class TradingEngine:
                     # Clear state
                     state["entry_price"] = None
                     state["entry_atr"] = None
+                    state["target_price"] = None
                     state["hard_stop"] = None
                     state["bars_since_entry"] = 0
                     state["last_exit_time"] = datetime.utcnow()
@@ -2415,25 +2496,34 @@ class TradingEngine:
                     )
 
                 # === EXIT CONDITION 2: Mean Reached (TARGET) ===
-                # Determine exit level
-                if exit_at_mean:
-                    exit_level = sma
-                    exit_label = "mean"
-                else:
-                    exit_level = upper_band
-                    exit_label = "upper band"
+                # CRITICAL: Use the LOCKED target_price recorded at entry, never a
+                # freshly recomputed sma/upper_band. Mean reversion enters while
+                # price is declining into the lower band, so a live-recomputed sma
+                # keeps drifting down with it — "mean reached" would then fire the
+                # moment price stops falling, regardless of whether it ever
+                # recovered toward the level that made the trade worth taking.
+                # That silently turns the take-profit exit into a breakeven-or-worse
+                # exit. Locking the target the same way entry_atr/hard_stop are
+                # already locked closes that hole. Legacy positions opened before
+                # this field existed fall back to the current sma/upper_band once,
+                # same convention as the entry_atr_locked fallback above.
+                exit_label = "mean" if exit_at_mean else "upper band"
+                target_price = state.get("target_price")
+                if target_price is None:
+                    target_price = sma if exit_at_mean else upper_band
 
-                if last_bar_close >= exit_level:
+                if last_bar_close >= target_price:
                     sell_amount = pos.amount * current_price
 
                     logger.info(
                         f"Bot {bot.id}: Mean Reversion EXIT (target reached) - "
-                        f"Bar close ${last_bar_close:.2f} >= {exit_label} ${exit_level:.2f}"
+                        f"Bar close ${last_bar_close:.2f} >= locked {exit_label} target ${target_price:.2f}"
                     )
 
                     # Clear state
                     state["entry_price"] = None
                     state["entry_atr"] = None
+                    state["target_price"] = None
                     state["hard_stop"] = None
                     state["bars_since_entry"] = 0
                     state["last_exit_time"] = datetime.utcnow()
@@ -2443,7 +2533,7 @@ class TradingEngine:
                         action="sell",
                         amount=sell_amount,
                         order_type="market",
-                        reason=f"Mean Reversion: {exit_label} reached (${exit_level:.2f})",
+                        reason=f"Mean Reversion: {exit_label} reached (${target_price:.2f})",
                     )
 
                 # === EXIT CONDITION 3: Hard Stop (ATR-BASED) ===
@@ -2460,6 +2550,7 @@ class TradingEngine:
                     # Clear state
                     state["entry_price"] = None
                     state["entry_atr"] = None
+                    state["target_price"] = None
                     state["hard_stop"] = None
                     state["bars_since_entry"] = 0
                     state["last_exit_time"] = datetime.utcnow()
@@ -2485,6 +2576,7 @@ class TradingEngine:
                     # Clear state
                     state["entry_price"] = None
                     state["entry_atr"] = None
+                    state["target_price"] = None
                     state["hard_stop"] = None
                     state["bars_since_entry"] = 0
                     state["last_exit_time"] = datetime.utcnow()
@@ -2507,7 +2599,7 @@ class TradingEngine:
             return TradeSignal(
                 action="hold",
                 amount=0,
-                reason=f"Mean Reversion: Holding, target ${exit_level:.2f}, stop {stop_str}, bars {state['bars_since_entry']}/{max_hold_bars}"
+                reason=f"Mean Reversion: Holding, target ${target_price:.2f}, stop {stop_str}, bars {state['bars_since_entry']}/{max_hold_bars}"
             )
 
         # === ENTRY LOGIC (BAR-BASED) ===
@@ -2596,12 +2688,26 @@ class TradingEngine:
                 f"Entry ATR locked at ${atr:.4f}, Position: ${buy_amount:.2f}"
             )
 
-            # Initialize state with LOCKED entry_atr and hard stop
+            # Initialize state with LOCKED entry_atr, hard stop, AND target.
+            # target_price is locked here (not recomputed from a live sma on every
+            # tick) so the take-profit exit cannot decay into a moving-loss exit —
+            # see the "mean reached" exit condition below for the failure mode
+            # this closes.
+            locked_target = sma if exit_at_mean else upper_band
+            locked_stop = current_price - (atr * atr_stop_mult)
             state["entry_price"] = current_price
             state["entry_atr"] = atr  # LOCKED - stop distance will always use this
-            state["hard_stop"] = current_price - (atr * atr_stop_mult)
+            state["target_price"] = locked_target  # LOCKED - profit target never moves
+            state["hard_stop"] = locked_stop
             state["bars_since_entry"] = 0
             self._mean_reversion_states[bot.id] = state
+
+            # Risk/reward at entry, in the same units as expected_move_pct (reward)
+            # so the execution-layer viability gate can enforce a minimum RR ratio
+            # without any strategy-specific logic of its own.
+            expected_risk_pct = (
+                (current_price - locked_stop) / current_price if current_price > 0 else 0.0
+            )
 
             return TradeSignal(
                 action="buy",
@@ -2609,6 +2715,7 @@ class TradingEngine:
                 order_type="market",
                 reason=f"Mean Reversion: Entry at lower band (${lower_band:.2f})",
                 expected_move_pct=expected_move_pct,
+                expected_risk_pct=expected_risk_pct,
             )
 
         # Update state and hold
@@ -4623,6 +4730,12 @@ class TradingEngine:
             f"ATR ${atr:.4f}, Position ${buy_amount:.2f}"
         )
 
+        # Risk side for the reward:risk viability check: distance to the
+        # INITIAL trailing stop (atr × trailing_atr_mult) — the first exit that
+        # would trigger on adverse movement, not the wider emergency_stop
+        # (a last-resort net beyond the trailing stop, not the intended risk).
+        _dr_expected_risk = (atr * trailing_atr_mult) / current_price if current_price > 0 else 0.0
+
         return TradeSignal(
             action="buy", amount=buy_amount, order_type="market",
             reason=(
@@ -4630,6 +4743,7 @@ class TradingEngine:
                 f"{recovery_threshold:.2f}%) after decline - entering"
             ),
             expected_move_pct=_dr_expected_move,
+            expected_risk_pct=_dr_expected_risk,
         )
 
     def _dip_recovery_exit_signal(
@@ -4985,31 +5099,45 @@ class TradingEngine:
         # Sort by final score (descending)
         scored_strategies.sort(key=lambda x: x[1], reverse=True)
 
+        # === POSITION CHECK ===
+        # Needed to separate entry eligibility (should Auto allocate NEW capital
+        # to this strategy) from exit management (should an OPEN position be
+        # closed). These are different questions - see FORCE-EXIT CHECK below.
+        open_positions = await self._get_bot_positions(bot.id, session)
+        has_open_position = len(open_positions) > 0
+
         # === FORCE-EXIT CHECK ===
+        # _is_strategy_eligible() is an ENTRY ALLOCATION GATE ONLY (regime match,
+        # cooldown, blacklist, kill switch) - it answers "should Auto put new
+        # capital into this strategy right now?", not "should an existing
+        # position be closed?" A strategy that entered correctly owns its own
+        # exit rules (trailing stop, target reached, trend break, failed
+        # breakout, time stop, strategy-specific invalidation) and must be
+        # allowed to finish its trade even after the market moves out of its
+        # entry regime. Auto Mode used to market-sell ("FORCE EXIT") the
+        # instant the current strategy's entry regime rotated out, closing
+        # positions before their own exit logic ever ran.
         current_strategy = auto_state["current_strategy"]
-        force_exit_signal = None
+        current_ineligible = current_strategy not in eligible_strategies
+        pinned_for_exit = current_ineligible and has_open_position
 
-        # Check if current strategy is ineligible
-        if current_strategy not in eligible_strategies:
-            force_exit_reason = ineligible_reasons.get(current_strategy, "unknown")
-            logger.warning(
-                f"Bot {bot.id}: Auto Mode FORCE EXIT - {current_strategy} became ineligible: {force_exit_reason}"
+        if pinned_for_exit:
+            # Keep running the current strategy's own executor below so it
+            # manages the open position with its own exit rules. Losing entry
+            # eligibility because the market regime moved on is normal and is
+            # NOT a strategy failure - do not record a failure, cooldown, or
+            # blacklist for it (see Fix 2 / _record_strategy_failure).
+            ineligible_reason = ineligible_reasons.get(current_strategy, "unknown")
+            logger.info(
+                f"Bot {bot.id}: Auto Mode - {current_strategy} lost entry eligibility "
+                f"({ineligible_reason}) but has an open position; delegating to its own "
+                f"exit rules instead of force-selling."
             )
-            force_exit_signal = TradeSignal(
-                action="sell",
-                amount=0,  # Sell all
-                reason=f"Auto Mode FORCE EXIT: {current_strategy} ineligible ({force_exit_reason})"
-            )
-
-            # Record failure
-            await self._record_strategy_failure(
-                bot_id=bot.id,
-                auto_state=auto_state,
-                strategy_name=current_strategy,
-                reason=force_exit_reason,
-                now=now,
-                cooldown_hours=cooldown_hours_default,
-                session=session
+        elif current_ineligible:
+            logger.info(
+                f"Bot {bot.id}: Auto Mode - {current_strategy} lost entry eligibility "
+                f"({ineligible_reasons.get(current_strategy, 'unknown')}); no open position "
+                f"to protect, reallocating."
             )
 
         # === STRATEGY SELECTION WITH HYSTERESIS ===
@@ -5023,8 +5151,16 @@ class TradingEngine:
         should_switch = False
         switch_reason = ""
 
-        if current_strategy not in eligible_strategies:
-            # Hard switch: current strategy is ineligible (regime change, kill switch, etc.)
+        if pinned_for_exit:
+            # Do not reallocate while an ineligible strategy still holds a
+            # position - it keeps running (and executing below) until its own
+            # exit rules close it out.
+            switch_reason = (
+                f"{current_strategy} not entry-eligible but holding an open position; "
+                f"pinned until its own exit rules close it"
+            )
+        elif current_ineligible:
+            # No open position to protect - free to reallocate immediately.
             selected_strategy = best_strategy
             should_switch = True
             switch_reason = f"current strategy ineligible, switching to {best_strategy}"
@@ -5120,7 +5256,7 @@ class TradingEngine:
             exp.candidate({
                 "strategy": _name,
                 "opportunity": None, "performance": None, "risk": None, "final": None,
-                "eligible": False, "selected": False, "reason": _reason,
+                "eligible": False, "selected": _name == current_strategy, "reason": _reason,
             })
         exp.select(current_strategy)
         exp.update({
@@ -5128,20 +5264,16 @@ class TradingEngine:
             "selected_strategy": current_strategy,
             "switch_reason": switch_reason,
             "eligible_count": len(eligible_strategies),
+            "pinned_for_exit": pinned_for_exit,
         })
         exp.check(
             "Strategy selected", current_strategy,
             "highest final score among eligible", True, detail=switch_reason,
         )
-        # On force-exit there is no sub-strategy delegation below to set a state,
-        # so stamp it here. Otherwise the selected sub-strategy sets its own state.
-        if force_exit_signal:
-            exp.state("FORCE_EXIT")
         # ---------------------------------------------------------------------
-
-        # === FORCE EXIT EXECUTION ===
-        if force_exit_signal:
-            return force_exit_signal
+        # No force-exit branch here anymore: the selected strategy's own
+        # executor always runs below and sets its own state (including exit
+        # states like WAITING_EXIT/LONG_OPEN when pinned_for_exit is true).
 
         # === STRATEGY EXECUTION ===
         strategy_executor = self._get_strategy_executor(current_strategy)
@@ -5154,8 +5286,17 @@ class TradingEngine:
                 reason=f"Auto Mode: Invalid strategy {current_strategy}"
             )
 
-        # Execute the selected strategy
-        signal = await strategy_executor(bot, current_price, params, session)
+        # Execute the selected strategy. Mark this call as coming through
+        # Auto's own supervised dispatch - as opposed to some future direct/
+        # unsupervised call - so a sub-strategy can tell the difference from
+        # bot.strategy alone. bot.strategy reads "auto_mode" for every
+        # Auto-managed bot no matter which sub-strategy is currently
+        # selected, so it cannot answer "am I being run under supervision?"
+        # by itself (see _strategy_dca's own guard). Copied, not mutated, so
+        # the caller's params dict is never altered.
+        dispatched_params = dict(params)
+        dispatched_params["_invoked_by_auto"] = True
+        signal = await strategy_executor(bot, current_price, dispatched_params, session)
 
         if signal:
             # Add auto mode context to reason
@@ -5171,6 +5312,59 @@ class TradingEngine:
                 self._save_auto_state(bot.id, auto_state)
 
         return signal
+
+    def _classify_trend_state(self, ema_short: list, ema_long: list) -> str:
+        """Classify trend_state ("up"/"down"/"flat") from EMA-20 vs EMA-50 using
+        both a fast and a medium lookback slope of the short EMA.
+
+        A fast-only slope (few bars back) only sees short-term momentum, so a
+        slow but sustained move - a multi-hour grind that never produces a
+        sharp short-term kink - is invisible to it and gets classified "flat"
+        even though it is a real, persistent trend. The medium slope looks
+        further back along the same EMA series so a sustained move is caught
+        even when every short slice looks flat, while genuine chop still nets
+        out near zero over the medium window and stays "flat" too. Both
+        windows are expressed in bar counts, not fixed durations, so this
+        scales with whatever bar interval the caller is aggregating at rather
+        than being tuned to one asset's typical move size or a fixed calendar
+        horizon like "24h".
+        """
+        n = len(ema_short)
+        ema_now = ema_short[-1]
+        ema_long_now = ema_long[-1]
+
+        FAST_LOOKBACK = 5
+        FAST_THRESHOLD_PCT = 0.5
+        MEDIUM_LOOKBACK = min(n - 1, 30)
+        MEDIUM_THRESHOLD_PCT = 1.0
+
+        fast_prev = ema_short[-FAST_LOOKBACK] if n >= FAST_LOOKBACK else ema_short[0]
+        fast_slope_pct = (
+            (ema_now - fast_prev) / fast_prev * 100 if fast_prev > 0 else 0.0
+        )
+
+        if MEDIUM_LOOKBACK > FAST_LOOKBACK:
+            medium_prev = ema_short[-MEDIUM_LOOKBACK]
+            medium_slope_pct = (
+                (ema_now - medium_prev) / medium_prev * 100 if medium_prev > 0 else 0.0
+            )
+        else:
+            medium_slope_pct = fast_slope_pct
+
+        is_up = (
+            (fast_slope_pct > FAST_THRESHOLD_PCT or medium_slope_pct > MEDIUM_THRESHOLD_PCT)
+            and ema_now > ema_long_now
+        )
+        is_down = (
+            (fast_slope_pct < -FAST_THRESHOLD_PCT or medium_slope_pct < -MEDIUM_THRESHOLD_PCT)
+            and ema_now < ema_long_now
+        )
+
+        if is_up:
+            return "up"
+        if is_down:
+            return "down"
+        return "flat"
 
     def _detect_market_regime(self, price_history: list, current_regime: Optional[dict]) -> dict:
         """Detect market regime from a plain price series (tick/close prices).
@@ -5203,20 +5397,11 @@ class TradingEngine:
         if n < 20:
             return neutral
 
-        # === TREND STATE (EMA slope, same thresholds as bar-based variant) ===
+        # === TREND STATE (fast + medium EMA slope, same thresholds as bar-based variant) ===
         ema_20 = self._calculate_ema(prices, 20)
         ema_50 = self._calculate_ema(prices, 50) if n >= 50 else ema_20
 
-        ema_20_current = ema_20[-1]
-        ema_20_prev = ema_20[-5] if len(ema_20) >= 5 else ema_20[0]
-        ema_slope_pct = ((ema_20_current - ema_20_prev) / ema_20_prev) * 100 if ema_20_prev > 0 else 0
-
-        if ema_slope_pct > 0.5 and ema_20_current > ema_50[-1]:
-            trend_state = "up"
-        elif ema_slope_pct < -0.5 and ema_20_current < ema_50[-1]:
-            trend_state = "down"
-        else:
-            trend_state = "flat"
+        trend_state = self._classify_trend_state(ema_20, ema_50)
 
         # === VOLATILITY STATE (absolute price change as true-range proxy) ===
         changes = [abs(prices[i] - prices[i - 1]) for i in range(max(1, n - 30), n)]
@@ -5265,20 +5450,11 @@ class TradingEngine:
         closes = [bar["close"] for bar in bar_history]
         n = len(closes)
 
-        # === TREND STATE (using EMA slope on bar closes) ===
+        # === TREND STATE (fast + medium EMA slope on bar closes) ===
         ema_20 = self._calculate_ema(closes, 20)
         ema_50 = self._calculate_ema(closes, 50) if n >= 50 else ema_20
 
-        ema_20_current = ema_20[-1]
-        ema_20_prev = ema_20[-5] if len(ema_20) >= 5 else ema_20[0]
-        ema_slope_pct = ((ema_20_current - ema_20_prev) / ema_20_prev) * 100 if ema_20_prev > 0 else 0
-
-        if ema_slope_pct > 0.5 and ema_20_current > ema_50[-1]:
-            new_trend = "up"
-        elif ema_slope_pct < -0.5 and ema_20_current < ema_50[-1]:
-            new_trend = "down"
-        else:
-            new_trend = "flat"
+        new_trend = self._classify_trend_state(ema_20, ema_50)
 
         # === VOLATILITY STATE (using true range from bars) ===
         # Calculate ATR using actual bar high/low
@@ -6199,37 +6375,54 @@ class TradingEngine:
                 # trend_up: classic momentum setup
                 # volatility_expanding: early breakout phase, TF capitalises on
                 #   expanding moves before "trend_up" is confirmed
+                # NOTE: _strategy_trend_following has no internal regime gate of
+                # its own - this table is its ONLY regime awareness under Auto,
+                # so there is nothing for it to contradict.
                 "allowed_regimes": ["trend_up", "volatility_expanding"],
                 "priority": 4,
                 "typical_holding_time": "long",
                 "description": "Best for sustained uptrends with clear momentum"
             },
             "volatility_breakout": {
-                # volatility_contracting: compression phase — ATR shrinking means
-                #   a squeeze is building; "breakout conditions building" = high opp score
-                # volatility_low: absolute low vol also signals compression
-                "allowed_regimes": ["volatility_contracting", "volatility_low"],
+                # Must match _strategy_volatility_breakout's own regime_filter
+                # default (allowed_regimes=["volatility_expanding"], see the
+                # strategy's REGIME GATING section). The strategy itself only
+                # ever enters once volatility has expanded (breakout confirmed)
+                # - it does NOT enter during compression, it just watches for
+                # one. The old ["volatility_contracting", "volatility_low"]
+                # value here declared it Auto-eligible during compression and
+                # then ineligible the instant it actually expanded and entered,
+                # which caused force-exits right at (or just after) entry.
+                "allowed_regimes": ["volatility_expanding"],
                 "priority": 3,
                 "typical_holding_time": "medium",
                 "description": "Captures breakouts after volatility compression"
             },
             "mean_reversion": {
-                # Only eligible in flat/ranging markets; TF flips, expanding vol
-                # both indicate a trending move that breaks mean-reversion
-                "allowed_regimes": ["trend_flat"],
+                # Must match _strategy_mean_reversion's own hardcoded regime gate
+                # (allowed_regimes = ["trend_flat", "volatility_high"] in its
+                # REGIME GATING section) - it also trades high-volatility fades,
+                # not just flat/ranging markets.
+                "allowed_regimes": ["trend_flat", "volatility_high"],
                 "priority": 2,
                 "typical_holding_time": "short",
                 "description": "Profits from price mean reversion in choppy markets"
             },
             "adaptive_grid": {
-                # Flat trend + stable/medium volatility = ideal grid conditions
-                "allowed_regimes": ["trend_flat", "volatility_medium", "volatility_stable"],
+                # Must match _strategy_grid's own regime gate default
+                # (allowed_regimes = ["trend_flat", "volatility_medium"]), which
+                # only ever checks trend_state/volatility_state tags. The old
+                # "volatility_stable" entry here referred to volatility_direction,
+                # a tag the grid's own gate never inspects, so it was eligible
+                # here for a condition the strategy itself would never act on.
+                "allowed_regimes": ["trend_flat", "volatility_medium"],
                 "priority": 2,
                 "typical_holding_time": "medium",
                 "description": "Range-bound grid trading for sideways markets"
             },
             "funding_carry": {
-                # Eligible in uptrend and flat markets; downtrend disqualifies
+                # Eligible in uptrend and flat markets; downtrend disqualifies.
+                # Matches _strategy_funding_carry's own default exactly.
                 "allowed_regimes": ["trend_up", "trend_flat"],
                 "priority": 3,
                 "typical_holding_time": "long",
@@ -6247,6 +6440,10 @@ class TradingEngine:
                 # trend_down: the decline this strategy tracks a bottom during.
                 # volatility_expanding / volatility_high: sharp, fast moves are
                 #   exactly the setup it targets (pullback reversal, not a slow grind).
+                # NOTE: _strategy_dip_recovery has no internal regime gate of its
+                # own (its entry protection is its ATR-normalised decline/recovery
+                # ratio logic) - this table is its ONLY regime awareness under
+                # Auto, so there is nothing for it to contradict.
                 "allowed_regimes": ["trend_down", "volatility_expanding", "volatility_high"],
                 "priority": 3,
                 "typical_holding_time": "medium",
@@ -6584,6 +6781,18 @@ class TradingEngine:
                     diagnostics_store.record_blocked(bot.id, BLOCK_OTHER, reason)
                     return None
 
+                # Reward:risk check — a no-op when the strategy has no fixed
+                # stop (expected_risk_pct=None), so strategies not retrofitted
+                # with a locked stop keep their pre-existing behavior exactly.
+                rr_ok, rr_reason = evaluate_reward_risk(
+                    signal.expected_move_pct, signal.expected_risk_pct
+                )
+                if not rr_ok:
+                    reason = f"reward:risk check failed - {rr_reason}"
+                    logger.warning(f"Bot {bot.id}: Trade REJECTED (viability) - {reason}")
+                    diagnostics_store.record_blocked(bot.id, BLOCK_OTHER, reason)
+                    return None
+
         # === STEP 6: ORDER SIZE VALIDATION ===
         # Ensure order size is still meaningful after adjustments.
         # H3: the minimum applies to BUYS only (opening/adding risk). Sells must
@@ -6643,7 +6852,7 @@ class TradingEngine:
         if execution_mode == "market" or signal.order_type == "market":
             logger.debug(f"Bot {bot.id}: Placing market order: {side} {amount_base:.6f} {bot.trading_pair}")
             exchange_order = await exchange.place_market_order(
-                bot.trading_pair, side, amount_base
+                bot.trading_pair, side, amount_base, reference_price=current_price
             )
         else:
             # Determine limit price: prefer limit_price, fallback to price, then current_price
@@ -7596,7 +7805,9 @@ class TradingEngine:
             f"${slice_amount:.2f} {signal.action} @ ${current_price:.2f}"
         )
 
-        exchange_order = await exchange.place_market_order(bot.trading_pair, side, amount_base)
+        exchange_order = await exchange.place_market_order(
+            bot.trading_pair, side, amount_base, reference_price=current_price
+        )
 
         if not exchange_order:
             logger.error(f"Bot {bot.id}: TWAP slice {slices_executed + 1} failed to execute")
@@ -7750,7 +7961,9 @@ class TradingEngine:
         amount_base = signal.amount / current_price
         side = OrderSide.BUY if signal.action == "buy" else OrderSide.SELL
 
-        exchange_order = await exchange.place_market_order(bot.trading_pair, side, amount_base)
+        exchange_order = await exchange.place_market_order(
+            bot.trading_pair, side, amount_base, reference_price=current_price
+        )
 
         if not exchange_order:
             logger.error(f"Bot {bot.id}: VWAP execution failed")

@@ -118,7 +118,7 @@ class FakeExchange:
         self.filled_ratio = filled_ratio
         self.fee_currency = fee_currency
 
-    async def place_market_order(self, trading_pair, side, amount):
+    async def place_market_order(self, trading_pair, side, amount, reference_price=None):
         filled = amount * self.filled_ratio
         order = Mock()
         order.id = "live_1"

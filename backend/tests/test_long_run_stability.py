@@ -80,6 +80,7 @@ class DeterministicExchange:
         trading_pair: str,
         side,  # OrderSide or string
         amount: float,
+        reference_price: float = None,
     ) -> dict:
         """
         Place deterministic market order.
