@@ -63,6 +63,22 @@ MIN_ORDER_USD = 10.0
 # 0.998 comfortably covers 0.1 % fee + up to ~0.1 % spread.
 _BUY_BALANCE_FRACTION = 0.998
 
+# Minimum safety buffer (fraction of notional) added on top of round-trip fees
+# when the central trade viability gate evaluates a BUY signal.  Ensures the
+# trade must beat the fee hurdle by a small margin rather than just break even
+# at the theoretical minimum.  0.05 % is intentionally conservative — the gate
+# is a catastrophe filter, not a profitability predictor.
+_VIABILITY_SAFETY_MARGIN_PCT = 0.0005
+
+# Minimum acceptable reward:risk ratio for directional BUY signals that supply
+# expected_risk_pct (distance to their own locked stop). Forensic review of
+# closed trades found average losses running ~3x average wins (stops sized
+# independently of targets); this ties them together at the gate so no
+# directional strategy can risk materially more than it targets to gain.
+# Strategies without a fixed price target (no locked stop to measure risk
+# against) leave expected_risk_pct=None and are unaffected by this check.
+_MIN_REWARD_RISK_RATIO = 1.5
+
 
 # Repeated-rejection circuit breaker. When the SAME executable trade is rejected
 # or fails for the SAME reason this many consecutive times, the bot is paused and
@@ -71,6 +87,33 @@ _BUY_BALANCE_FRACTION = 0.998
 # is independent of the loop-level failure breaker (which counts raised
 # exceptions); a rejection is a clean None return, not an exception.
 MAX_CONSECUTIVE_REJECTIONS = 5
+
+# Accumulation strategies (DCA, grid-like) have no per-trade directional target.
+# Gate applies a fee sanity check only: one-way fee must not exceed this fraction.
+_MAX_ACCUMULATION_FEE_PCT = 0.05
+
+
+def _normalize_trend_state(state: dict) -> dict:
+    """Fill any keys missing from a restored trend-following state dict.
+
+    Called on every access so state persisted before a key was added continues
+    to work.  This is the single canonical source of valid trend state shape.
+    """
+    defaults: Dict[str, Any] = {
+        "trailing_stop": None,
+        "highest_price": None,
+        "entry_atr": None,
+        "entry_time": None,
+        "last_exit_time": None,
+        "entry_confirmation_count": 0,
+        "exit_confirmation_count": 0,
+        "tf_bars": [],
+        "tf_current_bar": None,
+    }
+    for key, val in defaults.items():
+        if key not in state:
+            state[key] = list(val) if isinstance(val, list) else val
+    return state
 
 
 # === STRATEGY STATE PERSISTENCE (C3/H1, M5) ===
@@ -88,6 +131,7 @@ _PERSISTED_STATE_ATTRS = (
     "_twap_states",
     "_vwap_states",
     "_auto_states",
+    "_dip_recovery_states",
 )
 
 # Largest price-history window any strategy needs (trend_following long EMA).
@@ -186,6 +230,78 @@ class TradeSignal:
     score: Optional[float] = None
     threshold: Optional[float] = None
 
+    # Expected price move as a fraction of current price (e.g. 0.005 = 0.5%).
+    # Set by directional strategies that can estimate the distance to their
+    # profit target. The viability gate checks expected_move > round_trip_fees +
+    # safety_margin before executing a BUY on directional signals.
+    # Leave as None when is_accumulation=True — the gate uses a fee sanity check
+    # instead of requiring a price-target estimate.
+    expected_move_pct: Optional[float] = None
+
+    # Expected adverse move to the strategy's own stop-loss, as a fraction of
+    # current price (same units as expected_move_pct — the "reward" side).
+    # Set by directional strategies that already compute a locked stop at
+    # entry (mean_reversion, dip_recovery). When present, the viability gate
+    # additionally enforces a minimum reward:risk ratio
+    # (expected_move_pct / expected_risk_pct >= _MIN_REWARD_RISK_RATIO).
+    # Leave as None for strategies with no fixed price target (trend_following,
+    # volatility_breakout ride a trend/breakout with no take-profit level, so a
+    # reward:risk ratio is not well-defined) or accumulation strategies — those
+    # keep the pre-existing fee-only viability check, unchanged.
+    expected_risk_pct: Optional[float] = None
+
+    # True for accumulation strategies (DCA, grid-like) that build position
+    # without a per-trade directional price target. The viability gate applies
+    # a fee sanity check (fee % < _MAX_ACCUMULATION_FEE_PCT) instead of the
+    # directional edge check used for is_accumulation=False signals.
+    is_accumulation: bool = False
+
+
+def evaluate_reward_risk(
+    expected_move_pct: Optional[float],
+    expected_risk_pct: Optional[float],
+    min_ratio: float = _MIN_REWARD_RISK_RATIO,
+) -> tuple:
+    """Evaluate a directional BUY signal's reward:risk ratio for the viability gate.
+
+    Single implementation of the reward:risk check, used by the central gate in
+    _execute_trade and unit-tested independently of a running bot/engine.
+
+    Args:
+        expected_move_pct: Reward side — distance to the strategy's profit
+            target, as a fraction of price (same convention as the existing
+            fee-viability check).
+        expected_risk_pct: Risk side — distance to the strategy's own locked
+            stop, as a fraction of price. None means the strategy has no fixed
+            stop to measure risk against (e.g. a trend-following exit with no
+            price target) — the check is a no-op in that case, preserving the
+            pre-existing fee-only viability behavior.
+        min_ratio: Minimum acceptable reward:risk ratio.
+
+    Returns:
+        (ok, reason) — reason is "" when ok is True.
+    """
+    if expected_risk_pct is None:
+        return True, ""
+    if not isinstance(expected_risk_pct, (int, float)) or expected_risk_pct <= 0:
+        return False, (
+            f"invalid risk estimate ({expected_risk_pct}) — stop must be strictly "
+            "below entry for a long"
+        )
+    reward = expected_move_pct if isinstance(expected_move_pct, (int, float)) else 0.0
+    if reward <= 0:
+        return False, (
+            f"invalid reward estimate ({reward * 100:.3f}%) — target must be "
+            "strictly above entry for a long"
+        )
+    ratio = reward / expected_risk_pct
+    if ratio < min_ratio:
+        return False, (
+            f"reward:risk {ratio:.2f} (reward {reward * 100:.3f}% / "
+            f"risk {expected_risk_pct * 100:.3f}%) < minimum {min_ratio:.2f}"
+        )
+    return True, ""
+
 
 def validate_funding_carry_params(params: dict) -> list:
     """Validate funding_carry strategy parameters.
@@ -231,6 +347,91 @@ def validate_funding_carry_params(params: dict) -> list:
         errors.append("allowed_regimes must be a list of regime strings")
 
     return errors
+
+
+def validate_dip_recovery_params(params: dict) -> list:
+    """Validate dip_recovery strategy parameters.
+
+    Returns a list of human-readable error strings (empty when valid). Kept as a
+    pure function so it can be reused by configuration checks and tests without
+    constructing an engine, mirroring validate_funding_carry_params.
+
+    Args:
+        params: The bot's strategy_params dict.
+    """
+    errors = []
+
+    def _positive(name: str, allow_zero: bool = False) -> None:
+        value = params.get(name)
+        if value is None:
+            return
+        if not isinstance(value, (int, float)):
+            errors.append(f"{name} must be a number")
+            return
+        if allow_zero and value < 0:
+            errors.append(f"{name} must be >= 0")
+        elif not allow_zero and value <= 0:
+            errors.append(f"{name} must be > 0")
+
+    for field in (
+        "min_drop_percent", "drop_atr_multiplier",
+        "min_recovery_percent", "recovery_atr_multiplier",
+        "take_profit_atr_multiplier", "trailing_stop_atr_multiplier",
+        "emergency_stop_atr_multiplier", "max_position_duration_minutes",
+        "setup_expiry_minutes", "risk_percent", "spike_guard_atr_multiplier",
+        "reference_high_lookback_ticks", "atr_period", "ema_slope_period",
+    ):
+        _positive(field)
+
+    for field in ("cooldown_seconds", "loss_cooldown_seconds", "min_ticks_without_new_low"):
+        _positive(field, allow_zero=True)
+
+    trailing_mult = params.get("trailing_stop_atr_multiplier")
+    emergency_mult = params.get("emergency_stop_atr_multiplier")
+    if (
+        isinstance(trailing_mult, (int, float))
+        and isinstance(emergency_mult, (int, float))
+        and emergency_mult <= trailing_mult
+    ):
+        errors.append(
+            f"emergency_stop_atr_multiplier ({emergency_mult}) must be greater than "
+            f"trailing_stop_atr_multiplier ({trailing_mult}) - it is meant to be a wider, "
+            "last-resort safety net beyond the trailing stop"
+        )
+
+    cooldown = params.get("cooldown_seconds")
+    loss_cooldown = params.get("loss_cooldown_seconds")
+    if (
+        isinstance(cooldown, (int, float))
+        and isinstance(loss_cooldown, (int, float))
+        and loss_cooldown < cooldown
+    ):
+        errors.append(
+            f"loss_cooldown_seconds ({loss_cooldown}) must be >= cooldown_seconds ({cooldown})"
+        )
+
+    risk_percent = params.get("risk_percent")
+    if isinstance(risk_percent, (int, float)) and not (0 < risk_percent <= 100):
+        errors.append("risk_percent must be in (0, 100]")
+
+    return errors
+
+
+class _DipRecoveryState:
+    """String constants for Dip Recovery's lifecycle state machine.
+
+    Persisted as a plain string under state["state"] (JSON-compatible, matching
+    the dict-based persistence every other strategy uses - no separate typed
+    state system). ENTRY_ARMED is transient: it is only ever reported via
+    ExplanationBuilder.state() on the tick a BUY is emitted, and is never itself
+    written to the persisted dict (the next persisted value is LONG_OPEN).
+    """
+    IDLE = "IDLE"
+    TRACKING_DROP = "TRACKING_DROP"
+    WAITING_REVERSAL = "WAITING_REVERSAL"
+    ENTRY_ARMED = "ENTRY_ARMED"
+    LONG_OPEN = "LONG_OPEN"
+    COOLDOWN = "COOLDOWN"
 
 
 class _VirtualPosition:
@@ -930,6 +1131,7 @@ class TradingEngine:
             "trend_following": self._strategy_trend_following,
             "volatility_breakout": self._strategy_volatility_breakout,
             "funding_carry": self._strategy_funding_carry,
+            "dip_recovery": self._strategy_dip_recovery,
                     "auto_mode": self._strategy_auto,
         }
 
@@ -967,8 +1169,12 @@ class TradingEngine:
         Regime-aware by default: Can pause during unfavorable market conditions
         (e.g., strong downtrends) to protect capital.
 
-        WARNING: Do NOT use this strategy inside auto_mode. DCA is clock-driven
-        and conflicts with regime-based strategy rotation.
+        Auto Mode may select this strategy (it is the designated fallback -
+        see _get_strategy_capabilities): that is a SUPERVISED call, routed
+        through _strategy_auto's own eligibility/regime/scoring gate, and is
+        allowed. What remains blocked is an UNSUPERVISED direct call on an
+        auto_mode bot (bypassing that gate entirely) - DCA's clock-driven,
+        never-sell behaviour is still a poor fit run that way.
 
         Parameters:
             interval_minutes: Time between buys (default: 60)
@@ -978,16 +1184,24 @@ class TradingEngine:
             regime_filter_enabled: Enable regime filter to pause during bad conditions (default: True)
             allowed_regimes: List of allowed trend states (default: ["trend_up", "trend_flat"])
         """
-        # Defensive check: Block usage inside auto_mode
-        if bot.strategy == "auto_mode":
+        # Defensive check: block DIRECT/unsupervised use of DCA on an
+        # auto_mode bot. bot.strategy alone can't tell us that - it reads
+        # "auto_mode" for every Auto-managed bot regardless of which
+        # sub-strategy Auto has actually selected, since Auto dispatches
+        # sub-strategies using the same bot object. _strategy_auto marks its
+        # own dispatch calls explicitly via params["_invoked_by_auto"], so a
+        # supervised call (Auto selected DCA itself) is let through while a
+        # call that bypasses Auto's gate entirely is still blocked.
+        if bot.strategy == "auto_mode" and not params.get("_invoked_by_auto"):
             logger.warning(
-                f"Bot {bot.id}: DCA strategy invoked inside auto_mode. "
-                f"This is NOT recommended - DCA conflicts with regime-based rotation."
+                f"Bot {bot.id}: DCA strategy invoked directly on an auto_mode bot, "
+                f"bypassing Auto Mode's own supervision. This is NOT recommended - "
+                f"DCA conflicts with unsupervised regime-based rotation."
             )
             return TradeSignal(
                 action="hold",
                 amount=0,
-                reason="DCA: Not intended for use inside auto_mode"
+                reason="DCA: Not intended for direct/unsupervised use inside auto_mode"
             )
 
         interval_minutes = params.get("interval_minutes", 60)
@@ -1182,6 +1396,7 @@ class TradingEngine:
             amount=buy_amount,
             order_type="market",
             reason=f"DCA buy #{order_count + 1}: ${buy_amount:.2f} @ ${current_price:.2f}",
+            is_accumulation=True,
         )
 
     async def _strategy_grid(
@@ -1791,6 +2006,29 @@ class TradingEngine:
                     reason=f"Grid: Insufficient virtual cash for buy at level {nearest_level}"
                 )
 
+            # Viability pre-check: verify grid_spacing covers round-trip fees before
+            # mutating the virtual wallet. spacing / price = minimum profitable move
+            # from the buy level to the nearest sell level. This must exceed the
+            # configured fee threshold so the central gate does not later reject an
+            # order whose virtual state was already updated.
+            _grid_expected_move = grid_spacing / bar_close_price if bar_close_price > 0 else 0.0
+            _fee_raw_grid = getattr(bot, 'exchange_fee', 0.1)
+            _grid_fee_pct = (
+                float(_fee_raw_grid) if isinstance(_fee_raw_grid, (int, float)) else 0.1
+            ) / 100.0
+            _grid_min_move = 2.0 * _grid_fee_pct + _VIABILITY_SAFETY_MARGIN_PCT
+            if _grid_expected_move < _grid_min_move:
+                self._save_grid_state(bot.id, state)
+                return TradeSignal(
+                    action="hold",
+                    amount=0,
+                    reason=(
+                        f"Grid: spacing {_grid_expected_move * 100:.3f}% < "
+                        f"fee threshold {_grid_min_move * 100:.3f}% "
+                        f"(exchange_fee={_grid_fee_pct * 100:.2f}%)"
+                    ),
+                )
+
             # Execute virtual buy
             crypto_amount = order_size_usd / bar_close_price
             state["virtual_cash"] -= order_size_usd
@@ -1815,6 +2053,7 @@ class TradingEngine:
                 amount=order_size_usd,
                 order_type="market",
                 reason=f"Grid: Buy at level {nearest_level} (${bar_close_price:.2f}, depth={depth})",
+                expected_move_pct=_grid_expected_move,
             )
 
         else:
@@ -1957,6 +2196,7 @@ class TradingEngine:
             "current_bar": None,  # Bar being built
             "entry_price": None,
             "entry_atr": None,  # LOCKED at entry - risk never expands
+            "target_price": None,  # LOCKED at entry - profit target never moves
             "hard_stop": None,  # ATR-based hard stop
             "bars_since_entry": 0,  # Time stop counter
             "last_exit_time": None,  # For cooldown
@@ -2242,6 +2482,7 @@ class TradingEngine:
                     # Clear state
                     state["entry_price"] = None
                     state["entry_atr"] = None
+                    state["target_price"] = None
                     state["hard_stop"] = None
                     state["bars_since_entry"] = 0
                     state["last_exit_time"] = datetime.utcnow()
@@ -2255,25 +2496,34 @@ class TradingEngine:
                     )
 
                 # === EXIT CONDITION 2: Mean Reached (TARGET) ===
-                # Determine exit level
-                if exit_at_mean:
-                    exit_level = sma
-                    exit_label = "mean"
-                else:
-                    exit_level = upper_band
-                    exit_label = "upper band"
+                # CRITICAL: Use the LOCKED target_price recorded at entry, never a
+                # freshly recomputed sma/upper_band. Mean reversion enters while
+                # price is declining into the lower band, so a live-recomputed sma
+                # keeps drifting down with it — "mean reached" would then fire the
+                # moment price stops falling, regardless of whether it ever
+                # recovered toward the level that made the trade worth taking.
+                # That silently turns the take-profit exit into a breakeven-or-worse
+                # exit. Locking the target the same way entry_atr/hard_stop are
+                # already locked closes that hole. Legacy positions opened before
+                # this field existed fall back to the current sma/upper_band once,
+                # same convention as the entry_atr_locked fallback above.
+                exit_label = "mean" if exit_at_mean else "upper band"
+                target_price = state.get("target_price")
+                if target_price is None:
+                    target_price = sma if exit_at_mean else upper_band
 
-                if last_bar_close >= exit_level:
+                if last_bar_close >= target_price:
                     sell_amount = pos.amount * current_price
 
                     logger.info(
                         f"Bot {bot.id}: Mean Reversion EXIT (target reached) - "
-                        f"Bar close ${last_bar_close:.2f} >= {exit_label} ${exit_level:.2f}"
+                        f"Bar close ${last_bar_close:.2f} >= locked {exit_label} target ${target_price:.2f}"
                     )
 
                     # Clear state
                     state["entry_price"] = None
                     state["entry_atr"] = None
+                    state["target_price"] = None
                     state["hard_stop"] = None
                     state["bars_since_entry"] = 0
                     state["last_exit_time"] = datetime.utcnow()
@@ -2283,7 +2533,7 @@ class TradingEngine:
                         action="sell",
                         amount=sell_amount,
                         order_type="market",
-                        reason=f"Mean Reversion: {exit_label} reached (${exit_level:.2f})",
+                        reason=f"Mean Reversion: {exit_label} reached (${target_price:.2f})",
                     )
 
                 # === EXIT CONDITION 3: Hard Stop (ATR-BASED) ===
@@ -2300,6 +2550,7 @@ class TradingEngine:
                     # Clear state
                     state["entry_price"] = None
                     state["entry_atr"] = None
+                    state["target_price"] = None
                     state["hard_stop"] = None
                     state["bars_since_entry"] = 0
                     state["last_exit_time"] = datetime.utcnow()
@@ -2325,6 +2576,7 @@ class TradingEngine:
                     # Clear state
                     state["entry_price"] = None
                     state["entry_atr"] = None
+                    state["target_price"] = None
                     state["hard_stop"] = None
                     state["bars_since_entry"] = 0
                     state["last_exit_time"] = datetime.utcnow()
@@ -2347,7 +2599,7 @@ class TradingEngine:
             return TradeSignal(
                 action="hold",
                 amount=0,
-                reason=f"Mean Reversion: Holding, target ${exit_level:.2f}, stop {stop_str}, bars {state['bars_since_entry']}/{max_hold_bars}"
+                reason=f"Mean Reversion: Holding, target ${target_price:.2f}, stop {stop_str}, bars {state['bars_since_entry']}/{max_hold_bars}"
             )
 
         # === ENTRY LOGIC (BAR-BASED) ===
@@ -2376,6 +2628,38 @@ class TradingEngine:
 
         # Entry condition: bar close <= lower Bollinger Band
         if last_bar_close <= lower_band:
+            # Expected profit: from current execution price to the SMA (MR's
+            # profit target). Using current_price (not last_bar_close) reflects
+            # the actual cost basis at which the order would fill.
+            expected_move_pct = max(
+                0.0,
+                (sma - current_price) / current_price if current_price > 0 else 0.0,
+            )
+
+            # Pre-flight viability: verify the band is wide enough to cover
+            # round-trip fees BEFORE we mutate state.  MR writes entry_price and
+            # hard_stop before returning the BUY signal; if the central viability
+            # gate in _execute_trade later rejects the order (fees exceed the
+            # expected move), MR's in-memory state would record an entry that has
+            # no matching DB position, causing re-entry attempts every loop.
+            # isinstance guard: tests where bot.exchange_fee is a Mock use 0.1 %
+            # default rather than propagating a non-numeric value into the check.
+            _fee_raw = getattr(bot, 'exchange_fee', 0.1)
+            _mr_fee_pct = (
+                float(_fee_raw) if isinstance(_fee_raw, (int, float)) else 0.1
+            ) / 100.0
+            _mr_min_move = 2.0 * _mr_fee_pct + _VIABILITY_SAFETY_MARGIN_PCT
+            if expected_move_pct < _mr_min_move:
+                self._mean_reversion_states[bot.id] = state
+                return TradeSignal(
+                    action="hold",
+                    amount=0,
+                    reason=(
+                        f"Mean Reversion: Band too narrow for fees "
+                        f"({expected_move_pct * 100:.3f}% < {_mr_min_move * 100:.3f}%)"
+                    ),
+                )
+
             # Fixed percentage position sizing, capped at _BUY_BALANCE_FRACTION
             # of balance so the simulated exchange fee cannot push cost + fee
             # over available funds, then floored to the executable minimum.
@@ -2404,18 +2688,34 @@ class TradingEngine:
                 f"Entry ATR locked at ${atr:.4f}, Position: ${buy_amount:.2f}"
             )
 
-            # Initialize state with LOCKED entry_atr and hard stop
+            # Initialize state with LOCKED entry_atr, hard stop, AND target.
+            # target_price is locked here (not recomputed from a live sma on every
+            # tick) so the take-profit exit cannot decay into a moving-loss exit —
+            # see the "mean reached" exit condition below for the failure mode
+            # this closes.
+            locked_target = sma if exit_at_mean else upper_band
+            locked_stop = current_price - (atr * atr_stop_mult)
             state["entry_price"] = current_price
             state["entry_atr"] = atr  # LOCKED - stop distance will always use this
-            state["hard_stop"] = current_price - (atr * atr_stop_mult)
+            state["target_price"] = locked_target  # LOCKED - profit target never moves
+            state["hard_stop"] = locked_stop
             state["bars_since_entry"] = 0
             self._mean_reversion_states[bot.id] = state
+
+            # Risk/reward at entry, in the same units as expected_move_pct (reward)
+            # so the execution-layer viability gate can enforce a minimum RR ratio
+            # without any strategy-specific logic of its own.
+            expected_risk_pct = (
+                (current_price - locked_stop) / current_price if current_price > 0 else 0.0
+            )
 
             return TradeSignal(
                 action="buy",
                 amount=buy_amount,
                 order_type="market",
                 reason=f"Mean Reversion: Entry at lower band (${lower_band:.2f})",
+                expected_move_pct=expected_move_pct,
+                expected_risk_pct=expected_risk_pct,
             )
 
         # Update state and hold
@@ -2527,6 +2827,30 @@ class TradingEngine:
         # Keep only the last max_len prices
         self._price_histories[bot_id] = history[-max_len:]
 
+    def _calc_price_atr_proxy(self, prices: list, period: int) -> float:
+        """Calculate an ATR proxy from a plain (tick/close) price series.
+
+        Same formula as trend_following's inline calculate_atr_proxy: True Range
+        is approximated as the absolute difference between consecutive prices
+        (no OHLC available for tick data), averaged over the last `period`
+        differences. Extracted here as a shared, reusable method - rather than
+        duplicating trend_following's private closure or modifying it to call
+        out to this method - specifically so dip_recovery (and any future
+        tick-based strategy) does not reimplement the math, while leaving
+        trend_following's own pinned implementation completely untouched.
+
+        Returns 0.0 if insufficient data.
+        """
+        if len(prices) < period + 1:
+            return 0.0
+
+        true_ranges = [abs(prices[i] - prices[i - 1]) for i in range(1, len(prices))]
+        if len(true_ranges) < period:
+            return 0.0
+
+        recent_trs = true_ranges[-period:]
+        return sum(recent_trs) / len(recent_trs)
+
     # Note: _strategy_momentum (breakdown_momentum) was removed (stub implementation, overlaps with other strategies)
 
     async def _strategy_trend_following(
@@ -2565,6 +2889,13 @@ class TradingEngine:
         exit_confirmation_loops = params.get("exit_confirmation_loops", 2)
         cooldown_seconds = params.get("cooldown_seconds", 300)  # 5 minutes default
 
+        # Normalize persisted state before any early-return so missing keys added
+        # after state was first saved (e.g. tf_bars) are backfilled on every tick,
+        # including the warmup ticks that return before reaching the trading logic.
+        if not hasattr(self, "_trend_states"):
+            self._trend_states = {}
+        state = _normalize_trend_state(self._trend_states.get(bot.id, {}))
+
         # Get price history
         price_history = self._get_price_history(bot.id)
 
@@ -2574,6 +2905,7 @@ class TradingEngine:
 
         # Need enough data for EMA calculation
         if len(price_history) < long_period:
+            self._trend_states[bot.id] = state  # Persist normalization even on early return
             self._explain(bot.id).state("WARMING_UP").metric("current_price", current_price).check(
                 "Data collected", len(price_history), f">= {long_period}", False,
                 detail="warming up EMA window",
@@ -2600,57 +2932,58 @@ class TradingEngine:
 
             return ema
 
-        # Calculate ATR proxy (Average True Range approximation)
-        def calculate_atr_proxy(prices: list, period: int) -> float:
-            """Calculate ATR proxy from price-only data.
-
-            Since only prices are available (no OHLC), we approximate True Range
-            as the absolute difference between consecutive prices.
-            This is NOT a true ATR but serves as a reasonable volatility proxy
-            for tick-based data.
-
-            Returns 0 if insufficient data.
-            """
-            if len(prices) < period + 1:
-                return 0.0
-
-            # Calculate true range approximations: |current_price - previous_price|
-            true_ranges = []
-            for i in range(1, len(prices)):
-                tr = abs(prices[i] - prices[i-1])
-                true_ranges.append(tr)
-
-            # Return rolling average over last 'period' true ranges
-            if len(true_ranges) < period:
-                return 0.0
-
-            recent_trs = true_ranges[-period:]
-            return sum(recent_trs) / len(recent_trs)
-
         # Calculate indicators
         ema_short = calculate_ema(price_history, short_period)
         ema_long = calculate_ema(price_history, long_period)
-        atr = calculate_atr_proxy(price_history, atr_period)
 
         # Get current positions
         positions = await self._get_bot_positions(bot.id, session)
         has_position = len(positions) > 0
 
-        # Get or initialize trend-following state
-        # State tracks: trailing stop, entry ATR (locked at entry to prevent risk expansion),
-        # entry/exit confirmation counters (noise defense), and cooldown timer (anti-churn)
-        if not hasattr(self, "_trend_states"):
-            self._trend_states = {}
+        # === BAR ATR ACCUMULATION ===
+        # Replace tick-level ATR with bar-based ATR.  The original code computed
+        # |price[i] − price[i-1]| at 1 Hz → ATR ≈ $1-3 on BTC, placing stops
+        # well inside the fee hurdle (guaranteed loss on every trade).
+        # 60-second bar H-L ranges (~$50-200 on BTC) reflect actual volatility.
+        bar_interval_seconds = params.get("bar_interval_seconds", 60)
+        _now = datetime.utcnow()
+        if state.get("tf_current_bar") is None:
+            state["tf_current_bar"] = {
+                "high": current_price, "low": current_price,
+                "close": current_price, "start_ts": _now,
+            }
+        _cb = state["tf_current_bar"]
+        _cb["high"] = max(_cb["high"], current_price)
+        _cb["low"] = min(_cb["low"], current_price)
+        _cb["close"] = current_price
+        if (_now - _cb["start_ts"]).total_seconds() >= bar_interval_seconds:
+            state["tf_bars"].append(dict(_cb))
+            state["tf_bars"] = state["tf_bars"][-100:]
+            state["tf_current_bar"] = {
+                "high": current_price, "low": current_price,
+                "close": current_price, "start_ts": _now,
+            }
+        self._trend_states[bot.id] = state
 
-        state = self._trend_states.get(bot.id, {
-            "trailing_stop": None,
-            "highest_price": None,
-            "entry_atr": None,  # Locked at entry - risk must never increase
-            "entry_time": None,
-            "last_exit_time": None,
-            "entry_confirmation_count": 0,  # Consecutive loops with entry conditions met
-            "exit_confirmation_count": 0,   # Consecutive loops with exit conditions met
-        })
+        def _calc_bar_atr(bars: list, period: int) -> float:
+            if len(bars) < period:
+                return 0.0
+            return sum(b["high"] - b["low"] for b in bars[-period:]) / period
+
+        tf_bars = state.get("tf_bars", [])
+        bar_atr = _calc_bar_atr(tf_bars, atr_period)
+
+        # Fee-coverage floor: when bar ATR is zero (not enough bars collected yet),
+        # use a stop distance that at minimum covers the round-trip fee + safety.
+        # This prevents microscopic stops during the bar warmup window AND fixes
+        # the original tick-ATR bug (1-second tick diffs ~$1-3 on BTC, well inside
+        # the fee hurdle).  Once bars are ready, the larger bar ATR takes over.
+        _fee_raw_tf = getattr(bot, 'exchange_fee', 0.1)
+        _fee_pct_tf = (
+            float(_fee_raw_tf) if isinstance(_fee_raw_tf, (int, float)) else 0.1
+        ) / 100.0
+        _min_stop_pct = 2.0 * _fee_pct_tf + _VIABILITY_SAFETY_MARGIN_PCT
+        atr = max(bar_atr, current_price * _min_stop_pct)
 
         logger.debug(
             f"Bot {bot.id}: Trend Following - Price: ${current_price:.2f}, "
@@ -2836,6 +3169,9 @@ class TradingEngine:
                     amount=buy_amount,
                     order_type="market",
                     reason=f"Trend Following: Bullish trend confirmed ({entry_confirmation_loops} loops)",
+                    expected_move_pct=(
+                        (atr * atr_multiplier) / current_price if current_price > 0 else None
+                    ),
                 )
             else:
                 # Entry conditions not met - reset confirmation counter
@@ -3230,6 +3566,7 @@ class TradingEngine:
                     f"Funding Carry: favourable funding ({funding_pct:.5f}%) "
                     f"and regime ({trend_regime_name})"
                 ),
+                is_accumulation=True,
             )
 
         # --- Exit path: leave when either condition stops being favourable ---
@@ -3839,6 +4176,29 @@ class TradingEngine:
                 rank = sorted_widths.index(min(sorted_widths, key=lambda x: abs(x - bb_width)))
                 percentile_rank = f"{int((rank / len(sorted_widths)) * 100)}th"
 
+            # Viability pre-check before state mutation: expected move = how far the
+            # price has already broken above the upper band (the measured breakout
+            # magnitude). A breakout is expected to continue at least this distance,
+            # making it the most conservative honest estimate available without
+            # inventing a price target. upper_gap is already computed above.
+            _vb_expected_move = upper_gap / current_price if current_price > 0 else 0.0
+            _fee_raw_vb = getattr(bot, 'exchange_fee', 0.1)
+            _vb_fee_pct = (
+                float(_fee_raw_vb) if isinstance(_fee_raw_vb, (int, float)) else 0.1
+            ) / 100.0
+            _vb_min_move = 2.0 * _vb_fee_pct + _VIABILITY_SAFETY_MARGIN_PCT
+            if _vb_expected_move < _vb_min_move:
+                self._volatility_breakout_states[bot.id] = state
+                return TradeSignal(
+                    action="hold",
+                    amount=0,
+                    reason=(
+                        f"Volatility Breakout: breakout {_vb_expected_move * 100:.3f}% < "
+                        f"fee threshold {_vb_min_move * 100:.3f}% "
+                        f"(exchange_fee={_vb_fee_pct * 100:.2f}%)"
+                    ),
+                )
+
             logger.info(
                 f"Bot {bot.id}: Volatility Breakout ENTRY - "
                 f"{state['compression_bars']} bars compression (BB width {percentile_rank} percentile), "
@@ -3862,6 +4222,7 @@ class TradingEngine:
                 amount=buy_amount,
                 order_type="market",
                 reason=f"Volatility Breakout: {state['compression_bars']} bars compression, breakout confirmed",
+                expected_move_pct=_vb_expected_move,
             )
 
         # Update state and hold (EXPLAINABLE REASONS)
@@ -3893,6 +4254,639 @@ class TradingEngine:
 
 
     # Note: _strategy_arbitrage and _strategy_event were removed (placeholders without implementation)
+
+    def _dip_recovery_default_state(self) -> dict:
+        """Fresh default runtime state for a Dip Recovery bot.
+
+        Single source of truth for the shape of dip_recovery state - reused by
+        the live strategy, restart-restore (generic _restore_bot_state), and
+        tests, so there is exactly one place that defines what this strategy
+        persists.
+        """
+        return {
+            "state": _DipRecoveryState.IDLE,
+            "reference_high": None,
+            "reference_high_time": None,
+            "lowest_price": None,
+            "lowest_price_time": None,
+            "tracking_started_at": None,
+            "ticks_since_new_low": 0,
+            "entry_price": None,
+            "entry_time": None,
+            "entry_atr": None,
+            "highest_price_since_entry": None,
+            "trailing_stop": None,
+            "take_profit": None,
+            "emergency_stop": None,
+            "cooldown_until": None,
+            "last_exit_was_loss": None,
+        }
+
+    async def _strategy_dip_recovery(
+        self,
+        bot: Bot,
+        current_price: float,
+        params: dict,
+        session: AsyncSession,
+    ) -> Optional[TradeSignal]:
+        """Dip Recovery / Reversal Momentum strategy.
+
+        Captures the bounce AFTER a significant decline, not the decline
+        itself: a drop only ARMS monitoring; a BUY additionally requires price
+        to have already reversed off a confirmed local low by an adaptive
+        margin, with optional momentum confirmation. This intentionally
+        accepts a later entry than a pure dip-buyer in exchange for materially
+        reduced downside risk - it never buys into a market that is still
+        falling.
+
+        Lifecycle (persisted in bot.strategy_state via _dip_recovery_states):
+            IDLE -> TRACKING_DROP -> WAITING_REVERSAL -> LONG_OPEN -> COOLDOWN -> IDLE
+        ENTRY_ARMED is reported only in the explanation on the single tick a
+        BUY fires - see _DipRecoveryState for why it is never itself persisted.
+
+        All thresholds adapt to current volatility via an ATR-percent proxy
+        (_calc_price_atr_proxy) computed from the bot's own tick price
+        history - the same shared source trend_following uses. No OHLC candles
+        are available for tick-driven bots, so True Range is approximated as
+        the absolute tick-to-tick price change, exactly like trend_following.
+        This makes every threshold pair-and-volatility agnostic (no BTC-
+        specific assumptions): a 2% move only matters relative to what THIS
+        pair's recent ATR% says is normal for it.
+
+        Parameters (sane crypto defaults; also documented in
+        validate_dip_recovery_params and app/routers/config.py STRATEGIES):
+            atr_period (14): ticks in the ATR proxy window.
+            reference_high_lookback_ticks (60): rolling window used to derive
+                the "recent high" a decline is measured against.
+            min_drop_percent / drop_atr_multiplier (1.5 / 2.5): adaptive drop
+                threshold = max(min_drop_percent, atr_percent * drop_atr_multiplier).
+            min_recovery_percent / recovery_atr_multiplier (0.5 / 0.8): adaptive
+                recovery confirmation = max(min_recovery_percent, atr_percent * recovery_atr_multiplier).
+            require_ema_slope_confirmation / ema_slope_period (True / 5): the
+                short EMA over price history must be rising.
+            require_no_new_low_confirmation / min_ticks_without_new_low (True / 2):
+                no new low for N ticks.
+            take_profit_atr_multiplier / trailing_stop_atr_multiplier /
+                emergency_stop_atr_multiplier (3.0 / 1.5 / 5.0): ATR-based
+                exits, locked at entry (risk never expands, matching
+                trend_following/volatility_breakout convention).
+            max_position_duration_minutes (720): force-exit after this long
+                regardless of P&L.
+            setup_expiry_minutes (240): abandon an unresolved TRACKING_DROP /
+                WAITING_REVERSAL setup after this long with no confirmed
+                reversal, back to IDLE.
+            cooldown_seconds / loss_cooldown_seconds (300 / 1800): pause after
+                any exit, extended after a losing exit.
+            risk_percent (1.0): % of balance risked per trade, sized off the
+                trailing-stop distance (same sizing formula as trend_following).
+            spike_guard_atr_multiplier (6.0): a single-tick move bigger than
+                this many ATRs is treated as noise and ignored when updating
+                the tracked high/low, so one bad tick cannot anchor an
+                unrealistic reference point.
+        """
+        atr_period = int(params.get("atr_period", 14))
+        ref_high_lookback = int(params.get("reference_high_lookback_ticks", 60))
+        min_drop_pct = params.get("min_drop_percent", 1.5)
+        drop_atr_mult = params.get("drop_atr_multiplier", 2.5)
+        min_recovery_pct = params.get("min_recovery_percent", 0.5)
+        recovery_atr_mult = params.get("recovery_atr_multiplier", 0.8)
+        require_ema_slope = params.get("require_ema_slope_confirmation", True)
+        ema_slope_period = int(params.get("ema_slope_period", 5))
+        require_no_new_low = params.get("require_no_new_low_confirmation", True)
+        min_ticks_no_new_low = int(params.get("min_ticks_without_new_low", 2))
+        take_profit_atr_mult = params.get("take_profit_atr_multiplier", 3.0)
+        trailing_atr_mult = params.get("trailing_stop_atr_multiplier", 1.5)
+        emergency_atr_mult = params.get("emergency_stop_atr_multiplier", 5.0)
+        max_duration_min = params.get("max_position_duration_minutes", 720)
+        setup_expiry_min = params.get("setup_expiry_minutes", 240)
+        cooldown_seconds = params.get("cooldown_seconds", 300)
+        loss_cooldown_seconds = params.get("loss_cooldown_seconds", 1800)
+        risk_percent = params.get("risk_percent", 1.0) / 100
+        spike_guard_mult = params.get("spike_guard_atr_multiplier", 6.0)
+
+        now = datetime.utcnow()
+
+        # === Price history (shared tick history, same source as trend_following) ===
+        price_history = self._get_price_history(bot.id)
+        previous_price = price_history[-1] if price_history else current_price
+        price_history.append(current_price)
+        self._save_price_history(bot.id, price_history, max_len=max(ref_high_lookback + 50, 250))
+
+        if not hasattr(self, "_dip_recovery_states"):
+            self._dip_recovery_states = {}
+        state = self._dip_recovery_states.get(bot.id) or self._dip_recovery_default_state()
+
+        exp = self._explain(bot.id)
+
+        # Warm-up gate: need enough ticks for a meaningful ATR proxy.
+        if len(price_history) < atr_period + 1:
+            self._dip_recovery_states[bot.id] = state
+            exp.state(state["state"]).metric("current_price", current_price).check(
+                "History collected", len(price_history), f">= {atr_period + 1}", False,
+                detail="warming up ATR window",
+            )
+            return TradeSignal(
+                action="hold",
+                amount=0,
+                reason=f"Dip Recovery: Collecting data ({len(price_history)}/{atr_period + 1})"
+            )
+
+        atr = self._calc_price_atr_proxy(price_history, atr_period)
+        atr_percent = (atr / current_price * 100.0) if current_price > 0 else 0.0
+        is_spike = atr > 0 and abs(current_price - previous_price) > (atr * spike_guard_mult)
+
+        positions = await self._get_bot_positions(bot.id, session)
+        has_position = len(positions) > 0
+
+        if not has_position and state["state"] == _DipRecoveryState.LONG_OPEN:
+            # Defensive: persisted state says a position is open but none
+            # exists (closed outside this strategy's knowledge, or a crash
+            # between execution and the next state save). There is nothing to
+            # manage and no valid TRACKING_DROP/WAITING_REVERSAL context either
+            # (those fields were cleared on entry) - reset cleanly to IDLE
+            # rather than falling into the setup-tracking branch below with
+            # stale/absent low/high fields.
+            state = self._dip_recovery_default_state()
+            self._dip_recovery_states[bot.id] = state
+
+        if has_position:
+            return self._dip_recovery_manage_exit(
+                bot, state, positions, current_price, atr, now,
+                take_profit_atr_mult, trailing_atr_mult, emergency_atr_mult,
+                max_duration_min, cooldown_seconds, loss_cooldown_seconds, exp,
+            )
+
+        # === COOLDOWN ===
+        if state["state"] == _DipRecoveryState.COOLDOWN:
+            cooldown_until = state.get("cooldown_until")
+            if cooldown_until and now < cooldown_until:
+                remaining = (cooldown_until - now).total_seconds()
+                exp.state(_DipRecoveryState.COOLDOWN).update({
+                    "current_price": current_price, "atr": atr, "atr_percent": atr_percent,
+                    "cooldown_remaining_s": remaining,
+                    "last_exit_was_loss": state.get("last_exit_was_loss"),
+                })
+                exp.check("Cooldown elapsed", f"{remaining:.0f}s remaining", "0s remaining", False)
+                exp.next_trade(
+                    current=remaining, current_label="Cooldown remaining (s)",
+                    target=0, target_label="Ready", distance=remaining,
+                    status=f"{remaining:.0f}s until monitoring resumes",
+                )
+                self._dip_recovery_states[bot.id] = state
+                return TradeSignal(
+                    action="hold", amount=0,
+                    reason=f"Dip Recovery: Cooldown active ({remaining:.0f}s remaining)"
+                )
+            # Cooldown elapsed - fall through to IDLE this same tick.
+            state["state"] = _DipRecoveryState.IDLE
+            state["cooldown_until"] = None
+
+        drop_threshold = max(min_drop_pct, atr_percent * drop_atr_mult)
+        recovery_threshold = max(min_recovery_pct, atr_percent * recovery_atr_mult)
+
+        # === IDLE: watch for a significant decline ===
+        if state["state"] == _DipRecoveryState.IDLE:
+            window = price_history[-ref_high_lookback:]
+            # A single-tick spike must not anchor the reference high.
+            if is_spike and len(window) > 1:
+                window = window[:-1]
+            reference_high = max(window) if window else current_price
+            drawdown_percent = (
+                (current_price - reference_high) / reference_high * 100.0
+                if reference_high > 0 else 0.0
+            )
+            decline_ratio = abs(drawdown_percent) / atr_percent if atr_percent > 0 else 0.0
+            opportunity_score = self._dip_recovery_score_from_ratios(decline_ratio, 0.0)
+
+            exp.state(_DipRecoveryState.IDLE).update({
+                "current_price": current_price, "reference_high": reference_high,
+                "atr": atr, "atr_percent": atr_percent,
+                "drawdown_percent": drawdown_percent, "drop_threshold_percent": drop_threshold,
+                "opportunity_score": opportunity_score * 10.0,
+            })
+            exp.check(
+                "Decline vs adaptive threshold", f"{abs(drawdown_percent):.3f}%",
+                f">= {drop_threshold:.3f}%", abs(drawdown_percent) >= drop_threshold,
+            )
+
+            if drawdown_percent < 0 and abs(drawdown_percent) >= drop_threshold:
+                state.update({
+                    "state": _DipRecoveryState.TRACKING_DROP,
+                    "reference_high": reference_high,
+                    "reference_high_time": now,
+                    "lowest_price": current_price,
+                    "lowest_price_time": now,
+                    "tracking_started_at": now,
+                    "ticks_since_new_low": 0,
+                })
+                self._dip_recovery_states[bot.id] = state
+                exp.state(_DipRecoveryState.TRACKING_DROP).next_trade(
+                    current=abs(drawdown_percent), current_label="Decline so far (%)",
+                    target=drop_threshold, target_label="Drop threshold (%)",
+                    distance=0.0, status="drop confirmed - tracking bottom for a reversal",
+                )
+                return TradeSignal(
+                    action="hold", amount=0,
+                    reason=(
+                        f"Dip Recovery: Significant decline detected "
+                        f"({abs(drawdown_percent):.2f}% >= {drop_threshold:.2f}%) - tracking bottom"
+                    )
+                )
+
+            needed = max(0.0, drop_threshold - abs(drawdown_percent))
+            exp.next_trade(
+                current=abs(drawdown_percent), current_label="Current drawdown (%)",
+                target=drop_threshold, target_label="Required (%)", distance=needed,
+                status=f"{needed:.2f}% further decline needed to arm monitoring",
+            )
+            self._dip_recovery_states[bot.id] = state
+            return TradeSignal(
+                action="hold", amount=0,
+                reason=(
+                    f"Dip Recovery: No significant decline "
+                    f"({abs(drawdown_percent):.2f}% < {drop_threshold:.2f}%)"
+                )
+            )
+
+        # === TRACKING_DROP / WAITING_REVERSAL ===
+        return self._dip_recovery_manage_setup(
+            bot, state, price_history, current_price, atr, atr_percent, is_spike, now,
+            recovery_threshold, require_ema_slope, ema_slope_period,
+            require_no_new_low, min_ticks_no_new_low, setup_expiry_min,
+            risk_percent, take_profit_atr_mult, trailing_atr_mult, emergency_atr_mult,
+            exp,
+        )
+
+    def _dip_recovery_manage_setup(
+        self,
+        bot: Bot,
+        state: dict,
+        price_history: list,
+        current_price: float,
+        atr: float,
+        atr_percent: float,
+        is_spike: bool,
+        now: datetime,
+        recovery_threshold: float,
+        require_ema_slope: bool,
+        ema_slope_period: int,
+        require_no_new_low: bool,
+        min_ticks_no_new_low: int,
+        setup_expiry_min: float,
+        risk_percent: float,
+        take_profit_atr_mult: float,
+        trailing_atr_mult: float,
+        emergency_atr_mult: float,
+        exp: ExplanationBuilder,
+    ) -> TradeSignal:
+        """Handle TRACKING_DROP / WAITING_REVERSAL: track the bottom, then
+        confirm and arm a BUY once price has genuinely reversed off it.
+
+        Never buys on the way down - only once recovery_percent clears the
+        adaptive threshold AND every enabled confirmation filter passes.
+        """
+        reference_high = state.get("reference_high")
+        tracking_started_at = state.get("tracking_started_at")
+
+        # Invalidation: setup has gone stale without confirming a reversal.
+        elapsed_minutes = (
+            (now - tracking_started_at).total_seconds() / 60.0 if tracking_started_at else 0.0
+        )
+        if elapsed_minutes >= setup_expiry_min:
+            self._dip_recovery_states[bot.id] = self._dip_recovery_default_state()
+            exp.state(_DipRecoveryState.IDLE).check(
+                "Setup expiry", f"{elapsed_minutes:.1f} min", f"< {setup_expiry_min} min", False,
+            )
+            return TradeSignal(
+                action="hold", amount=0,
+                reason=(
+                    f"Dip Recovery: Setup expired after {elapsed_minutes:.1f} min "
+                    "without a confirmed reversal - back to IDLE"
+                )
+            )
+
+        # Invalidation: price fully round-tripped past the original high
+        # without ever confirming entry - no longer "the dip"; reset and re-watch.
+        if reference_high and current_price >= reference_high:
+            self._dip_recovery_states[bot.id] = self._dip_recovery_default_state()
+            exp.state(_DipRecoveryState.IDLE)
+            return TradeSignal(
+                action="hold", amount=0,
+                reason=(
+                    "Dip Recovery: Price recovered past the original reference high "
+                    "without confirmation - resetting"
+                )
+            )
+
+        lowest_price = state.get("lowest_price", current_price)
+        is_new_low = (not is_spike) and current_price < lowest_price
+
+        if is_new_low:
+            state["lowest_price"] = current_price
+            state["lowest_price_time"] = now
+            state["ticks_since_new_low"] = 0
+            lowest_price = current_price
+        else:
+            state["ticks_since_new_low"] = state.get("ticks_since_new_low", 0) + 1
+
+        recovery_percent = (
+            (current_price - lowest_price) / lowest_price * 100.0 if lowest_price > 0 else 0.0
+        )
+
+        if recovery_percent <= 0:
+            # Still at/below the tracked low - no reversal yet, nothing to confirm.
+            state["state"] = _DipRecoveryState.TRACKING_DROP
+            self._dip_recovery_states[bot.id] = state
+            exp.state(_DipRecoveryState.TRACKING_DROP).update({
+                "current_price": current_price, "lowest_price": lowest_price,
+                "atr": atr, "atr_percent": atr_percent, "recovery_percent": recovery_percent,
+                "recovery_threshold_percent": recovery_threshold,
+            })
+            exp.check("New low tracking", current_price, f"<= {lowest_price:.4f}", True)
+            return TradeSignal(
+                action="hold", amount=0,
+                reason=f"Dip Recovery: Still declining, tracking bottom (${lowest_price:.4f})"
+            )
+
+        # Price has bounced off the low - evaluate reversal confirmation.
+        ema_series = self._calculate_ema(price_history, ema_slope_period)
+        ema_slope_positive = len(ema_series) >= 2 and ema_series[-1] > ema_series[-2]
+        ema_ok = (not require_ema_slope) or ema_slope_positive
+
+        no_new_low_ok = (
+            (not require_no_new_low) or state["ticks_since_new_low"] >= min_ticks_no_new_low
+        )
+
+        recovery_ok = recovery_percent >= recovery_threshold
+        entry_ready = recovery_ok and ema_ok and no_new_low_ok
+
+        decline_ratio = (
+            abs((reference_high - lowest_price) / reference_high * 100.0) / atr_percent
+            if reference_high and atr_percent > 0 else 0.0
+        )
+        recovery_ratio = recovery_percent / atr_percent if atr_percent > 0 else 0.0
+        opportunity_score = self._dip_recovery_score_from_ratios(decline_ratio, recovery_ratio)
+
+        exp.update({
+            "current_price": current_price, "lowest_price": lowest_price,
+            "atr": atr, "atr_percent": atr_percent,
+            "recovery_percent": recovery_percent, "recovery_threshold_percent": recovery_threshold,
+            "ticks_since_new_low": state["ticks_since_new_low"],
+            "ema_slope_positive": ema_slope_positive,
+            "opportunity_score": opportunity_score * 10.0,
+        })
+        exp.check(
+            "Recovery from bottom", f"{recovery_percent:.3f}%",
+            f">= {recovery_threshold:.3f}%", recovery_ok,
+        )
+        if require_ema_slope:
+            exp.check("Short EMA slope positive", ema_slope_positive, "True", ema_slope_positive)
+        if require_no_new_low:
+            exp.check(
+                "No new low", state["ticks_since_new_low"],
+                f">= {min_ticks_no_new_low} ticks", no_new_low_ok,
+            )
+
+        if not entry_ready:
+            state["state"] = _DipRecoveryState.WAITING_REVERSAL
+            self._dip_recovery_states[bot.id] = state
+            needed = max(0.0, recovery_threshold - recovery_percent)
+            exp.state(_DipRecoveryState.WAITING_REVERSAL).next_trade(
+                current=recovery_percent, current_label="Recovery from bottom (%)",
+                target=recovery_threshold, target_label="Required (%)", distance=needed,
+                status="waiting for full reversal confirmation",
+            )
+            return TradeSignal(
+                action="hold", amount=0,
+                reason=(
+                    f"Dip Recovery: Reversal forming ({recovery_percent:.2f}%/"
+                    f"{recovery_threshold:.2f}% required) - awaiting confirmation"
+                )
+            )
+
+        # === ENTRY ARMED -> BUY ===
+        exp.state(_DipRecoveryState.ENTRY_ARMED)
+
+        risk_amount = bot.current_balance * risk_percent
+        trailing_distance = atr * trailing_atr_mult
+        if trailing_distance > 0:
+            position_coins = risk_amount / trailing_distance
+            position_size = position_coins * current_price
+        else:
+            position_size = risk_amount
+
+        buy_amount = min(position_size, bot.current_balance * _BUY_BALANCE_FRACTION)
+        if buy_amount < MIN_ORDER_USD:
+            if bot.current_balance >= MIN_ORDER_USD:
+                buy_amount = MIN_ORDER_USD
+            else:
+                self._dip_recovery_states[bot.id] = state
+                return TradeSignal(
+                    action="hold", amount=0,
+                    reason=(
+                        f"Dip Recovery: balance ${bot.current_balance:.2f} below "
+                        f"${MIN_ORDER_USD:.0f} minimum order"
+                    ),
+                )
+
+        # Viability pre-check before state mutation: expected move = distance from
+        # entry to the strategy's take-profit target (atr × take_profit_atr_mult).
+        # This is the genuine profit objective baked into the strategy — not
+        # invented — and must cover round-trip fees before we commit state.
+        _dr_expected_move = (atr * take_profit_atr_mult) / current_price if current_price > 0 else 0.0
+        _fee_raw_dr = getattr(bot, 'exchange_fee', 0.1)
+        _dr_fee_pct = (
+            float(_fee_raw_dr) if isinstance(_fee_raw_dr, (int, float)) else 0.1
+        ) / 100.0
+        _dr_min_move = 2.0 * _dr_fee_pct + _VIABILITY_SAFETY_MARGIN_PCT
+        if _dr_expected_move < _dr_min_move:
+            self._dip_recovery_states[bot.id] = state
+            return TradeSignal(
+                action="hold",
+                amount=0,
+                reason=(
+                    f"Dip Recovery: take-profit {_dr_expected_move * 100:.3f}% < "
+                    f"fee threshold {_dr_min_move * 100:.3f}% "
+                    f"(exchange_fee={_dr_fee_pct * 100:.2f}%)"
+                ),
+            )
+
+        entry_price = current_price
+        self._dip_recovery_states[bot.id] = {
+            **self._dip_recovery_default_state(),
+            "state": _DipRecoveryState.LONG_OPEN,
+            "entry_price": entry_price,
+            "entry_time": now,
+            "entry_atr": atr,
+            "highest_price_since_entry": entry_price,
+            "trailing_stop": entry_price - (atr * trailing_atr_mult),
+            "take_profit": entry_price + (atr * take_profit_atr_mult),
+            "emergency_stop": entry_price - (atr * emergency_atr_mult),
+        }
+
+        logger.info(
+            f"Bot {bot.id}: Dip Recovery ENTRY - Price ${entry_price:.4f}, "
+            f"recovery {recovery_percent:.2f}% (required {recovery_threshold:.2f}%), "
+            f"ATR ${atr:.4f}, Position ${buy_amount:.2f}"
+        )
+
+        # Risk side for the reward:risk viability check: distance to the
+        # INITIAL trailing stop (atr × trailing_atr_mult) — the first exit that
+        # would trigger on adverse movement, not the wider emergency_stop
+        # (a last-resort net beyond the trailing stop, not the intended risk).
+        _dr_expected_risk = (atr * trailing_atr_mult) / current_price if current_price > 0 else 0.0
+
+        return TradeSignal(
+            action="buy", amount=buy_amount, order_type="market",
+            reason=(
+                f"Dip Recovery: Reversal confirmed ({recovery_percent:.2f}% >= "
+                f"{recovery_threshold:.2f}%) after decline - entering"
+            ),
+            expected_move_pct=_dr_expected_move,
+            expected_risk_pct=_dr_expected_risk,
+        )
+
+    def _dip_recovery_exit_signal(
+        self,
+        bot: Bot,
+        pos,
+        current_price: float,
+        entry_price: float,
+        unrealized_pnl_pct: float,
+        reason: str,
+        cooldown_secs: float,
+        now: datetime,
+    ) -> TradeSignal:
+        """Build the SELL signal for a Dip Recovery exit and reset state to
+        COOLDOWN. Single source of truth for the cooldown-reset behaviour so
+        every exit path (take-profit, trailing stop, emergency stop, max
+        duration) resets state identically.
+        """
+        sell_amount = pos.amount * current_price
+        is_loss = current_price < entry_price
+        self._dip_recovery_states[bot.id] = {
+            **self._dip_recovery_default_state(),
+            "state": _DipRecoveryState.COOLDOWN,
+            "cooldown_until": now + timedelta(seconds=cooldown_secs),
+            "last_exit_was_loss": is_loss,
+        }
+        logger.info(
+            f"Bot {bot.id}: Dip Recovery EXIT ({reason}) - Price ${current_price:.4f}, "
+            f"Entry ${entry_price:.4f}, PnL {unrealized_pnl_pct:+.2f}%"
+        )
+        return TradeSignal(
+            action="sell", amount=sell_amount, order_type="market",
+            reason=f"Dip Recovery: Exit ({reason}), PnL {unrealized_pnl_pct:+.2f}%",
+        )
+
+    def _dip_recovery_manage_exit(
+        self,
+        bot: Bot,
+        state: dict,
+        positions: list,
+        current_price: float,
+        atr: float,
+        now: datetime,
+        take_profit_atr_mult: float,
+        trailing_atr_mult: float,
+        emergency_atr_mult: float,
+        max_duration_min: float,
+        cooldown_seconds: float,
+        loss_cooldown_seconds: float,
+        exp: ExplanationBuilder,
+    ) -> TradeSignal:
+        """Manage an open Dip Recovery position: take-profit, monotonic
+        trailing stop, emergency stop, and max-duration exits, each routed
+        through a loss-aware cooldown (see _dip_recovery_exit_signal).
+        """
+        entry_price = state.get("entry_price")
+        entry_atr_locked = state.get("entry_atr") or atr  # fallback for legacy/corrupted state
+        entry_time = state.get("entry_time") or now
+        if entry_price is None:
+            # Defensive: a position exists but entry was never recorded (state
+            # lost before restart-restore). Adopt current price as entry so
+            # exits still function instead of crashing or buying again.
+            entry_price = current_price
+            entry_atr_locked = atr
+
+        previous_highest = state.get("highest_price_since_entry") or entry_price
+        highest = max(previous_highest, current_price)
+        trailing_stop = state.get("trailing_stop")
+        if trailing_stop is None or highest > previous_highest:
+            # Monotonic tightening only - risk never expands (same convention
+            # as trend_following / volatility_breakout).
+            trailing_stop = highest - (entry_atr_locked * trailing_atr_mult)
+        take_profit = state.get("take_profit") or (
+            entry_price + entry_atr_locked * take_profit_atr_mult
+        )
+        emergency_stop = state.get("emergency_stop") or (
+            entry_price - entry_atr_locked * emergency_atr_mult
+        )
+
+        duration_minutes = (now - entry_time).total_seconds() / 60.0
+        unrealized_pnl_pct = (
+            (current_price - entry_price) / entry_price * 100.0 if entry_price > 0 else 0.0
+        )
+
+        state.update({
+            "state": _DipRecoveryState.LONG_OPEN, "entry_price": entry_price,
+            "entry_time": entry_time, "entry_atr": entry_atr_locked,
+            "highest_price_since_entry": highest, "trailing_stop": trailing_stop,
+            "take_profit": take_profit, "emergency_stop": emergency_stop,
+        })
+
+        exp.state(_DipRecoveryState.LONG_OPEN).update({
+            "current_price": current_price, "entry_price": entry_price, "highest_price": highest,
+            "trailing_stop": trailing_stop, "take_profit": take_profit,
+            "emergency_stop": emergency_stop, "unrealized_pnl_percent": unrealized_pnl_pct,
+            "position_duration_minutes": duration_minutes,
+        })
+        exp.check("Take profit hit", current_price, f">= {take_profit:.4f}", current_price >= take_profit)
+        exp.check("Trailing stop hit", current_price, f"<= {trailing_stop:.4f}", current_price <= trailing_stop)
+        exp.check(
+            "Max duration", f"{duration_minutes:.1f} min",
+            f"< {max_duration_min} min", duration_minutes < max_duration_min,
+        )
+        exp.next_trade(
+            current=current_price, current_label="Current price",
+            target=(take_profit if unrealized_pnl_pct >= 0 else trailing_stop),
+            target_label=("Take profit" if unrealized_pnl_pct >= 0 else "Trailing stop"),
+            distance=(take_profit - current_price),
+            status="holding - exits on take-profit, trailing stop, emergency stop, or max duration",
+        )
+
+        for pos in positions:
+            if current_price >= take_profit:
+                return self._dip_recovery_exit_signal(
+                    bot, pos, current_price, entry_price, unrealized_pnl_pct,
+                    "take profit", cooldown_seconds, now,
+                )
+            if current_price <= trailing_stop:
+                cd = loss_cooldown_seconds if current_price < entry_price else cooldown_seconds
+                return self._dip_recovery_exit_signal(
+                    bot, pos, current_price, entry_price, unrealized_pnl_pct,
+                    "trailing stop", cd, now,
+                )
+            if current_price <= emergency_stop:
+                return self._dip_recovery_exit_signal(
+                    bot, pos, current_price, entry_price, unrealized_pnl_pct,
+                    "emergency stop", loss_cooldown_seconds, now,
+                )
+            if duration_minutes >= max_duration_min:
+                cd = loss_cooldown_seconds if unrealized_pnl_pct < 0 else cooldown_seconds
+                return self._dip_recovery_exit_signal(
+                    bot, pos, current_price, entry_price, unrealized_pnl_pct,
+                    "max duration", cd, now,
+                )
+
+        self._dip_recovery_states[bot.id] = state
+        return TradeSignal(
+            action="hold", amount=0,
+            reason=(
+                f"Dip Recovery: Holding (PnL {unrealized_pnl_pct:+.2f}%, "
+                f"trailing stop ${trailing_stop:.4f}, take profit ${take_profit:.4f})"
+            ),
+        )
 
     async def _strategy_auto(
         self,
@@ -4105,31 +5099,45 @@ class TradingEngine:
         # Sort by final score (descending)
         scored_strategies.sort(key=lambda x: x[1], reverse=True)
 
+        # === POSITION CHECK ===
+        # Needed to separate entry eligibility (should Auto allocate NEW capital
+        # to this strategy) from exit management (should an OPEN position be
+        # closed). These are different questions - see FORCE-EXIT CHECK below.
+        open_positions = await self._get_bot_positions(bot.id, session)
+        has_open_position = len(open_positions) > 0
+
         # === FORCE-EXIT CHECK ===
+        # _is_strategy_eligible() is an ENTRY ALLOCATION GATE ONLY (regime match,
+        # cooldown, blacklist, kill switch) - it answers "should Auto put new
+        # capital into this strategy right now?", not "should an existing
+        # position be closed?" A strategy that entered correctly owns its own
+        # exit rules (trailing stop, target reached, trend break, failed
+        # breakout, time stop, strategy-specific invalidation) and must be
+        # allowed to finish its trade even after the market moves out of its
+        # entry regime. Auto Mode used to market-sell ("FORCE EXIT") the
+        # instant the current strategy's entry regime rotated out, closing
+        # positions before their own exit logic ever ran.
         current_strategy = auto_state["current_strategy"]
-        force_exit_signal = None
+        current_ineligible = current_strategy not in eligible_strategies
+        pinned_for_exit = current_ineligible and has_open_position
 
-        # Check if current strategy is ineligible
-        if current_strategy not in eligible_strategies:
-            force_exit_reason = ineligible_reasons.get(current_strategy, "unknown")
-            logger.warning(
-                f"Bot {bot.id}: Auto Mode FORCE EXIT - {current_strategy} became ineligible: {force_exit_reason}"
+        if pinned_for_exit:
+            # Keep running the current strategy's own executor below so it
+            # manages the open position with its own exit rules. Losing entry
+            # eligibility because the market regime moved on is normal and is
+            # NOT a strategy failure - do not record a failure, cooldown, or
+            # blacklist for it (see Fix 2 / _record_strategy_failure).
+            ineligible_reason = ineligible_reasons.get(current_strategy, "unknown")
+            logger.info(
+                f"Bot {bot.id}: Auto Mode - {current_strategy} lost entry eligibility "
+                f"({ineligible_reason}) but has an open position; delegating to its own "
+                f"exit rules instead of force-selling."
             )
-            force_exit_signal = TradeSignal(
-                action="sell",
-                amount=0,  # Sell all
-                reason=f"Auto Mode FORCE EXIT: {current_strategy} ineligible ({force_exit_reason})"
-            )
-
-            # Record failure
-            await self._record_strategy_failure(
-                bot_id=bot.id,
-                auto_state=auto_state,
-                strategy_name=current_strategy,
-                reason=force_exit_reason,
-                now=now,
-                cooldown_hours=cooldown_hours_default,
-                session=session
+        elif current_ineligible:
+            logger.info(
+                f"Bot {bot.id}: Auto Mode - {current_strategy} lost entry eligibility "
+                f"({ineligible_reasons.get(current_strategy, 'unknown')}); no open position "
+                f"to protect, reallocating."
             )
 
         # === STRATEGY SELECTION WITH HYSTERESIS ===
@@ -4143,8 +5151,16 @@ class TradingEngine:
         should_switch = False
         switch_reason = ""
 
-        if current_strategy not in eligible_strategies:
-            # Hard switch: current strategy is ineligible (regime change, kill switch, etc.)
+        if pinned_for_exit:
+            # Do not reallocate while an ineligible strategy still holds a
+            # position - it keeps running (and executing below) until its own
+            # exit rules close it out.
+            switch_reason = (
+                f"{current_strategy} not entry-eligible but holding an open position; "
+                f"pinned until its own exit rules close it"
+            )
+        elif current_ineligible:
+            # No open position to protect - free to reallocate immediately.
             selected_strategy = best_strategy
             should_switch = True
             switch_reason = f"current strategy ineligible, switching to {best_strategy}"
@@ -4240,7 +5256,7 @@ class TradingEngine:
             exp.candidate({
                 "strategy": _name,
                 "opportunity": None, "performance": None, "risk": None, "final": None,
-                "eligible": False, "selected": False, "reason": _reason,
+                "eligible": False, "selected": _name == current_strategy, "reason": _reason,
             })
         exp.select(current_strategy)
         exp.update({
@@ -4248,20 +5264,16 @@ class TradingEngine:
             "selected_strategy": current_strategy,
             "switch_reason": switch_reason,
             "eligible_count": len(eligible_strategies),
+            "pinned_for_exit": pinned_for_exit,
         })
         exp.check(
             "Strategy selected", current_strategy,
             "highest final score among eligible", True, detail=switch_reason,
         )
-        # On force-exit there is no sub-strategy delegation below to set a state,
-        # so stamp it here. Otherwise the selected sub-strategy sets its own state.
-        if force_exit_signal:
-            exp.state("FORCE_EXIT")
         # ---------------------------------------------------------------------
-
-        # === FORCE EXIT EXECUTION ===
-        if force_exit_signal:
-            return force_exit_signal
+        # No force-exit branch here anymore: the selected strategy's own
+        # executor always runs below and sets its own state (including exit
+        # states like WAITING_EXIT/LONG_OPEN when pinned_for_exit is true).
 
         # === STRATEGY EXECUTION ===
         strategy_executor = self._get_strategy_executor(current_strategy)
@@ -4274,8 +5286,17 @@ class TradingEngine:
                 reason=f"Auto Mode: Invalid strategy {current_strategy}"
             )
 
-        # Execute the selected strategy
-        signal = await strategy_executor(bot, current_price, params, session)
+        # Execute the selected strategy. Mark this call as coming through
+        # Auto's own supervised dispatch - as opposed to some future direct/
+        # unsupervised call - so a sub-strategy can tell the difference from
+        # bot.strategy alone. bot.strategy reads "auto_mode" for every
+        # Auto-managed bot no matter which sub-strategy is currently
+        # selected, so it cannot answer "am I being run under supervision?"
+        # by itself (see _strategy_dca's own guard). Copied, not mutated, so
+        # the caller's params dict is never altered.
+        dispatched_params = dict(params)
+        dispatched_params["_invoked_by_auto"] = True
+        signal = await strategy_executor(bot, current_price, dispatched_params, session)
 
         if signal:
             # Add auto mode context to reason
@@ -4291,6 +5312,59 @@ class TradingEngine:
                 self._save_auto_state(bot.id, auto_state)
 
         return signal
+
+    def _classify_trend_state(self, ema_short: list, ema_long: list) -> str:
+        """Classify trend_state ("up"/"down"/"flat") from EMA-20 vs EMA-50 using
+        both a fast and a medium lookback slope of the short EMA.
+
+        A fast-only slope (few bars back) only sees short-term momentum, so a
+        slow but sustained move - a multi-hour grind that never produces a
+        sharp short-term kink - is invisible to it and gets classified "flat"
+        even though it is a real, persistent trend. The medium slope looks
+        further back along the same EMA series so a sustained move is caught
+        even when every short slice looks flat, while genuine chop still nets
+        out near zero over the medium window and stays "flat" too. Both
+        windows are expressed in bar counts, not fixed durations, so this
+        scales with whatever bar interval the caller is aggregating at rather
+        than being tuned to one asset's typical move size or a fixed calendar
+        horizon like "24h".
+        """
+        n = len(ema_short)
+        ema_now = ema_short[-1]
+        ema_long_now = ema_long[-1]
+
+        FAST_LOOKBACK = 5
+        FAST_THRESHOLD_PCT = 0.5
+        MEDIUM_LOOKBACK = min(n - 1, 30)
+        MEDIUM_THRESHOLD_PCT = 1.0
+
+        fast_prev = ema_short[-FAST_LOOKBACK] if n >= FAST_LOOKBACK else ema_short[0]
+        fast_slope_pct = (
+            (ema_now - fast_prev) / fast_prev * 100 if fast_prev > 0 else 0.0
+        )
+
+        if MEDIUM_LOOKBACK > FAST_LOOKBACK:
+            medium_prev = ema_short[-MEDIUM_LOOKBACK]
+            medium_slope_pct = (
+                (ema_now - medium_prev) / medium_prev * 100 if medium_prev > 0 else 0.0
+            )
+        else:
+            medium_slope_pct = fast_slope_pct
+
+        is_up = (
+            (fast_slope_pct > FAST_THRESHOLD_PCT or medium_slope_pct > MEDIUM_THRESHOLD_PCT)
+            and ema_now > ema_long_now
+        )
+        is_down = (
+            (fast_slope_pct < -FAST_THRESHOLD_PCT or medium_slope_pct < -MEDIUM_THRESHOLD_PCT)
+            and ema_now < ema_long_now
+        )
+
+        if is_up:
+            return "up"
+        if is_down:
+            return "down"
+        return "flat"
 
     def _detect_market_regime(self, price_history: list, current_regime: Optional[dict]) -> dict:
         """Detect market regime from a plain price series (tick/close prices).
@@ -4323,20 +5397,11 @@ class TradingEngine:
         if n < 20:
             return neutral
 
-        # === TREND STATE (EMA slope, same thresholds as bar-based variant) ===
+        # === TREND STATE (fast + medium EMA slope, same thresholds as bar-based variant) ===
         ema_20 = self._calculate_ema(prices, 20)
         ema_50 = self._calculate_ema(prices, 50) if n >= 50 else ema_20
 
-        ema_20_current = ema_20[-1]
-        ema_20_prev = ema_20[-5] if len(ema_20) >= 5 else ema_20[0]
-        ema_slope_pct = ((ema_20_current - ema_20_prev) / ema_20_prev) * 100 if ema_20_prev > 0 else 0
-
-        if ema_slope_pct > 0.5 and ema_20_current > ema_50[-1]:
-            trend_state = "up"
-        elif ema_slope_pct < -0.5 and ema_20_current < ema_50[-1]:
-            trend_state = "down"
-        else:
-            trend_state = "flat"
+        trend_state = self._classify_trend_state(ema_20, ema_50)
 
         # === VOLATILITY STATE (absolute price change as true-range proxy) ===
         changes = [abs(prices[i] - prices[i - 1]) for i in range(max(1, n - 30), n)]
@@ -4385,20 +5450,11 @@ class TradingEngine:
         closes = [bar["close"] for bar in bar_history]
         n = len(closes)
 
-        # === TREND STATE (using EMA slope on bar closes) ===
+        # === TREND STATE (fast + medium EMA slope on bar closes) ===
         ema_20 = self._calculate_ema(closes, 20)
         ema_50 = self._calculate_ema(closes, 50) if n >= 50 else ema_20
 
-        ema_20_current = ema_20[-1]
-        ema_20_prev = ema_20[-5] if len(ema_20) >= 5 else ema_20[0]
-        ema_slope_pct = ((ema_20_current - ema_20_prev) / ema_20_prev) * 100 if ema_20_prev > 0 else 0
-
-        if ema_slope_pct > 0.5 and ema_20_current > ema_50[-1]:
-            new_trend = "up"
-        elif ema_slope_pct < -0.5 and ema_20_current < ema_50[-1]:
-            new_trend = "down"
-        else:
-            new_trend = "flat"
+        new_trend = self._classify_trend_state(ema_20, ema_50)
 
         # === VOLATILITY STATE (using true range from bars) ===
         # Calculate ATR using actual bar high/low
@@ -4762,7 +5818,70 @@ class TradingEngine:
             # 5% drawdown → ~10 (strong accumulation opportunity)
             return _clamp(drawdown_pct * 1.4 + 3.0)
 
+        elif strategy_name == "dip_recovery":
+            # Opportunity = a decline that is LARGE relative to normal volatility
+            # AND already showing an early bounce off a local low. Mirrors the
+            # live strategy's own adaptive-threshold logic (drop vs ATR%,
+            # recovery-from-low vs ATR%, see _strategy_dip_recovery) but is
+            # computed here from auto_mode's own bar history rather than the
+            # strategy's tick-level state, since dip_recovery may not be the
+            # currently-running sub-strategy yet. Delegates the actual score
+            # curve to _dip_recovery_score_from_ratios so the math is defined
+            # exactly once and shared with the live strategy's own diagnostics.
+            atrs = _atr_series(highs, lows, 14)
+            atr = atrs[-1] if atrs else 0.0
+            atr_pct = (atr / current_price * 100.0) if current_price > 0 else 0.0
+            if atr_pct <= 0:
+                return 5.0
+
+            recent_c = closes[-min(30, n):]
+            recent_high = max(recent_c)
+            high_idx = recent_c.index(recent_high)
+            after_high = recent_c[high_idx:] or recent_c
+            lowest = min(after_high)
+
+            decline_pct = (recent_high - lowest) / recent_high * 100.0 if recent_high > 0 else 0.0
+            recovery_pct = (current_price - lowest) / lowest * 100.0 if lowest > 0 else 0.0
+
+            decline_ratio = decline_pct / atr_pct
+            recovery_ratio = max(0.0, recovery_pct) / atr_pct
+            return self._dip_recovery_score_from_ratios(decline_ratio, recovery_ratio)
+
         return 5.0  # neutral for unknown strategies
+
+    def _dip_recovery_score_from_ratios(self, decline_ratio: float, recovery_ratio: float) -> float:
+        """Dip Recovery opportunity score (0-10) from ATR-normalized ratios.
+
+        decline_ratio: how many ATR%s deep the tracked decline is (depth of
+            drop relative to normal volatility for this pair right now).
+        recovery_ratio: how many ATR%s the price has already bounced off its
+            local low.
+
+        Shared by _compute_opportunity_score's "dip_recovery" branch (fed
+        approximate ratios from auto_mode's bar history) AND
+        _strategy_dip_recovery's own explanation (fed its exact, precisely
+        tracked ratios) - one formula, two callers, so Auto Mode ranking and
+        the strategy's own "Opportunity score" diagnostic never disagree on
+        what a given setup is worth.
+
+        Low score (no real decline, e.g. sideways market): decline_ratio < 1.
+        Low score (already fully recovered / mature uptrend, nothing left to
+        catch): recovery_ratio > 3. Otherwise scales with both a real decline
+        having occurred AND an early reversal forming - the "sweet spot" this
+        strategy targets. A market still actively falling (recovery_ratio ~ 0)
+        scores low too: recovery_score is only ~2 until a bounce is underway.
+        """
+        def _clamp(v: float) -> float:
+            return max(0.0, min(10.0, v))
+
+        if decline_ratio < 1.0:
+            return _clamp(2.0)
+        if recovery_ratio > 3.0:
+            return _clamp(4.0)
+
+        decline_score = _clamp(decline_ratio * 2.0)          # ratio 2.5 -> 5, ratio 5 -> 10
+        recovery_score = _clamp(recovery_ratio * 3.0 + 2.0)  # ratio 0 -> 2, ratio 1 -> 5, ratio 2.67 -> 10
+        return _clamp(decline_score * 0.5 + recovery_score * 0.5)
 
     def _score_strategy(
         self,
@@ -5256,37 +6375,54 @@ class TradingEngine:
                 # trend_up: classic momentum setup
                 # volatility_expanding: early breakout phase, TF capitalises on
                 #   expanding moves before "trend_up" is confirmed
+                # NOTE: _strategy_trend_following has no internal regime gate of
+                # its own - this table is its ONLY regime awareness under Auto,
+                # so there is nothing for it to contradict.
                 "allowed_regimes": ["trend_up", "volatility_expanding"],
                 "priority": 4,
                 "typical_holding_time": "long",
                 "description": "Best for sustained uptrends with clear momentum"
             },
             "volatility_breakout": {
-                # volatility_contracting: compression phase — ATR shrinking means
-                #   a squeeze is building; "breakout conditions building" = high opp score
-                # volatility_low: absolute low vol also signals compression
-                "allowed_regimes": ["volatility_contracting", "volatility_low"],
+                # Must match _strategy_volatility_breakout's own regime_filter
+                # default (allowed_regimes=["volatility_expanding"], see the
+                # strategy's REGIME GATING section). The strategy itself only
+                # ever enters once volatility has expanded (breakout confirmed)
+                # - it does NOT enter during compression, it just watches for
+                # one. The old ["volatility_contracting", "volatility_low"]
+                # value here declared it Auto-eligible during compression and
+                # then ineligible the instant it actually expanded and entered,
+                # which caused force-exits right at (or just after) entry.
+                "allowed_regimes": ["volatility_expanding"],
                 "priority": 3,
                 "typical_holding_time": "medium",
                 "description": "Captures breakouts after volatility compression"
             },
             "mean_reversion": {
-                # Only eligible in flat/ranging markets; TF flips, expanding vol
-                # both indicate a trending move that breaks mean-reversion
-                "allowed_regimes": ["trend_flat"],
+                # Must match _strategy_mean_reversion's own hardcoded regime gate
+                # (allowed_regimes = ["trend_flat", "volatility_high"] in its
+                # REGIME GATING section) - it also trades high-volatility fades,
+                # not just flat/ranging markets.
+                "allowed_regimes": ["trend_flat", "volatility_high"],
                 "priority": 2,
                 "typical_holding_time": "short",
                 "description": "Profits from price mean reversion in choppy markets"
             },
             "adaptive_grid": {
-                # Flat trend + stable/medium volatility = ideal grid conditions
-                "allowed_regimes": ["trend_flat", "volatility_medium", "volatility_stable"],
+                # Must match _strategy_grid's own regime gate default
+                # (allowed_regimes = ["trend_flat", "volatility_medium"]), which
+                # only ever checks trend_state/volatility_state tags. The old
+                # "volatility_stable" entry here referred to volatility_direction,
+                # a tag the grid's own gate never inspects, so it was eligible
+                # here for a condition the strategy itself would never act on.
+                "allowed_regimes": ["trend_flat", "volatility_medium"],
                 "priority": 2,
                 "typical_holding_time": "medium",
                 "description": "Range-bound grid trading for sideways markets"
             },
             "funding_carry": {
-                # Eligible in uptrend and flat markets; downtrend disqualifies
+                # Eligible in uptrend and flat markets; downtrend disqualifies.
+                # Matches _strategy_funding_carry's own default exactly.
                 "allowed_regimes": ["trend_up", "trend_flat"],
                 "priority": 3,
                 "typical_holding_time": "long",
@@ -5299,6 +6435,19 @@ class TradingEngine:
                 "priority": 0,
                 "typical_holding_time": "long",
                 "description": "Safe default accumulator for all market conditions"
+            },
+            "dip_recovery": {
+                # trend_down: the decline this strategy tracks a bottom during.
+                # volatility_expanding / volatility_high: sharp, fast moves are
+                #   exactly the setup it targets (pullback reversal, not a slow grind).
+                # NOTE: _strategy_dip_recovery has no internal regime gate of its
+                # own (its entry protection is its ATR-normalised decline/recovery
+                # ratio logic) - this table is its ONLY regime awareness under
+                # Auto, so there is nothing for it to contradict.
+                "allowed_regimes": ["trend_down", "volatility_expanding", "volatility_high"],
+                "priority": 3,
+                "typical_holding_time": "medium",
+                "description": "Buys confirmed reversals after significant declines - never buys a still-falling market"
             },
         }
 
@@ -5553,9 +6702,17 @@ class TradingEngine:
                 )
 
         # === STEP 5: EXECUTION COST ESTIMATION ===
-        # Get cost model (defaults to 0 cost, preserving current behavior)
+        # bot.exchange_fee is a persisted column (default 0.1 %).  The getattr
+        # fallback covers the window between a deploy and migration run.  The
+        # isinstance guard ensures tests that use Mock bots (where attribute
+        # access returns a non-numeric Mock) fall back to 0.1 % rather than
+        # propagating a non-numeric value into the cost model arithmetic.
+        _exec_fee_raw = getattr(bot, 'exchange_fee', 0.1)
+        _exec_fee_pct = (
+            float(_exec_fee_raw) if isinstance(_exec_fee_raw, (int, float)) else 0.1
+        )
         cost_model = get_cost_model(
-            exchange_fee_pct=getattr(bot, 'exchange_fee', 0.0) or 0.0,
+            exchange_fee_pct=_exec_fee_pct,
             market_spread_pct=0.0,  # TODO: Make configurable per bot
             slippage_pct=0.0,       # TODO: Make configurable per bot
             impact_pct=0.0,         # Not used for spot
@@ -5574,6 +6731,67 @@ class TradingEngine:
             f"spread=${cost_estimate.spread_cost:.4f}, "
             f"slip=${cost_estimate.slippage_cost:.4f})"
         )
+
+        # === STEP 5.5: TRADE VIABILITY GATE (fail-closed) ===
+        # Sells are never blocked — they close positions, not open risk.
+        # BUYs are checked differently by strategy type:
+        #   Accumulation (is_accumulation=True): fee sanity check only.
+        #   Directional (is_accumulation=False): expected_move > round_trip + margin.
+        # Viability rejections are VALID no-trade decisions, not failures.
+        # They do NOT increment the repeated-rejection circuit breaker counter.
+        if signal.action == "buy":
+            _fee_raw_gate = getattr(bot, 'exchange_fee', 0.1)
+            _fee_pct_gate = (
+                float(_fee_raw_gate) if isinstance(_fee_raw_gate, (int, float)) else 0.1
+            ) / 100.0
+
+            if signal.is_accumulation:
+                # Accumulation strategies have no per-trade price target.
+                # Sanity-check only: reject if exchange fee is absurdly high.
+                if _fee_pct_gate > _MAX_ACCUMULATION_FEE_PCT:
+                    reason = (
+                        f"exchange fee {_fee_pct_gate * 100:.2f}% exceeds "
+                        f"accumulation maximum {_MAX_ACCUMULATION_FEE_PCT * 100:.0f}%"
+                    )
+                    logger.warning(f"Bot {bot.id}: Trade REJECTED (viability/accumulation) - {reason}")
+                    diagnostics_store.record_blocked(bot.id, BLOCK_OTHER, reason)
+                    return None
+            else:
+                # Directional strategies must prove edge clears round-trip fees.
+                if not isinstance(signal.expected_move_pct, (int, float)):
+                    reason = "missing expected move estimate — strategy did not provide expected_move_pct"
+                    logger.warning(f"Bot {bot.id}: Trade REJECTED (viability) - {reason}")
+                    diagnostics_store.record_blocked(bot.id, BLOCK_OTHER, reason)
+                    return None
+
+                rt_cost_usd = cost_model.estimate_roundtrip_cost(
+                    notional_usd=signal.amount,
+                    price=current_price,
+                )
+                rt_cost_pct = rt_cost_usd / signal.amount if signal.amount > 0 else 0.0
+                min_viable_pct = rt_cost_pct + _VIABILITY_SAFETY_MARGIN_PCT
+                if signal.expected_move_pct < min_viable_pct:
+                    reason = (
+                        f"expected move {signal.expected_move_pct * 100:.3f}% < "
+                        f"round-trip {rt_cost_pct * 100:.3f}% + "
+                        f"margin {_VIABILITY_SAFETY_MARGIN_PCT * 100:.3f}% "
+                        f"= min {min_viable_pct * 100:.3f}%"
+                    )
+                    logger.warning(f"Bot {bot.id}: Trade REJECTED (viability) - {reason}")
+                    diagnostics_store.record_blocked(bot.id, BLOCK_OTHER, reason)
+                    return None
+
+                # Reward:risk check — a no-op when the strategy has no fixed
+                # stop (expected_risk_pct=None), so strategies not retrofitted
+                # with a locked stop keep their pre-existing behavior exactly.
+                rr_ok, rr_reason = evaluate_reward_risk(
+                    signal.expected_move_pct, signal.expected_risk_pct
+                )
+                if not rr_ok:
+                    reason = f"reward:risk check failed - {rr_reason}"
+                    logger.warning(f"Bot {bot.id}: Trade REJECTED (viability) - {reason}")
+                    diagnostics_store.record_blocked(bot.id, BLOCK_OTHER, reason)
+                    return None
 
         # === STEP 6: ORDER SIZE VALIDATION ===
         # Ensure order size is still meaningful after adjustments.
@@ -5634,7 +6852,7 @@ class TradingEngine:
         if execution_mode == "market" or signal.order_type == "market":
             logger.debug(f"Bot {bot.id}: Placing market order: {side} {amount_base:.6f} {bot.trading_pair}")
             exchange_order = await exchange.place_market_order(
-                bot.trading_pair, side, amount_base
+                bot.trading_pair, side, amount_base, reference_price=current_price
             )
         else:
             # Determine limit price: prefer limit_price, fallback to price, then current_price
@@ -5929,9 +7147,9 @@ class TradingEngine:
 
     def _cost_estimate_for(self, bot: Bot, action: str, notional: float, price: float):
         """Build a cost estimate for a recovered fill (mirrors _execute_trade)."""
-        cost_model = get_cost_model(
-            exchange_fee_pct=getattr(bot, 'exchange_fee', 0.0) or 0.0,
-        )
+        _fee_raw = getattr(bot, 'exchange_fee', 0.1)
+        _fee_pct = float(_fee_raw) if isinstance(_fee_raw, (int, float)) else 0.1
+        cost_model = get_cost_model(exchange_fee_pct=_fee_pct)
         return cost_model.estimate_cost(side=action, notional_usd=notional, price=price)
 
     async def _resolve_pending_orders(
@@ -6253,7 +7471,10 @@ class TradingEngine:
             logger.warning(f"Bot {bot_id}: _process_paper_trade called but no recovery state")
             return
 
-        taker_fee_rate = 0.001  # 0.1% per side
+        _fee_raw_pt = getattr(bot, 'exchange_fee', 0.1)
+        taker_fee_rate = (
+            float(_fee_raw_pt) if isinstance(_fee_raw_pt, (int, float)) else 0.1
+        ) / 100.0
 
         if signal.action == "buy":
             if recovery.get("paper_position") is None:
@@ -6584,7 +7805,9 @@ class TradingEngine:
             f"${slice_amount:.2f} {signal.action} @ ${current_price:.2f}"
         )
 
-        exchange_order = await exchange.place_market_order(bot.trading_pair, side, amount_base)
+        exchange_order = await exchange.place_market_order(
+            bot.trading_pair, side, amount_base, reference_price=current_price
+        )
 
         if not exchange_order:
             logger.error(f"Bot {bot.id}: TWAP slice {slices_executed + 1} failed to execute")
@@ -6738,7 +7961,9 @@ class TradingEngine:
         amount_base = signal.amount / current_price
         side = OrderSide.BUY if signal.action == "buy" else OrderSide.SELL
 
-        exchange_order = await exchange.place_market_order(bot.trading_pair, side, amount_base)
+        exchange_order = await exchange.place_market_order(
+            bot.trading_pair, side, amount_base, reference_price=current_price
+        )
 
         if not exchange_order:
             logger.error(f"Bot {bot.id}: VWAP execution failed")
@@ -7296,6 +8521,16 @@ class TradingEngine:
         if exchange is not None and hasattr(exchange, "export_state"):
             state["_sim_state"] = exchange.export_state()
 
+        # Recovery state lives in its own in-memory dict (self._recovery_states),
+        # not in _PERSISTED_STATE_ATTRS, because it is written eagerly by
+        # _enter_recovery_mode/_process_paper_trade on every transition rather
+        # than collected here. It must still ride along in this snapshot: this
+        # dict wholesale-replaces Bot.strategy_state (see _save_bot_state), so
+        # omitting it would erase recovery_mode on the very next checkpoint.
+        recovery = self._recovery_states.get(bot_id)
+        if recovery is not None:
+            state["recovery_mode"] = recovery
+
         return _to_jsonable(state)
 
     def _restore_bot_state(self, bot_id: int, strategy_state: dict) -> None:
@@ -7407,7 +8642,19 @@ class TradingEngine:
 
         # Persist ALL strategy runtime state (trailing stops, locked entry ATR,
         # cooldowns, price history) into the dedicated strategy_state column.
-        bot.strategy_state = self._collect_bot_state(bot_id)
+        new_state = self._collect_bot_state(bot_id)
+
+        # _collect_bot_state already carries recovery_mode when this process has
+        # a live in-memory copy (self._recovery_states). In the narrow window
+        # right after a restart — bot resumed into RECOVERY_MODE but the loop's
+        # first-tick restore (see _run_bot_loop) hasn't repopulated
+        # self._recovery_states yet — fall back to whatever is already
+        # persisted so this checkpoint cannot erase it.
+        existing = bot.strategy_state or {}
+        if "recovery_mode" not in new_state and "recovery_mode" in existing:
+            new_state["recovery_mode"] = existing["recovery_mode"]
+
+        bot.strategy_state = new_state
 
         # M5: strategy_params is user config only. Strip any runtime state that
         # older builds may have embedded there so it cannot pollute config or

@@ -128,6 +128,32 @@ STRATEGIES = [
             "funding_refresh_seconds": {"type": "number", "default": 300, "min": 30, "max": 3600, "description": "Funding-rate cache TTL in seconds (limits API calls)"},
         }
     ),
+    StrategyInfo(
+        name="dip_recovery",
+        display_name="Dip Recovery (Reversal Momentum)",
+        description="Pullback reversal strategy: monitors for a significant decline (relative to current volatility) but only buys after price has confirmed a reversal off a tracked local low. Never buys into a still-falling market - accepts a later entry for reduced downside risk.",
+        parameters={
+            "atr_period": {"type": "number", "default": 14, "min": 5, "max": 50, "description": "Ticks in the ATR proxy window used to adapt every threshold to current volatility"},
+            "reference_high_lookback_ticks": {"type": "number", "default": 60, "min": 10, "max": 500, "description": "Rolling window used to derive the recent high a decline is measured against"},
+            "min_drop_percent": {"type": "number", "default": 1.5, "min": 0.1, "max": 20, "description": "Floor for the adaptive drop threshold (%) - a decline must clear at least this even in dead-calm markets"},
+            "drop_atr_multiplier": {"type": "number", "default": 2.5, "min": 0.5, "max": 10, "description": "Adaptive drop threshold = max(min_drop_percent, ATR% x this) - how many ATRs deep a decline must be to count as significant"},
+            "min_recovery_percent": {"type": "number", "default": 0.5, "min": 0.05, "max": 10, "description": "Floor for the adaptive recovery confirmation (%)"},
+            "recovery_atr_multiplier": {"type": "number", "default": 0.8, "min": 0.1, "max": 5, "description": "Adaptive recovery confirmation = max(min_recovery_percent, ATR% x this) - how much of a bounce off the low is required before buying"},
+            "require_ema_slope_confirmation": {"type": "boolean", "default": True, "description": "Require the short EMA to be sloping upward before entry"},
+            "ema_slope_period": {"type": "number", "default": 5, "min": 2, "max": 50, "description": "Period of the short EMA used for the slope confirmation filter"},
+            "require_no_new_low_confirmation": {"type": "boolean", "default": True, "description": "Require N ticks with no new low before entry"},
+            "min_ticks_without_new_low": {"type": "number", "default": 2, "min": 0, "max": 50, "description": "Consecutive ticks without a new low required for the no-new-low confirmation filter"},
+            "take_profit_atr_multiplier": {"type": "number", "default": 3.0, "min": 0.5, "max": 10, "description": "Take-profit target = entry price + ATR (locked at entry) x this"},
+            "trailing_stop_atr_multiplier": {"type": "number", "default": 1.5, "min": 0.5, "max": 10, "description": "Trailing stop distance = highest price since entry - ATR (locked at entry) x this; only tightens, never expands"},
+            "emergency_stop_atr_multiplier": {"type": "number", "default": 5.0, "min": 1, "max": 20, "description": "Last-resort hard stop distance from entry price - must be wider than trailing_stop_atr_multiplier"},
+            "max_position_duration_minutes": {"type": "number", "default": 720, "min": 5, "max": 20160, "description": "Force-exit a position after this long regardless of P&L"},
+            "setup_expiry_minutes": {"type": "number", "default": 240, "min": 5, "max": 20160, "description": "Abandon an unresolved decline/reversal setup after this long with no confirmed entry, returning to IDLE"},
+            "cooldown_seconds": {"type": "number", "default": 300, "min": 0, "max": 86400, "description": "Pause before monitoring resumes after any exit"},
+            "loss_cooldown_seconds": {"type": "number", "default": 1800, "min": 0, "max": 86400, "description": "Extended pause after a losing exit (must be >= cooldown_seconds)"},
+            "risk_percent": {"type": "number", "default": 1.0, "min": 0.1, "max": 100, "description": "Percent of balance risked per trade, sized off the trailing-stop distance"},
+            "spike_guard_atr_multiplier": {"type": "number", "default": 6.0, "min": 1, "max": 50, "description": "A single-tick move bigger than this many ATRs is treated as noise and ignored when updating the tracked high/low"},
+        }
+    ),
     # Note: TWAP and VWAP are execution algorithms, not alpha strategies.
     # They are intentionally excluded from strategy selection.
     # TWAP/VWAP exist only in the execution layer for order execution methods.

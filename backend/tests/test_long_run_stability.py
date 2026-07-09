@@ -80,6 +80,7 @@ class DeterministicExchange:
         trading_pair: str,
         side,  # OrderSide or string
         amount: float,
+        reference_price: float = None,
     ) -> dict:
         """
         Place deterministic market order.
@@ -473,6 +474,7 @@ async def test_long_run_stability_deterministic(
                 action=action,
                 amount=TRADE_SIZE * FIXED_PRICE,  # Amount in USDT
                 order_type="market",
+                expected_move_pct=0.01 if action == "buy" else None,
             )
 
             # Get current price (deterministic)
@@ -742,6 +744,7 @@ async def test_long_run_stability_deterministic_no_drift(
                 action=action,
                 amount=TRADE_SIZE * FIXED_PRICE,  # USDT amount
                 order_type="market",
+                expected_move_pct=0.01,
             )
             
             # ================================================================

@@ -93,7 +93,7 @@ class DeterministicExchange:
             timestamp=datetime.utcnow(),
         )
 
-    async def place_market_order(self, symbol: str, side, amount: float):
+    async def place_market_order(self, symbol: str, side, amount: float, reference_price: float = None):
         """Place deterministic market order with no slippage."""
         price = self._current_price
         cost = amount * price

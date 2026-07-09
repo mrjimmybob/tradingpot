@@ -189,6 +189,7 @@ class DeterministicBacktestExchange:
         trading_pair: str,
         side,
         amount: float,
+        reference_price: float = None,
     ) -> SimpleNamespace:
         """
         Execute deterministic market order at current historical price.
@@ -361,6 +362,7 @@ async def run_deterministic_backtest(
                 action=action,
                 amount=trade_size * current_price,  # Amount in USDT
                 order_type="market",
+                expected_move_pct=0.01 if action == "buy" else None,
             )
 
             # Setup mock trade recorder

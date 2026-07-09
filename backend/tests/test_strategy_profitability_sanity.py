@@ -124,7 +124,7 @@ class DeterministicExchange:
             timestamp=datetime.utcnow(),
         )
 
-    async def place_market_order(self, symbol: str, side, amount: float):
+    async def place_market_order(self, symbol: str, side, amount: float, reference_price: float = None):
         """Place deterministic market order with no slippage."""
         # Get current price from external feed (injected)
         if not hasattr(self, '_current_price'):
@@ -391,6 +391,7 @@ async def test_strategy_profitability_sanity():
                 slippage_cost=0.0,
             )
         )
+        mock_cost_model_instance.estimate_roundtrip_cost = Mock(return_value=0.1)
         MockCostModel.return_value = mock_cost_model_instance
 
         # ====================================================================
@@ -415,7 +416,8 @@ async def test_strategy_profitability_sanity():
                     action="buy",
                     amount=trade_amount,
                     order_type="market",
-                    reason=f"Test buy at ${current_price:.2f}"
+                    reason=f"Test buy at ${current_price:.2f}",
+                    expected_move_pct=0.01,
                 )
             else:
                 return TradeSignal(
@@ -605,6 +607,7 @@ async def test_strategy_profitability_sanity_oscillating():
         mock_cost_model_instance.estimate_cost = Mock(
             return_value=Mock(total_cost=0.05, exchange_fee=0.05, spread_cost=0.0, slippage_cost=0.0)
         )
+        mock_cost_model_instance.estimate_roundtrip_cost = Mock(return_value=0.05)
         MockCostModel.return_value = mock_cost_model_instance
 
         num_ticks = 200  # More ticks for oscillation
@@ -623,7 +626,8 @@ async def test_strategy_profitability_sanity_oscillating():
                     action="buy",
                     amount=trade_amount,
                     order_type="market",
-                    reason=f"Test buy at ${current_price:.2f}"
+                    reason=f"Test buy at ${current_price:.2f}",
+                    expected_move_pct=0.01,
                 )
             else:
                 return TradeSignal(action="hold", amount=0, reason="Waiting")

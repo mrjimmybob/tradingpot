@@ -509,6 +509,7 @@ async def test_drawdown_curve_correctness():
             signal.action = action
             signal.symbol = bot.trading_pair
             signal.amount = 20.0  # Large enough to pass minimum
+            signal.expected_move_pct = 0.01 if action == "buy" else None
 
             current_price = 100.0
 

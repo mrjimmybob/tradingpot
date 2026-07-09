@@ -49,6 +49,13 @@ class Bot(Base):
     weekly_loss_limit = Column(Float, nullable=True)
     max_strategy_rotations = Column(Integer, default=3)
 
+    # Exchange taker fee rate (percentage, e.g. 0.1 = 0.1%).
+    # Used by the execution viability gate and cost model to compute the minimum
+    # profitable move before a trade is allowed to execute. Defaults to 0.1%
+    # which matches the simulated exchange's hard-coded rate and is a common
+    # taker fee on major crypto exchanges. Explicit — never silently zero.
+    exchange_fee = Column(Float, nullable=False, default=0.1, server_default="0.1")
+
     # Dry run mode
     is_dry_run = Column(Boolean, default=False)
 

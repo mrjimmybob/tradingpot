@@ -992,6 +992,133 @@ class TestSimulatedExchangeRealMarketData:
         assert btc.total == 0.01
 
 
+class TestExecutionPriceConsistency:
+    """Regression tests for the decision-vs-fill price mismatch (Finding 3).
+
+    Root cause: place_market_order used to call get_ticker() a SECOND time,
+    independently of whatever ticker the caller's trading decision was made
+    against. That second fetch is decoupled from the decision by an unbounded
+    number of intervening awaits (portfolio risk checks, capacity checks, DB
+    writes), so a decision made at price X could fill at a materially
+    different, unrelated price — observed in production data as a Dip
+    Recovery exit whose reason text quoted "PnL -0.07%" against the decision
+    price while the realized fill was actually -0.55% (and another: "-0.04%"
+    quoted vs. -1.01% realized).
+
+    The fix: trading_engine.py now always passes reference_price=current_price
+    (the exact ticker.last the strategy's decision was made against) into
+    place_market_order/place_limit_order. When reference_price is supplied,
+    the simulated exchange fills AT it directly instead of re-fetching —
+    bounding decision-vs-fill divergence to exactly zero, the strongest form
+    of "cannot diverge beyond configured execution cost assumptions".
+    """
+
+    def _make_service_with_mock_client(self, ttl: float = 2.0):
+        from app.services.exchange import SimulatedExchangeService
+
+        service = SimulatedExchangeService(
+            initial_balance=10000.0, ticker_cache_ttl=ttl
+        )
+        service._connected = True
+        mock_client = AsyncMock()
+        mock_client.fetch_ticker = AsyncMock(
+            return_value={
+                "symbol": "BTC/USDT",
+                "bid": 99990.0,
+                "ask": 100010.0,
+                "last": 100000.0,
+                "baseVolume": 1234.0,
+                "timestamp": int(datetime(2026, 6, 1).timestamp() * 1000),
+            }
+        )
+        service.exchange = mock_client
+        return service, mock_client
+
+    @pytest.mark.asyncio
+    async def test_market_order_fills_exactly_at_reference_price(self):
+        """A decision price passed as reference_price is honored exactly —
+        zero divergence between decision and fill under a stable market."""
+        service, _ = self._make_service_with_mock_client()
+
+        order = await service.place_market_order(
+            symbol="BTC/USDT", side=OrderSide.BUY, amount=0.01,
+            reference_price=64_000.0,
+        )
+
+        assert order is not None
+        assert order.price == 64_000.0
+
+    @pytest.mark.asyncio
+    async def test_market_order_does_not_refetch_ticker_when_reference_price_given(self):
+        """No second, independent market-data fetch happens when the caller
+        already supplied the decision price — eliminates the divergence
+        window entirely rather than merely narrowing it."""
+        service, mock_client = self._make_service_with_mock_client()
+
+        await service.place_market_order(
+            symbol="BTC/USDT", side=OrderSide.SELL, amount=0.01,
+            reference_price=64_000.0,
+        )
+
+        mock_client.fetch_ticker.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_reference_price_wins_even_if_live_ticker_has_moved(self):
+        """Reproduces the exact bug shape: the live ticker (as if fetched a
+        second time, later, after the market moved) is WILDLY different from
+        the decision price. The fill must still equal the decision price, not
+        drift toward the independently-fetched value.
+        """
+        service, mock_client = self._make_service_with_mock_client()
+        # If place_market_order still re-fetched, this is the price it would
+        # wrongly fill at — far from the decision price of 64000.
+        mock_client.fetch_ticker = AsyncMock(
+            return_value={
+                "symbol": "BTC/USDT", "bid": 63_000.0, "ask": 63_010.0,
+                "last": 63_005.0, "baseVolume": 1.0,
+                "timestamp": int(datetime(2026, 6, 1).timestamp() * 1000),
+            }
+        )
+
+        order = await service.place_market_order(
+            symbol="BTC/USDT", side=OrderSide.BUY, amount=0.01,
+            reference_price=64_000.0,
+        )
+
+        assert order.price == 64_000.0, (
+            "fill drifted toward an independently-fetched ticker instead of "
+            "honoring the caller's decision price"
+        )
+
+    @pytest.mark.asyncio
+    async def test_limit_order_honors_its_own_price_instead_of_discarding_it(self):
+        """place_limit_order previously ignored its own `price` argument and
+        fell through to a fresh ticker fetch. It must now fill at the price
+        the caller specified.
+        """
+        service, mock_client = self._make_service_with_mock_client()
+
+        order = await service.place_limit_order(
+            symbol="BTC/USDT", side=OrderSide.BUY, amount=0.01, price=61_500.0,
+        )
+
+        assert order is not None
+        assert order.price == 61_500.0
+        mock_client.fetch_ticker.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_reference_price_none_preserves_prior_fetch_based_behavior(self):
+        """Backward compatibility: callers with no live decision price (the
+        default) still get the pre-fix fetch-based bid/ask fill."""
+        service, _ = self._make_service_with_mock_client()
+
+        order = await service.place_market_order(
+            symbol="BTC/USDT", side=OrderSide.BUY, amount=0.01,
+        )
+
+        assert order.price == 100_010.0  # real ask, fetched
+
+
 class TestOrderPreflight:
     """Live orders are validated against exchange precision and limits
     before submission; invalid orders never reach the exchange."""

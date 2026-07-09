@@ -1,14 +1,19 @@
-"""Execution cost modeling service - risk estimation only.
+"""Execution cost modeling service — risk and viability estimation.
 
-IMPORTANT: This is RISK-ONLY modeling. Execution costs are estimated before trade
-execution to improve risk calculations and P&L tracking. These costs MUST NOT
-feed back into strategy decisions or auto_mode scoring.
+Cost estimates are used at the execution layer for two purposes:
+1. P&L tracking accuracy: costs are logged/recorded alongside each trade.
+2. Trade viability gate: the central gate in _execute_trade uses round-trip cost
+   estimates to block BUY signals where the expected price move cannot cover fees.
+   This is an EXECUTION-layer decision, not a strategy-layer one — the gate lives
+   in _execute_trade, not inside individual strategy functions.
+
+Strategies MUST NOT use this model to score opportunities or rank signals.
+auto_mode MUST NOT use cost estimates in its strategy scoring weights.
 
 Design constraints:
 - Spot trading only (no leverage, no margin)
 - Deterministic (no randomness)
-- Default values = 0 (preserves current behavior)
-- No impact on strategy logic
+- Default values = 0 (preserves current behavior when fee is not configured)
 """
 
 import logging
