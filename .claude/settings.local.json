@@ -177,7 +177,17 @@
       "Bash(/opt/tradingbot/venv/bin/pytest tests/test_fee_headroom_regression.py -v)",
       "Bash(/opt/tradingbot/venv/bin/pytest *)",
       "Bash(python3 -c \"import sqlite3; print\\('python sqlite3 available'\\)\")",
-      "Bash(python3 *)"
+      "Bash(python3 *)",
+      "Bash(git log *)",
+      "Bash(mkdir *)",
+      "Bash(/opt/tradingbot/venv/bin/python -m pytest tests/test_mean_reversion_target_lock.py tests/test_mean_reversion_hold_format.py -q)",
+      "Bash(/opt/tradingbot/venv/bin/python -m pytest tests/test_reward_risk_gate.py tests/test_trade_viability.py -q)",
+      "Bash(/opt/tradingbot/venv/bin/python -m pytest tests/test_dip_recovery_strategy.py -q)",
+      "Bash(/opt/tradingbot/venv/bin/python -m pytest tests/test_exchange_wrapper.py -q)",
+      "Bash(/opt/tradingbot/venv/bin/python -m pytest tests/ -q -x --timeout=300)",
+      "Bash(timeout 280 /opt/tradingbot/venv/bin/python -m pytest tests/ -q)",
+      "Bash(/opt/tradingbot/venv/bin/python -m pytest tests/test_expectancy_diagnostics.py tests/test_mean_reversion_target_lock.py -q)",
+      "Bash(../venv/bin/python -m pytest)"
     ]
   }
 }

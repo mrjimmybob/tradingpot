@@ -3,3 +3,4 @@
 2026-06-20T17:39:26.415889 [INFO] [DRY RUN] Bot started with strategy 'dca_accumulator' on BTC/USDT
 2026-06-20T22:35:35.214680 [INFO] [DRY RUN] Bot started with strategy 'dca_accumulator' on BTC/USDT
 2026-06-21T22:10:50.962013 [INFO] [DRY RUN] Bot resumed after server restart
+2026-07-07T16:39:15.911529 [INFO] [DRY RUN] Bot started with strategy 'trend_following' on BTC/USDT
