@@ -17,6 +17,7 @@ not a parallel, potentially-drifting in-memory mirror.
 """
 from __future__ import annotations
 
+import time
 from typing import List, Optional
 
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
@@ -30,34 +31,65 @@ from .clock import BacktestClock
 from .data_provider import HistoricalDataProvider, _TIMEFRAME_SECONDS
 from .execution_model import BacktestExecutionModel
 from .portfolio import BacktestPortfolio
-from .progress import compute_update_every, render_bar, terminal_width
+from .progress import compute_update_every, format_duration, render_bar, terminal_width
 from .resampling import resample
 from .results import BacktestResult, compute_result
+
+
+def _print_phase(name: str, quiet: bool) -> None:
+    """Announce a coarse-grained stage transition for long-running calls
+    (Loading data / Preparing backtest / Running strategy replay / Computing
+    metrics) - purely visual, always explicitly flushed (see
+    _print_backtest_progress for why that matters)."""
+    if not quiet:
+        print(f"{name}...", flush=True)
 
 
 def _print_backtest_start(
     trading_pair: str, strategy: str, timeframe: Optional[str], candles: List[Candle],
 ) -> None:
-    print("Starting backtest:\n")
-    print(f"Symbol:\n{trading_pair}\n")
-    print(f"Strategy:\n{strategy}\n")
+    print("Starting backtest:\n", flush=True)
+    print(f"Symbol:\n{trading_pair}\n", flush=True)
+    print(f"Strategy:\n{strategy}\n", flush=True)
     if timeframe:
-        print(f"Timeframe:\n{timeframe}\n")
-    print(f"Candles:\n{len(candles):,}\n")
+        print(f"Timeframe:\n{timeframe}\n", flush=True)
+    print(f"Candles:\n{len(candles):,}\n", flush=True)
     start_date = ms_to_naive_utc(candles[0].timestamp).date()
     end_date = ms_to_naive_utc(candles[-1].timestamp).date()
-    print(f"Range:\n{start_date}\n→\n{end_date}\n")
+    print(f"Range:\n{start_date}\n→\n{end_date}\n", flush=True)
 
 
 def _print_backtest_progress(
-    current: int, total: int, decision_candle: Candle, portfolio: BacktestPortfolio,
+    current: int,
+    total: int,
+    decision_candle: Candle,
+    portfolio: BacktestPortfolio,
+    elapsed_seconds: float,
 ) -> None:
-    bar = render_bar(current / total if total else 1.0, terminal_width())
-    date_str = ms_to_naive_utc(decision_candle.timestamp).date()
-    print(bar)
-    print(f"Date: {date_str}")
-    print(f"Trades: {len(portfolio.trades)}")
-    print(f"Equity: {portfolio.equity(decision_candle.close):.2f}")
+    """One throttled progress block. Every field here is either an O(1)
+    counter already being tracked (current/total, len(trades)) or an O(1)
+    lookup (portfolio.equity is cash + base_amount * price) - nothing here
+    recomputes backtest statistics, so calling this ~100 times per run costs
+    nothing measurable next to the replay loop itself.
+
+    Explicitly flushed: a bare ``print()`` is fully block-buffered whenever
+    stdout isn't a live terminal (piped to a file, ``tee``, systemd, CI) -
+    exactly how long unattended backtests are normally run - so without an
+    explicit flush the buffer can sit unflushed until the process exits,
+    which looks indistinguishable from a hang for a multi-hour run.
+    """
+    fraction = current / total if total else 1.0
+    bar = render_bar(fraction, terminal_width())
+    date_str = ms_to_naive_utc(decision_candle.timestamp).strftime("%Y-%m-%d %H:%M")
+    remaining = (elapsed_seconds / current * (total - current)) if current else 0.0
+
+    print(bar, flush=True)
+    print(f"Candles: {current:,} / {total:,}", flush=True)
+    print(f"Date: {date_str}", flush=True)
+    print(f"Trades: {len(portfolio.trades)}", flush=True)
+    print(f"Equity: {portfolio.equity(decision_candle.close):.2f}", flush=True)
+    print(f"Elapsed: {format_duration(elapsed_seconds)}", flush=True)
+    print(f"ETA: {format_duration(remaining)}", flush=True)
 
 
 class BacktestEngine:
@@ -81,6 +113,7 @@ class BacktestEngine:
         end: Optional[int] = None,
         quiet: bool = False,
     ) -> BacktestResult:
+        _print_phase("Loading data", quiet)
         candles = self._load_candles(exchange, symbol, timeframe, start, end)
         if len(candles) < 2:
             raise ValueError(
@@ -140,6 +173,8 @@ class BacktestEngine:
         against a small hand-built fixture without touching the filesystem.
         Does not itself print the "Starting backtest" banner (see ``run``) -
         it only ever accesses candles[0..i] as the replay reaches index i."""
+        _print_phase("Preparing backtest", quiet)
+
         # Dependency-injected clock, not a global patch: this TradingEngine
         # instance is the only thing that ever reads it. A live or dry-run
         # TradingEngine elsewhere in the same process holds its own SystemClock
@@ -166,6 +201,9 @@ class BacktestEngine:
                 )
                 session.add(bot)
                 await session.flush()
+
+                _print_phase("Running strategy replay", quiet)
+                replay_start = time.monotonic()
 
                 for i in range(len(candles) - 1):
                     # === decision: sees only candle i (and, through the
@@ -195,14 +233,22 @@ class BacktestEngine:
 
                     portfolio.mark_to_market(decision_candle.timestamp, decision_candle.close)
 
-                    if not quiet and ((i + 1) % update_every == 0 or i + 1 == num_decisions):
-                        _print_backtest_progress(i + 1, num_decisions, decision_candle, portfolio)
+                    # First update fires immediately (i+1 == 1) so a long run
+                    # never looks frozen while it waits for update_every
+                    # candles to pass; the last always fires so 100% is seen.
+                    if not quiet and (
+                        i + 1 == 1 or (i + 1) % update_every == 0 or i + 1 == num_decisions
+                    ):
+                        elapsed = time.monotonic() - replay_start
+                        _print_backtest_progress(i + 1, num_decisions, decision_candle, portfolio, elapsed)
 
                 # Final mark-to-market on the last candle (no decision made on it -
                 # it only ever serves as the last fill candle above).
                 portfolio.mark_to_market(candles[-1].timestamp, candles[-1].close)
         finally:
             await db_engine.dispose()
+
+        _print_phase("Computing metrics", quiet)
 
         buy_and_hold_pct = (
             (candles[-1].close - candles[0].open) / candles[0].open * 100.0

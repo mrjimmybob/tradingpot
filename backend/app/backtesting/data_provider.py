@@ -161,7 +161,7 @@ class CsvHistoricalDataProvider(HistoricalDataProvider):
         for file_path in csv_files:
             total_rows = 0 if self.quiet else _count_data_rows(file_path)
             if not self.quiet:
-                print(f"Loading:\n{file_path.name}\nRows: {total_rows:,}")
+                print(f"Loading:\n{file_path.name}\nRows: {total_rows:,}", flush=True)
 
             start_time = time.monotonic()
             update_every = compute_update_every(total_rows) if total_rows else 1
@@ -192,7 +192,8 @@ class CsvHistoricalDataProvider(HistoricalDataProvider):
                     f"Finished:\n{file_path.name}\n"
                     f"Loaded: {file_loaded} candles\n"
                     f"Skipped: {file_skipped} rows\n"
-                    f"Time: {elapsed:.2f} seconds"
+                    f"Time: {elapsed:.2f} seconds",
+                    flush=True,
                 )
 
         candles = sorted(raw_by_timestamp.values(), key=lambda c: c.timestamp)

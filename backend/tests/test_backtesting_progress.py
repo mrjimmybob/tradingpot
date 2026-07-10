@@ -97,15 +97,66 @@ class TestBacktestReplayProgress:
         )
 
         out = capsys.readouterr().out
+        # Phase announcements (Loading data is emitted by the provider, since
+        # quiet_provider=True here it's the engine's own phases we check).
+        assert "Preparing backtest..." in out
+        assert "Running strategy replay..." in out
+        assert "Computing metrics..." in out
         assert "Starting backtest:" in out
         assert "Symbol:\nFOOBAR" in out
         assert "Strategy:\nmean_reversion" in out
         assert "Candles:\n200" in out
         assert "Range:" in out
         assert "[" in out and "]" in out and "%" in out
+        assert "Candles: " in out and " / 199" in out  # processed / total decisions
         assert "Date:" in out
         assert "Trades:" in out
         assert "Equity:" in out
+        assert "Elapsed:" in out
+        assert "ETA:" in out
+
+    @pytest.mark.asyncio
+    async def test_first_update_prints_immediately_without_waiting_for_throttle_window(
+        self, fake_root, capsys,
+    ):
+        """Regression test for the reported bug: for a run large enough that
+        update_every > 1, the very first replay update must still appear at
+        candle 1, not only once update_every candles have been processed -
+        otherwise a long run looks frozen at the start."""
+        _write_minute_csv(fake_root / "zaplex" / "FOOBAR" / "1m" / "a.csv", 500)
+        engine = self._engine(fake_root, quiet_provider=True)
+
+        await engine.run(
+            exchange="zaplex", symbol="FOOBAR", timeframe="1m",
+            strategy="mean_reversion", strategy_params=_MEAN_REVERSION_PARAMS,
+            starting_balance=10_000.0,
+        )
+
+        out = capsys.readouterr().out
+        assert "Candles: 1 / 499" in out
+
+    @pytest.mark.asyncio
+    async def test_long_backtest_shows_intermediate_progress_before_completion(
+        self, fake_root, capsys,
+    ):
+        """A long-enough run must show more than just a first and a final
+        block - there should be genuine progress in between, proving updates
+        are throttled (not skipped) across the run rather than only firing
+        at the very start and very end."""
+        _write_minute_csv(fake_root / "zaplex" / "FOOBAR" / "1m" / "a.csv", 8_000)
+        engine = self._engine(fake_root, quiet_provider=True)
+
+        await engine.run(
+            exchange="zaplex", symbol="FOOBAR", timeframe="1m",
+            strategy="mean_reversion", strategy_params=_MEAN_REVERSION_PARAMS,
+            starting_balance=10_000.0,
+        )
+
+        out = capsys.readouterr().out
+        num_updates = out.count("Candles: ")
+        assert num_updates > 2  # more than just "first" and "final"
+        assert "Candles: 1 / " in out
+        assert "100%" in out  # the final update always completes the bar
 
     @pytest.mark.asyncio
     async def test_quiet_suppresses_backtest_progress(self, fake_root, capsys):
@@ -135,5 +186,28 @@ class TestBacktestReplayProgress:
 
         out = capsys.readouterr().out
         assert result.num_trades >= 0
-        # Roughly 50-100 updates target (Task 2) - assert well under one per candle.
+        # ~100 updates target - assert well under one per candle.
         assert out.count("Date:") < 150
+
+    @pytest.mark.asyncio
+    async def test_progress_reporting_does_not_change_backtest_results(self, fake_root):
+        """Purely visual: running the same backtest with and without
+        progress output must produce byte-identical results."""
+        _write_minute_csv(fake_root / "zaplex" / "FOOBAR" / "1m" / "a.csv", 300)
+
+        verbose_result = await self._engine(fake_root, quiet_provider=True).run(
+            exchange="zaplex", symbol="FOOBAR", timeframe="1m",
+            strategy="mean_reversion", strategy_params=_MEAN_REVERSION_PARAMS,
+            starting_balance=10_000.0, quiet=False,
+        )
+        quiet_result = await self._engine(fake_root, quiet_provider=True).run(
+            exchange="zaplex", symbol="FOOBAR", timeframe="1m",
+            strategy="mean_reversion", strategy_params=_MEAN_REVERSION_PARAMS,
+            starting_balance=10_000.0, quiet=True,
+        )
+
+        assert verbose_result.ending_balance == quiet_result.ending_balance
+        assert verbose_result.num_trades == quiet_result.num_trades
+        assert verbose_result.equity_curve == quiet_result.equity_curve
+        assert [(t.entry_timestamp, t.exit_timestamp, t.net_pnl) for t in verbose_result.trades] == \
+               [(t.entry_timestamp, t.exit_timestamp, t.net_pnl) for t in quiet_result.trades]

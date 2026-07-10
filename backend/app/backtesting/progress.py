@@ -12,8 +12,8 @@ import shutil
 import sys
 
 # Roughly how many progress updates a full run should produce end to end
-# (Task 3: "about 50-100 updates total for a full run").
-DEFAULT_UPDATE_STEPS = 80
+# ("Target roughly 100 terminal updates for the entire run").
+DEFAULT_UPDATE_STEPS = 100
 
 
 def compute_update_every(total: int, steps: int = DEFAULT_UPDATE_STEPS) -> int:
@@ -35,6 +35,17 @@ def render_bar(fraction: float, width: int) -> str:
     filled = int(bar_width * fraction)
     bar = "#" * filled + "." * (bar_width - filled)
     return f"[{bar}]{suffix}"
+
+
+def format_duration(seconds: float) -> str:
+    """Render a duration as ``MM:SS`` (or ``H:MM:SS`` once it reaches an
+    hour) for the Elapsed/ETA lines."""
+    total_seconds = max(0, int(seconds))
+    hours, remainder = divmod(total_seconds, 3600)
+    minutes, secs = divmod(remainder, 60)
+    if hours:
+        return f"{hours}:{minutes:02d}:{secs:02d}"
+    return f"{minutes:02d}:{secs:02d}"
 
 
 class ProgressBar:
