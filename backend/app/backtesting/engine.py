@@ -30,8 +30,34 @@ from .clock import BacktestClock
 from .data_provider import HistoricalDataProvider, _TIMEFRAME_SECONDS
 from .execution_model import BacktestExecutionModel
 from .portfolio import BacktestPortfolio
+from .progress import compute_update_every, render_bar, terminal_width
 from .resampling import resample
 from .results import BacktestResult, compute_result
+
+
+def _print_backtest_start(
+    trading_pair: str, strategy: str, timeframe: Optional[str], candles: List[Candle],
+) -> None:
+    print("Starting backtest:\n")
+    print(f"Symbol:\n{trading_pair}\n")
+    print(f"Strategy:\n{strategy}\n")
+    if timeframe:
+        print(f"Timeframe:\n{timeframe}\n")
+    print(f"Candles:\n{len(candles):,}\n")
+    start_date = ms_to_naive_utc(candles[0].timestamp).date()
+    end_date = ms_to_naive_utc(candles[-1].timestamp).date()
+    print(f"Range:\n{start_date}\n→\n{end_date}\n")
+
+
+def _print_backtest_progress(
+    current: int, total: int, decision_candle: Candle, portfolio: BacktestPortfolio,
+) -> None:
+    bar = render_bar(current / total if total else 1.0, terminal_width())
+    date_str = ms_to_naive_utc(decision_candle.timestamp).date()
+    print(bar)
+    print(f"Date: {date_str}")
+    print(f"Trades: {len(portfolio.trades)}")
+    print(f"Equity: {portfolio.equity(decision_candle.close):.2f}")
 
 
 class BacktestEngine:
@@ -53,14 +79,22 @@ class BacktestEngine:
         starting_balance: float = 10_000.0,
         start: Optional[int] = None,
         end: Optional[int] = None,
+        quiet: bool = False,
     ) -> BacktestResult:
         candles = self._load_candles(exchange, symbol, timeframe, start, end)
         if len(candles) < 2:
             raise ValueError(
                 "Need at least 2 candles to backtest (one to decide on, one to fill against)"
             )
+        # Printed here (not in run_candles) because the full range is only
+        # meaningful to display once the whole series is loaded from disk -
+        # run_candles itself must only ever look at candles[0..i] during
+        # replay, never index ahead to find the last candle's date.
+        if not quiet:
+            _print_backtest_start(symbol, strategy, timeframe, candles)
         return await self.run_candles(
             candles, symbol, strategy, strategy_params or {}, starting_balance,
+            quiet=quiet,
         )
 
     def _load_candles(
@@ -99,10 +133,13 @@ class BacktestEngine:
         strategy: str,
         strategy_params: dict,
         starting_balance: float,
+        quiet: bool = False,
     ) -> BacktestResult:
         """Same as ``run`` but takes an already-loaded candle list directly -
         the entry point unit tests use to assert no-lookahead / determinism
-        against a small hand-built fixture without touching the filesystem."""
+        against a small hand-built fixture without touching the filesystem.
+        Does not itself print the "Starting backtest" banner (see ``run``) -
+        it only ever accesses candles[0..i] as the replay reaches index i."""
         # Dependency-injected clock, not a global patch: this TradingEngine
         # instance is the only thing that ever reads it. A live or dry-run
         # TradingEngine elsewhere in the same process holds its own SystemClock
@@ -110,6 +147,9 @@ class BacktestEngine:
         clock = BacktestClock(candles[0].timestamp)
         engine = TradingEngine(clock=clock)
         portfolio = BacktestPortfolio(starting_balance)
+
+        num_decisions = len(candles) - 1
+        update_every = compute_update_every(num_decisions)
 
         db_engine = create_async_engine("sqlite+aiosqlite:///:memory:")
         async with db_engine.begin() as conn:
@@ -154,6 +194,9 @@ class BacktestEngine:
                         await session.flush()
 
                     portfolio.mark_to_market(decision_candle.timestamp, decision_candle.close)
+
+                    if not quiet and ((i + 1) % update_every == 0 or i + 1 == num_decisions):
+                        _print_backtest_progress(i + 1, num_decisions, decision_candle, portfolio)
 
                 # Final mark-to-market on the last candle (no decision made on it -
                 # it only ever serves as the last fill candle above).

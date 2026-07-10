@@ -69,6 +69,60 @@ class TestDynamicDiscovery:
             provider.get_candles("nope", "NOPE", "1m")
 
 
+class TestSchemaVariants:
+    """CryptoDataDownload has shipped multiple valid header schemas across
+    years - lowercase vs capitalized column names, and lowercase
+    `volume`/`volume_from` instead of `Volume <ASSET>`/`Volume <ASSET>`, plus
+    extra columns in some years. All must parse identically by role."""
+
+    def test_lowercase_2020_style_header(self, fake_root):
+        path = fake_root / "zaplex" / "FOOBAR" / "1m" / "2020.csv"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            "unix,date,symbol,open,high,low,close,Volume FOO,Volume BAR,tradecount\n"
+            "1704067200000,2024-01-01 00:00:00,FOO/BAR,1.0,1.1,0.9,1.05,10.0,10.5,5\n"
+        )
+        provider = CsvHistoricalDataProvider(root=fake_root)
+        candles = provider.get_candles("zaplex", "FOOBAR", "1m")
+        assert len(candles) == 1
+        assert candles[0].open == 1.0 and candles[0].close == 1.05
+        assert candles[0].base_volume == 10.0 and candles[0].quote_volume == 10.5
+        assert candles[0].trade_count == 5
+
+    def test_lowercase_2021_style_header_with_extra_columns(self, fake_root):
+        path = fake_root / "zaplex" / "FOOBAR" / "1m" / "2021.csv"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            "unix,date,symbol,open,high,low,close,volume,volume_from,"
+            "marketorder_volume,marketorder_volume_from,tradecount,date_close,close_unix\n"
+            "1704067200000,2024-01-01 00:00:00,FOOBAR,1.0,1.1,0.9,1.05,10.0,10.5,4.0,4.2,5,"
+            "2024-01-01 00:00:59.999,1704067259999\n"
+        )
+        provider = CsvHistoricalDataProvider(root=fake_root)
+        candles = provider.get_candles("zaplex", "FOOBAR", "1m")
+        assert len(candles) == 1
+        assert candles[0].base_volume == 10.0 and candles[0].quote_volume == 10.5
+        assert candles[0].trade_count == 5
+
+    def test_mixed_schema_files_merge_together(self, fake_root):
+        """A lowercase-header file and a capitalized-header file in the same
+        directory both parse and merge into one series."""
+        (fake_root / "zaplex" / "FOOBAR" / "1m").mkdir(parents=True, exist_ok=True)
+        (fake_root / "zaplex" / "FOOBAR" / "1m" / "2020.csv").write_text(
+            "unix,date,symbol,open,high,low,close,Volume FOO,Volume BAR,tradecount\n"
+            "1704067200000,2024-01-01 00:00:00,FOO/BAR,1.0,1.1,0.9,1.05,10.0,10.5,5\n"
+        )
+        _write_csv(
+            fake_root / "zaplex" / "FOOBAR" / "1m" / "2024.csv",
+            [(1704067260000, "2024-01-01 00:01:00", "FOOBAR", 2.0, 2.2, 1.8, 2.1, 20.0, 42.0, 7)],
+            base_asset="FOO", quote_asset="BAR",
+        )
+        provider = CsvHistoricalDataProvider(root=fake_root)
+        candles = provider.get_candles("zaplex", "FOOBAR", "1m")
+        assert [c.timestamp for c in candles] == [1704067200000, 1704067260000]
+        assert [c.open for c in candles] == [1.0, 2.0]
+
+
 class TestMultiFileMergeAndSort:
     def test_merges_and_sorts_multiple_files(self, fake_root):
         # Two files, each newest-first internally (matches the real fixture

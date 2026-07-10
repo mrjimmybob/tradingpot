@@ -76,6 +76,10 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         "--data-root", default=str(_DEFAULT_DATA_ROOT),
         help=f"Root of the data/backtest directory tree (default: {_DEFAULT_DATA_ROOT})",
     )
+    parser.add_argument(
+        "--quiet", action="store_true",
+        help="Disable progress output (useful for tests, scripts, automation)",
+    )
     return parser
 
 
@@ -97,7 +101,7 @@ def _print_result(result: BacktestResult, exchange: str, symbol: str, timeframe:
 
 
 async def _run(args: argparse.Namespace) -> int:
-    provider = CsvHistoricalDataProvider(root=args.data_root)
+    provider = CsvHistoricalDataProvider(root=args.data_root, quiet=args.quiet)
 
     exchanges = provider.list_exchanges()
     if args.exchange not in exchanges:
@@ -140,6 +144,7 @@ async def _run(args: argparse.Namespace) -> int:
             starting_balance=args.starting_balance,
             start=start_ms,
             end=end_ms,
+            quiet=args.quiet,
         )
     except (DataIntegrityError, ValueError) as e:
         print(f"Backtest could not run: {e}", file=sys.stderr)

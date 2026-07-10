@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import csv
 import logging
+import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -18,15 +19,21 @@ from pathlib import Path
 from typing import List, Optional
 
 from .candle import Candle
+from .progress import ProgressBar, compute_update_every
 
 logger = logging.getLogger(__name__)
 
-# Plausible bounds for a unix-milliseconds crypto-market timestamp. Rows
-# outside this range are almost certainly a units mistake (e.g. nanoseconds
-# mixed into a milliseconds column - see ValidationReport.invalid_timestamp_rows)
-# rather than a real candle, and are excluded rather than silently misread.
+# Plausible bounds for a normalized unix-milliseconds crypto-market timestamp.
+# Rows outside this range are almost certainly garbage (not just a units
+# mistake - unit is now auto-detected in _normalize_timestamp_ms) rather than
+# a real candle, and are excluded rather than silently misread.
 _MIN_PLAUSIBLE_YEAR = 2009  # before Bitcoin existed
 _MAX_PLAUSIBLE_YEAR = 2100
+
+# CSV Date-column mismatches beyond this tolerance are logged, never used to
+# reject a row: the Unix column is the sole timestamp authority (see
+# _normalize_timestamp_ms and TASK 1/2 in the historical-ingestion fix).
+_DATE_MISMATCH_TOLERANCE_SECONDS = 60
 
 
 class DataIntegrityError(ValueError):
@@ -39,6 +46,7 @@ class ValidationReport:
     duplicate_timestamps: List[int] = field(default_factory=list)
     gaps: List[tuple] = field(default_factory=list)  # (after_ts, before_ts) in ms
     invalid_timestamp_rows: int = 0
+    date_mismatches: int = 0
 
     @property
     def is_clean(self) -> bool:
@@ -72,6 +80,14 @@ class HistoricalDataProvider(ABC):
         ...
 
 
+def _count_data_rows(file_path: Path) -> int:
+    """Fast line count for the progress display, excluding the header row.
+    Purely informational - never used for parsing or validation."""
+    with open(file_path, "rb") as f:
+        total_lines = sum(1 for _ in f)
+    return max(total_lines - 1, 0)
+
+
 def _plausible_ms_timestamp(ts_ms: int) -> bool:
     try:
         year = datetime.fromtimestamp(ts_ms / 1000.0, tz=timezone.utc).year
@@ -87,15 +103,22 @@ class CsvHistoricalDataProvider(HistoricalDataProvider):
 
         {root}/{exchange}/{symbol}/{timeframe}/*.csv
 
-    CSV header (asset name in the volume columns varies, e.g. "Volume BTC",
-    "Volume SOL" - detected positionally, never by name)::
+    CSV header: CryptoDataDownload has shipped several schema variants across
+    years - column casing varies (``Unix`` vs ``unix``), the volume columns'
+    asset name varies (``Volume BTC``, ``Volume SOL``, or lowercase ``volume``/
+    ``volume_from``), and some years add extra columns (``marketorder_volume``,
+    ``date_close``, ``close_unix``, ...). Every column is looked up by role,
+    case-insensitively, never by exact header string or hardcoded asset name::
 
+        unix,date,symbol,open,high,low,close,Volume <ASSET>,Volume <ASSET>,tradecount
         Unix,Date,Symbol,Open,High,Low,Close,Volume <ASSET>,Volume <ASSET>,tradecount
+        unix,date,symbol,open,high,low,close,volume,volume_from,tradecount
     """
 
-    def __init__(self, root: str | Path = "data/backtest"):
+    def __init__(self, root: str | Path = "data/backtest", quiet: bool = False):
         self.root = Path(root)
         self.last_validation: Optional[ValidationReport] = None
+        self.quiet = quiet
 
     # --- discovery -----------------------------------------------------
 
@@ -136,15 +159,41 @@ class CsvHistoricalDataProvider(HistoricalDataProvider):
         invalid_rows = 0
 
         for file_path in csv_files:
-            for candle, is_valid in self._parse_file(file_path, symbol):
+            total_rows = 0 if self.quiet else _count_data_rows(file_path)
+            if not self.quiet:
+                print(f"Loading:\n{file_path.name}\nRows: {total_rows:,}")
+
+            start_time = time.monotonic()
+            update_every = compute_update_every(total_rows) if total_rows else 1
+            bar = ProgressBar(total_rows, quiet=self.quiet)
+            file_loaded = 0
+            file_skipped = 0
+
+            for i, (candle, is_valid) in enumerate(self._parse_file(file_path, symbol), start=1):
                 if not is_valid:
                     invalid_rows += 1
-                    continue
-                if candle.timestamp in raw_by_timestamp:
-                    duplicates.append(candle.timestamp)
-                # Last file processed (sorted by filename) wins on conflict -
-                # deterministic, not "whichever the OS happened to list first".
-                raw_by_timestamp[candle.timestamp] = candle
+                    file_skipped += 1
+                else:
+                    file_loaded += 1
+                    if candle.timestamp in raw_by_timestamp:
+                        duplicates.append(candle.timestamp)
+                    # Last file processed (sorted by filename) wins on conflict -
+                    # deterministic, not "whichever the OS happened to list first".
+                    raw_by_timestamp[candle.timestamp] = candle
+
+                if not self.quiet and i % update_every == 0:
+                    bar.update(i)
+
+            bar.update(total_rows)
+            bar.finish()
+            if not self.quiet:
+                elapsed = time.monotonic() - start_time
+                print(
+                    f"Finished:\n{file_path.name}\n"
+                    f"Loaded: {file_loaded} candles\n"
+                    f"Skipped: {file_skipped} rows\n"
+                    f"Time: {elapsed:.2f} seconds"
+                )
 
         candles = sorted(raw_by_timestamp.values(), key=lambda c: c.timestamp)
 
@@ -200,18 +249,29 @@ class CsvHistoricalDataProvider(HistoricalDataProvider):
 
     def _parse_file(self, file_path: Path, symbol: str):
         """Yields (Candle, is_valid) pairs. Column mapping is positional /
-        role-based, never by hardcoded asset name (Volume columns detected by
-        the "Volume" prefix, in header order: first = base, second = quote)."""
+        role-based and case-insensitive, never by hardcoded asset name or
+        exact header casing (Volume columns detected by a case-insensitive
+        "volume" prefix, in header order: first = base, second = quote) -
+        CryptoDataDownload's shipped files mix lowercase (2020-2023) and
+        capitalized (2024+) headers, plus extra columns in some years."""
         with open(file_path, newline="") as f:
             reader = csv.DictReader(f)
             fieldnames = reader.fieldnames or []
-            volume_cols = [c for c in fieldnames if c.startswith("Volume")]
+            by_lower = {c.lower(): c for c in fieldnames}
+            volume_cols = [c for c in fieldnames if c.lower().startswith("volume")]
             base_vol_col = volume_cols[0] if len(volume_cols) > 0 else None
             quote_vol_col = volume_cols[1] if len(volume_cols) > 1 else None
+            unix_col = by_lower.get("unix")
+            symbol_col = by_lower.get("symbol")
+            open_col = by_lower.get("open")
+            high_col = by_lower.get("high")
+            low_col = by_lower.get("low")
+            close_col = by_lower.get("close")
+            tradecount_col = by_lower.get("tradecount")
 
             for row in reader:
                 try:
-                    ts_ms = int(float(row["Unix"]))
+                    ts_ms = int(float(row[unix_col]))
                 except (KeyError, ValueError, TypeError):
                     yield None, False
                     continue
@@ -226,14 +286,14 @@ class CsvHistoricalDataProvider(HistoricalDataProvider):
                     candle = Candle(
                         timestamp=ts_ms,
                         datetime=dt_iso,
-                        symbol=row.get("Symbol") or symbol,
-                        open=float(row["Open"]),
-                        high=float(row["High"]),
-                        low=float(row["Low"]),
-                        close=float(row["Close"]),
+                        symbol=(row.get(symbol_col) if symbol_col else None) or symbol,
+                        open=float(row[open_col]),
+                        high=float(row[high_col]),
+                        low=float(row[low_col]),
+                        close=float(row[close_col]),
                         base_volume=float(row[base_vol_col]) if base_vol_col else 0.0,
                         quote_volume=float(row[quote_vol_col]) if quote_vol_col else 0.0,
-                        trade_count=int(float(row["tradecount"])) if row.get("tradecount") else 0,
+                        trade_count=int(float(row[tradecount_col])) if tradecount_col and row.get(tradecount_col) else 0,
                     )
                 except (KeyError, ValueError, TypeError):
                     yield None, False
