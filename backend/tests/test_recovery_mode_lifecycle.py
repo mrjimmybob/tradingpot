@@ -704,7 +704,7 @@ class TestRecoveryCountersSurviveRestart:
         bot = Bot(
             name="restart-recovery-bot",
             trading_pair="BTC/USDT",
-            strategy="funding_carry",
+            strategy="trend_following",
             strategy_params={},
             strategy_state={
                 "recovery_mode": {

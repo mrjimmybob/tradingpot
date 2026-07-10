@@ -39,7 +39,6 @@ CONCRETE_STRATEGIES = [
     "mean_reversion",
     "trend_following",
     "volatility_breakout",
-    "funding_carry",
 ]
 
 
@@ -88,7 +87,6 @@ def fresh_engine():
     engine._get_bot_positions = AsyncMock(return_value=[])
     engine._get_last_order = AsyncMock(return_value=None)
     engine._get_order_count = AsyncMock(return_value=0)
-    engine._get_funding_signal = AsyncMock(return_value=0.0)
     return engine
 
 
@@ -112,7 +110,6 @@ SMOKE_PARAMS = {
         "bar_interval_seconds": 0, "regime_filter_enabled": False,
         "bb_period": 5, "atr_period": 5, "min_compression_bars": 3,
     },
-    "funding_carry": {"allowed_regimes": ["trend_up", "trend_flat", "trend_down"]},
 }
 
 

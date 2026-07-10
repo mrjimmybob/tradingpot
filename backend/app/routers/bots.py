@@ -12,7 +12,7 @@ from ..models import (
 )
 from ..services import trading_engine
 from ..services.trading_engine import (
-    BotStartError, validate_funding_carry_params, validate_dip_recovery_params,
+    BotStartError, validate_dip_recovery_params,
 )
 from ..services.decision_status import decision_status_store, DecisionState
 from ..services.diagnostics import diagnostics_store, BotDiagnostics
@@ -25,7 +25,6 @@ router = APIRouter()
 # Per-strategy cross-field validators (beyond the per-field schema checks).
 # Keyed by strategy name; each returns a list of error strings.
 _STRATEGY_PARAM_VALIDATORS = {
-    "funding_carry": validate_funding_carry_params,
     "dip_recovery": validate_dip_recovery_params,
 }
 
@@ -87,7 +86,7 @@ def validate_strategy_params(strategy: str, params: dict) -> list[str]:
             if not isinstance(param_value, list):
                 errors.append(f"Parameter '{param_name}' must be an array, got {type(param_value).__name__}")
 
-    # Cross-field / per-strategy validation (e.g. funding_carry band ordering),
+    # Cross-field / per-strategy validation (e.g. dip_recovery cooldown ordering),
     # which the per-field schema checks above cannot express. (M3)
     extra_validator = _STRATEGY_PARAM_VALIDATORS.get(strategy)
     if extra_validator:

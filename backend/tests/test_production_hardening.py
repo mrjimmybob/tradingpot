@@ -153,25 +153,6 @@ class TestStatePersistence:
         assert engine2._price_histories[bot.id] == [100.0 + i for i in range(60)]
 
     @pytest.mark.asyncio
-    async def test_funding_cooldown_persisted(self, test_db):
-        bot = _make_bot(test_db, "funding_carry", {})
-        await test_db.flush()
-
-        dt = datetime(2026, 6, 11, 8, 0, 0)
-        engine = TradingEngine()
-        engine._funding_states = {bot.id: {"last_exit_time": dt}}
-
-        await engine._save_bot_state(bot.id, test_db)
-        await test_db.commit()
-
-        refreshed = (
-            await test_db.execute(select(Bot).where(Bot.id == bot.id))
-        ).scalar_one()
-        engine2 = TradingEngine()
-        await engine2._restore_strategy_state(refreshed)
-        assert engine2._funding_states[bot.id]["last_exit_time"] == dt
-
-    @pytest.mark.asyncio
     async def test_legacy_params_state_restored(self):
         # Bot saved by an older build: state embedded in strategy_params.
         bot = SimpleNamespace(

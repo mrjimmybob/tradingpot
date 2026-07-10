@@ -6,11 +6,9 @@ Background (the data-integrity failure these tests lock down):
   ``RiskManagementService.rotate_strategy`` which OVERWROTE ``Bot.strategy`` for
   every non-auto_mode bot - cycling it through ``_ALPHA_STRATEGIES``. After
   ``max_strategy_rotations`` (default 3) the bot paused at "Max strategy
-  rotations reached (3)". This silently corrupted fixed-strategy bots:
-      dca_accumulator -> ... -> trend_following
-      mean_reversion  -> ... -> funding_carry
-      trend_following -> ... -> dca_accumulator
-  (each = 3 hops through _ALPHA_STRATEGIES).
+  rotations reached (3)". This silently corrupted fixed-strategy bots,
+  cycling each one 3 hops through _ALPHA_STRATEGIES from its original
+  configured strategy.
 
 The fix:
   * check_consecutive_losses PAUSES fixed-strategy bots (never rotates them) and
@@ -249,15 +247,15 @@ async def test_repair_restores_the_three_observed_bots(test_db):
     await _add_rotation_chain(test_db, b2.id, [
         "dca_accumulator", "adaptive_grid", "mean_reversion", "trend_following",
     ])
-    # TestBot3-MR: mean_reversion -> trend_following -> volatility_breakout -> funding_carry
-    b3 = await _make_bot(test_db, "funding_carry", name="TestBot3-MR")
+    # TestBot3-MR: mean_reversion -> trend_following -> volatility_breakout -> adaptive_grid
+    b3 = await _make_bot(test_db, "adaptive_grid", name="TestBot3-MR")
     await _add_rotation_chain(test_db, b3.id, [
-        "mean_reversion", "trend_following", "volatility_breakout", "funding_carry",
+        "mean_reversion", "trend_following", "volatility_breakout", "adaptive_grid",
     ])
-    # TestBot9-TF: trend_following -> volatility_breakout -> funding_carry -> dca_accumulator
+    # TestBot9-TF: trend_following -> volatility_breakout -> adaptive_grid -> dca_accumulator
     b9 = await _make_bot(test_db, "dca_accumulator", name="TestBot9-TF")
     await _add_rotation_chain(test_db, b9.id, [
-        "trend_following", "volatility_breakout", "funding_carry", "dca_accumulator",
+        "trend_following", "volatility_breakout", "adaptive_grid", "dca_accumulator",
     ])
 
     svc = RiskManagementService(test_db)
@@ -277,8 +275,8 @@ async def test_repair_restores_the_three_observed_bots(test_db):
 
 @pytest.mark.asyncio
 async def test_repair_is_idempotent_and_skips_clean_bots(test_db):
-    corrupted = await _make_bot(test_db, "funding_carry", name="corrupt")
-    await _add_rotation_chain(test_db, corrupted.id, ["mean_reversion", "funding_carry"])
+    corrupted = await _make_bot(test_db, "adaptive_grid", name="corrupt")
+    await _add_rotation_chain(test_db, corrupted.id, ["mean_reversion", "adaptive_grid"])
     clean = await _make_bot(test_db, "dca_accumulator", name="clean")
     auto = await _make_bot(test_db, "auto_mode", name="auto")
 

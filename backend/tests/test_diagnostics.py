@@ -243,7 +243,7 @@ def test_record_signal_does_not_mutate_signal():
 # --------------------------------------------------------------------------- #
 ALL_STRATEGIES = [
     "dca_accumulator", "adaptive_grid", "mean_reversion",
-    "trend_following", "volatility_breakout", "funding_carry", "auto_mode",
+    "trend_following", "volatility_breakout", "auto_mode",
 ]
 
 
@@ -264,7 +264,7 @@ async def test_diagnostics_populated_for_every_strategy(strategy):
         compound_enabled=False, is_dry_run=True, status=BotStatus.RUNNING,
         total_pnl=0.0,
     )
-    # funding_carry / auto_mode read a registered exchange; give them a sim one.
+    # auto_mode reads a registered exchange; give it a sim one.
     engine._exchange_services[bot.id] = engine._make_simulated_exchange(bot.budget)
 
     # Generic empty-result session for strategies that touch the DB (auto_mode).
@@ -409,12 +409,12 @@ async def test_running_regime_hold_is_not_displayed_as_paused(client, test_db):
     """A RUNNING bot holding on a regime filter must show a DECISION of
     'Waiting for market regime' and a Current Activity that NEVER begins with
     'Paused'. (The exact bug: lifecycle RUNNING but UI said PAUSED.)"""
-    bot = await _create_bot(test_db, strategy="funding_carry", status=BotStatus.RUNNING)
+    bot = await _create_bot(test_db, strategy="trend_following", status=BotStatus.RUNNING)
     diagnostics_store.clear(bot.id)
     decision_status_store.clear(bot.id)
 
-    # Exactly the production signal funding_carry emits on a regime miss.
-    sig = _sig("hold", "Funding Carry: regime trend_flat not in ['trend_up']")
+    # Exactly the production signal trend_following emits on a regime miss.
+    sig = _sig("hold", "Trend Following: regime trend_flat not in ['trend_up']")
     decision_status_store.update_from_signal(bot.id, sig, symbol="BTC/USDT")
     diagnostics_store.record_signal(bot.id, sig)
 
@@ -436,7 +436,7 @@ async def test_lifecycle_and_decision_are_independent(client, test_db):
     """When the bot IS paused, lifecycle shows paused and Current Activity leads
     with 'Paused:' — proving the two concepts render independently and correctly
     in both directions."""
-    bot = await _create_bot(test_db, strategy="funding_carry", status=BotStatus.PAUSED)
+    bot = await _create_bot(test_db, strategy="trend_following", status=BotStatus.PAUSED)
     diagnostics_store.clear(bot.id)
     decision_status_store.clear(bot.id)
     diagnostics_store.record_pause(bot.id, "Risk limit reached")

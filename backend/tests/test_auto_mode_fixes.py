@@ -321,11 +321,6 @@ class TestCapabilityAlignment:
         caps = _engine()._get_strategy_capabilities()
         assert caps["adaptive_grid"]["allowed_regimes"] == ["trend_flat", "volatility_medium"]
 
-    def test_funding_carry_still_matches_strategy_entry_regime(self):
-        """Already correct before this fix - guard against regression."""
-        caps = _engine()._get_strategy_capabilities()
-        assert caps["funding_carry"]["allowed_regimes"] == ["trend_up", "trend_flat"]
-
     def test_capability_allowed_regimes_are_reachable_tags(self):
         """Every tag declared in allowed_regimes must be one _is_strategy_eligible
         can actually produce (trend_*, volatility_<state>, volatility_<direction>,

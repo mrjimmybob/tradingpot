@@ -1,11 +1,12 @@
-"""Regression tests for the 5 bot-inactivity root causes fixed in this session.
+"""Regression tests for bot-inactivity root causes fixed in this session.
 
 Issues fixed:
   1. Auto Mode indefinitely parked on non-trading strategy (inactivity penalty)
-  2. Funding Carry blocked 100% of the time by regime filter (added trend_flat)
-  3. Adaptive Grid levels never crossed (spacing 1.0% → 0.3%)
-  4. Volatility Breakout never armed (min_compression_bars 20 → 5, cooldown 72h → 24h)
-  5. TF and MR defaults too conservative (long_period 200→100, bollinger_std 2.0→1.8)
+  2. Adaptive Grid levels never crossed (spacing 1.0% → 0.3%)
+  3. Volatility Breakout never armed (min_compression_bars 20 → 5, cooldown 72h → 24h)
+  4. TF and MR defaults too conservative (long_period 200→100, bollinger_std 2.0→1.8)
+
+(funding_carry-specific regression tests removed along with the strategy itself.)
 """
 from __future__ import annotations
 
@@ -134,92 +135,6 @@ class TestAutoModeScoring:
         caps = _capabilities()["adaptive_grid"]
         result = engine._score_strategy("adaptive_grid", caps, _metrics())
         assert isinstance(result["final"], float)
-
-
-# ---------------------------------------------------------------------------
-# ISSUE 2 – Funding Carry default allowed_regimes now includes trend_flat
-# ---------------------------------------------------------------------------
-
-class TestFundingCarryRegimeDefault:
-    """The default allowed_regimes for funding_carry now includes 'trend_flat'
-    so the strategy can participate in sideways markets with favourable funding."""
-
-    def test_default_allowed_regimes_includes_trend_flat(self):
-        engine = _engine()
-        # Build a minimal params dict (no overrides) and read what the strategy
-        # would use as default.  We call the actual params lookup the same way
-        # the strategy method does.
-        params: dict = {}
-        allowed = params.get("allowed_regimes", ["trend_up", "trend_flat"])
-        assert "trend_flat" in allowed
-        assert "trend_up" in allowed
-
-    @pytest.mark.asyncio
-    async def test_funding_carry_enters_in_flat_regime_with_favourable_funding(self):
-        """Flat trend + funding within band → BUY signal (no entry cooldown)."""
-        engine = _engine()
-
-        bot = MagicMock()
-        bot.id = 99
-        bot.strategy = "funding_carry"
-        bot.trading_pair = "BTC/USDT"
-        bot.current_balance = 100.0
-        bot.started_at = datetime.utcnow() - timedelta(hours=1)
-
-        session = AsyncMock()
-        session.execute = AsyncMock(return_value=MagicMock(scalars=MagicMock(return_value=MagicMock(all=MagicMock(return_value=[])))))
-
-        # Inject price history that produces trend_flat regime
-        flat_price = 64000.0
-        flat_history = [flat_price] * 250
-        engine._price_histories = {bot.id: flat_history}
-        engine._funding_states = {}
-
-        # Patch funding signal to return a favourable rate (inside default band)
-        with patch.object(engine, "_get_funding_signal", new=AsyncMock(return_value=0.0001)):
-            with patch.object(engine, "_get_bot_positions", new=AsyncMock(return_value=[])):
-                signal = await engine._strategy_funding_carry(
-                    bot, flat_price, {}, session
-                )
-
-        assert signal is not None
-        assert signal.action == "buy", (
-            f"Expected buy in flat regime with favourable funding, got: {signal.reason}"
-        )
-
-    @pytest.mark.asyncio
-    async def test_funding_carry_still_blocked_in_downtrend(self):
-        """Funding Carry must still not enter during a downtrend.
-        We patch regime detection to inject a forced trend_down result."""
-        engine = _engine()
-
-        bot = MagicMock()
-        bot.id = 99
-        bot.strategy = "funding_carry"
-        bot.trading_pair = "BTC/USDT"
-        bot.current_balance = 100.0
-        bot.started_at = datetime.utcnow() - timedelta(hours=1)
-
-        session = AsyncMock()
-        engine._price_histories = {bot.id: [64000.0] * 250}
-        engine._funding_states = {}
-
-        downtrend_regime = {
-            "trend_state": "down",
-            "volatility_state": "medium",
-            "liquidity_state": "normal",
-        }
-
-        with patch.object(engine, "_detect_market_regime", return_value=downtrend_regime):
-            with patch.object(engine, "_get_funding_signal", new=AsyncMock(return_value=0.0001)):
-                with patch.object(engine, "_get_bot_positions", new=AsyncMock(return_value=[])):
-                    signal = await engine._strategy_funding_carry(
-                        bot, 64000.0, {}, session
-                    )
-
-        assert signal is not None
-        assert signal.action == "hold"
-        assert "trend_down" in signal.reason or "not in" in signal.reason
 
 
 # ---------------------------------------------------------------------------
@@ -782,74 +697,6 @@ class TestAutoModeOpportunityScore:
         assert abs(result["performance"]) < 1.5, (
             f"Low-confidence bad performance should barely affect score: {result['performance']:.3f}"
         )
-
-
-# ---------------------------------------------------------------------------
-# NEW – Funding Carry: stale ["trend_up"] default upgraded at runtime
-# ---------------------------------------------------------------------------
-
-class TestFundingCarryStaleMigration:
-    """Bots created under the old default allowed_regimes=['trend_up'] must
-    be silently upgraded to ['trend_up','trend_flat'] at runtime so they can
-    enter in flat markets."""
-
-    @pytest.mark.asyncio
-    async def test_stale_trend_up_only_config_still_enters_in_flat_regime(self):
-        """Bot with persisted allowed_regimes=['trend_up'] must enter when
-        regime is trend_flat (migration normalises the stale default)."""
-        engine = _engine()
-
-        bot = MagicMock()
-        bot.id = 201
-        bot.strategy = "funding_carry"
-        bot.trading_pair = "BTC/USDT"
-        bot.current_balance = 10_000.0
-
-        session = AsyncMock()
-        engine._price_histories = {bot.id: [64000.0] * 250}
-        engine._funding_states = {}
-
-        flat_regime = {"trend_state": "flat", "volatility_state": "medium", "liquidity_state": "normal"}
-
-        # Simulate the old, stale persisted default
-        stale_params = {"allowed_regimes": ["trend_up"]}
-
-        with patch.object(engine, "_detect_market_regime", return_value=flat_regime):
-            with patch.object(engine, "_get_funding_signal", new=AsyncMock(return_value=0.0001)):
-                with patch.object(engine, "_get_bot_positions", new=AsyncMock(return_value=[])):
-                    signal = await engine._strategy_funding_carry(
-                        bot, 64000.0, stale_params, session
-                    )
-
-        assert signal.action == "buy", (
-            f"Stale ['trend_up'] config must be normalised to include trend_flat; got: {signal.reason}"
-        )
-
-    @pytest.mark.asyncio
-    async def test_explicit_trend_up_only_does_not_block_trend_up(self):
-        """After normalisation, trend_up regime still triggers entry."""
-        engine = _engine()
-
-        bot = MagicMock()
-        bot.id = 202
-        bot.strategy = "funding_carry"
-        bot.trading_pair = "BTC/USDT"
-        bot.current_balance = 10_000.0
-
-        session = AsyncMock()
-        engine._price_histories = {bot.id: [64000.0] * 250}
-        engine._funding_states = {}
-
-        up_regime = {"trend_state": "up", "volatility_state": "medium", "liquidity_state": "normal"}
-
-        with patch.object(engine, "_detect_market_regime", return_value=up_regime):
-            with patch.object(engine, "_get_funding_signal", new=AsyncMock(return_value=0.0001)):
-                with patch.object(engine, "_get_bot_positions", new=AsyncMock(return_value=[])):
-                    signal = await engine._strategy_funding_carry(
-                        bot, 64000.0, {"allowed_regimes": ["trend_up"]}, session
-                    )
-
-        assert signal.action == "buy", f"trend_up must still trigger entry; got: {signal.reason}"
 
 
 # ---------------------------------------------------------------------------

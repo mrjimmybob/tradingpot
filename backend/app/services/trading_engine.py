@@ -17,6 +17,7 @@ from ..models import (
     Trade, TradeSide, Alert,
     async_session_maker,
 )
+from .clock import Clock, SystemClock
 from .exchange import ExchangeService, SimulatedExchangeService, OrderSide
 from .virtual_wallet import VirtualWalletService
 from .risk_management import RiskManagementService, RiskAction
@@ -28,7 +29,6 @@ from .logging_service import (
     ensure_bot_log_directory,
 )
 from .execution_cost_model import ExecutionCostModel, get_cost_model
-from .funding_diagnostic import compute_funding_stats
 from .portfolio_risk import PortfolioRiskService
 from .strategy_capacity import StrategyCapacityService
 from .ledger_writer import LedgerWriterService
@@ -121,12 +121,11 @@ def _normalize_trend_state(state: dict) -> dict:
 # resumed bots keep their risk state (trailing stops, locked entry ATR,
 # cooldowns) and price history. Stored in Bot.strategy_state (a dedicated JSON
 # column), NEVER in strategy_params (which is user config). Transient caches
-# (e.g. _funding_cache) are intentionally excluded - they are safe to rebuild.
+# are intentionally excluded - they are safe to rebuild.
 _PERSISTED_STATE_ATTRS = (
     "_grid_states",
     "_mean_reversion_states",
     "_trend_states",
-    "_funding_states",
     "_volatility_breakout_states",
     "_twap_states",
     "_vwap_states",
@@ -157,7 +156,6 @@ _ALPHA_STRATEGIES = (
     "mean_reversion",
     "trend_following",
     "volatility_breakout",
-    "funding_carry",
 )
 
 _DT_TAG = "__dt__"
@@ -303,58 +301,12 @@ def evaluate_reward_risk(
     return True, ""
 
 
-def validate_funding_carry_params(params: dict) -> list:
-    """Validate funding_carry strategy parameters.
-
-    Returns a list of human-readable error strings (empty when valid). Kept as a
-    pure function so it can be reused by configuration checks and tests without
-    constructing an engine. Missing keys are valid (defaults apply).
-
-    Args:
-        params: The bot's strategy_params dict.
-    """
-    errors = []
-    min_funding = params.get("min_funding_rate")
-    max_funding = params.get("max_funding_rate")
-    lookback = params.get("funding_lookback_periods")
-    max_alloc = params.get("max_allocation_percent")
-    cooldown = params.get("cooldown_seconds")
-    refresh = params.get("funding_refresh_seconds")
-    allowed = params.get("allowed_regimes")
-
-    if (
-        isinstance(min_funding, (int, float))
-        and isinstance(max_funding, (int, float))
-        and min_funding > max_funding
-    ):
-        errors.append(
-            f"min_funding_rate ({min_funding}) must not exceed "
-            f"max_funding_rate ({max_funding})"
-        )
-    if lookback is not None and (not isinstance(lookback, int) or lookback < 1):
-        errors.append("funding_lookback_periods must be an integer >= 1")
-    if max_alloc is not None and (
-        not isinstance(max_alloc, (int, float)) or not 0 < max_alloc <= 100
-    ):
-        errors.append("max_allocation_percent must be in (0, 100]")
-    if cooldown is not None and (not isinstance(cooldown, (int, float)) or cooldown < 0):
-        errors.append("cooldown_seconds must be >= 0")
-    if refresh is not None and (not isinstance(refresh, (int, float)) or refresh <= 0):
-        errors.append("funding_refresh_seconds must be > 0")
-    if allowed is not None and (
-        not isinstance(allowed, list) or not all(isinstance(r, str) for r in allowed)
-    ):
-        errors.append("allowed_regimes must be a list of regime strings")
-
-    return errors
-
-
 def validate_dip_recovery_params(params: dict) -> list:
     """Validate dip_recovery strategy parameters.
 
     Returns a list of human-readable error strings (empty when valid). Kept as a
     pure function so it can be reused by configuration checks and tests without
-    constructing an engine, mirroring validate_funding_carry_params.
+    constructing an engine.
 
     Args:
         params: The bot's strategy_params dict.
@@ -466,8 +418,20 @@ class _VirtualPosition:
 class TradingEngine:
     """Engine for executing trading bots."""
 
-    def __init__(self):
-        """Initialize trading engine."""
+    def __init__(self, clock: Optional[Clock] = None):
+        """Initialize trading engine.
+
+        Args:
+            clock: Time source for every wall-clock read in
+                this engine (bar-close detection, cooldown timers, entry/exit
+                timestamps). Defaults to SystemClock (real wall-clock time),
+                which is what live trading and dry-run both use. The backtest
+                engine injects a BacktestClock instead, so each TradingEngine
+                instance owns its own clock - no shared/global time state, so
+                a backtest cannot affect a live or dry-run engine's clock even
+                when run in the same process.
+        """
+        self.clock: Clock = clock or SystemClock()
         self._running_bots: Dict[int, asyncio.Task] = {}
         self._exchange_services: Dict[int, ExchangeService] = {}
         self._stop_flags: Dict[int, bool] = {}
@@ -585,9 +549,9 @@ class TradingEngine:
 
             # Update bot status only after the exchange connection succeeded
             bot.status = BotStatus.RUNNING
-            bot.started_at = datetime.utcnow()
+            bot.started_at = self.clock.now()
             bot.paused_at = None
-            bot.updated_at = datetime.utcnow()
+            bot.updated_at = self.clock.now()
             await session.commit()
 
             self._exchange_services[bot_id] = exchange
@@ -644,8 +608,8 @@ class TradingEngine:
             bot = result.scalar_one_or_none()
             if bot:
                 bot.status = BotStatus.PAUSED
-                bot.paused_at = datetime.utcnow()
-                bot.updated_at = datetime.utcnow()
+                bot.paused_at = self.clock.now()
+                bot.updated_at = self.clock.now()
                 await session.commit()
                 diagnostics_store.record_pause(bot_id, "Manual pause by operator")
                 decision_status_store.update(
@@ -683,7 +647,7 @@ class TradingEngine:
 
             # Update status
             bot.status = BotStatus.STOPPED
-            bot.updated_at = datetime.utcnow()
+            bot.updated_at = self.clock.now()
             await session.commit()
 
         # Disconnect exchange
@@ -787,7 +751,7 @@ class TradingEngine:
                             reason=risk_assessment.reason, symbol=bot.trading_pair,
                         )
                         bot.status = BotStatus.PAUSED
-                        bot.paused_at = datetime.utcnow()
+                        bot.paused_at = self.clock.now()
                         await session.commit()
                         self._stop_flags[bot_id] = True
 
@@ -846,11 +810,11 @@ class TradingEngine:
                         if recovery:
                             try:
                                 entered_at = datetime.fromisoformat(recovery["entered_at"])
-                                days_stuck = (datetime.utcnow() - entered_at).days
+                                days_stuck = (self.clock.now() - entered_at).days
                                 if days_stuck >= 7:
                                     # Warn roughly once per hour (3600 ticks ≈ 1 hour at 1 Hz)
                                     ticks_since_entry = int(
-                                        (datetime.utcnow() - entered_at).total_seconds()
+                                        (self.clock.now() - entered_at).total_seconds()
                                     )
                                     if ticks_since_entry % 3600 < 2:
                                         logger.warning(
@@ -989,7 +953,7 @@ class TradingEngine:
                     # H2: resolve any orders left pending (orphaned resting limit
                     # orders, or market orders the exchange confirms late) against
                     # the exchange. Throttled so we do not poll every second.
-                    now = datetime.utcnow()
+                    now = self.clock.now()
                     last_resolve = self._last_pending_resolve.get(bot_id)
                     if last_resolve is None or (now - last_resolve).total_seconds() >= 30:
                         self._last_pending_resolve[bot_id] = now
@@ -1130,7 +1094,6 @@ class TradingEngine:
             "mean_reversion": self._strategy_mean_reversion,
             "trend_following": self._strategy_trend_following,
             "volatility_breakout": self._strategy_volatility_breakout,
-            "funding_carry": self._strategy_funding_carry,
             "dip_recovery": self._strategy_dip_recovery,
                     "auto_mode": self._strategy_auto,
         }
@@ -1219,7 +1182,7 @@ class TradingEngine:
 
             # Add current price to history for regime detection
             price_history_with_current = price_history + [{
-                "timestamp": datetime.utcnow().isoformat(),
+                "timestamp": self.clock.now().isoformat(),
                 "price": current_price
             }]
 
@@ -1258,7 +1221,7 @@ class TradingEngine:
         # === TIME-BASED INTERVAL LOGIC (hardened) ===
         # Ensures clock-stable behavior: one buy max per interval, no catch-up
         interval_seconds = interval_minutes * 60
-        now = datetime.utcnow()
+        now = self.clock.now()
 
         if last_order:
             # Defensive: If last order timestamp is in the future, treat as no last order
@@ -1484,7 +1447,7 @@ class TradingEngine:
                 "completed_bars": [],  # List of completed bars for ATR calculation
                 "last_order_bar": None,  # Timestamp of last order bar (one order per bar)
                 "peak_portfolio_value": bot.budget,  # Track peak for drawdown
-                "last_recenter_time": datetime.utcnow(),
+                "last_recenter_time": self.clock.now(),
                 "total_trades": 0,
                 # TELEMETRY METRICS (for dashboards and auto-mode learning)
                 "lifetime_return_pct": 0.0,  # Total return since inception (%)
@@ -1507,7 +1470,7 @@ class TradingEngine:
             )
 
         # === BAR AGGREGATION (60-second bars) ===
-        now = datetime.utcnow()
+        now = self.clock.now()
         current_bar = state.get("current_bar")
 
         if current_bar is None:
@@ -2202,7 +2165,7 @@ class TradingEngine:
             "last_exit_time": None,  # For cooldown
         })
 
-        now = datetime.utcnow()
+        now = self.clock.now()
 
         # Initialize current bar if needed
         if state["current_bar"] is None:
@@ -2314,7 +2277,7 @@ class TradingEngine:
         if regime_filter_enabled:
             # Detect regime from THIS strategy's own completed bar closes. The
             # shared tick price-history buffer (_get_price_history) is only
-            # populated by trend_following/funding_carry, so a standalone
+            # populated by trend_following, so a standalone
             # mean-reversion bot fed it an empty series -> _detect_market_regime
             # returned the neutral 'flat/medium' default forever. That silently
             # disabled BOTH the regime entry gate AND the trend force-exit
@@ -2366,7 +2329,7 @@ class TradingEngine:
             cd_remaining = 0
             if state.get("last_exit_time") is not None:
                 cd_remaining = max(0, int(cooldown_seconds - (
-                    datetime.utcnow() - state["last_exit_time"]).total_seconds()))
+                    self.clock.now() - state["last_exit_time"]).total_seconds()))
             logger.info(
                 f"Bot {bot.id}: MR no-trade diag - close=${last_bar_close:.2f} "
                 f"lower_band=${lower_band:.2f} gap_to_entry={entry_gap_pct:+.3f}% "
@@ -2485,7 +2448,7 @@ class TradingEngine:
                     state["target_price"] = None
                     state["hard_stop"] = None
                     state["bars_since_entry"] = 0
-                    state["last_exit_time"] = datetime.utcnow()
+                    state["last_exit_time"] = self.clock.now()
                     self._mean_reversion_states[bot.id] = state
 
                     return TradeSignal(
@@ -2526,7 +2489,7 @@ class TradingEngine:
                     state["target_price"] = None
                     state["hard_stop"] = None
                     state["bars_since_entry"] = 0
-                    state["last_exit_time"] = datetime.utcnow()
+                    state["last_exit_time"] = self.clock.now()
                     self._mean_reversion_states[bot.id] = state
 
                     return TradeSignal(
@@ -2553,7 +2516,7 @@ class TradingEngine:
                     state["target_price"] = None
                     state["hard_stop"] = None
                     state["bars_since_entry"] = 0
-                    state["last_exit_time"] = datetime.utcnow()
+                    state["last_exit_time"] = self.clock.now()
                     self._mean_reversion_states[bot.id] = state
 
                     return TradeSignal(
@@ -2579,7 +2542,7 @@ class TradingEngine:
                     state["target_price"] = None
                     state["hard_stop"] = None
                     state["bars_since_entry"] = 0
-                    state["last_exit_time"] = datetime.utcnow()
+                    state["last_exit_time"] = self.clock.now()
                     self._mean_reversion_states[bot.id] = state
 
                     return TradeSignal(
@@ -2616,7 +2579,7 @@ class TradingEngine:
 
         # Cooldown check
         if state["last_exit_time"] is not None:
-            time_since_exit = (datetime.utcnow() - state["last_exit_time"]).total_seconds()
+            time_since_exit = (self.clock.now() - state["last_exit_time"]).total_seconds()
             if time_since_exit < cooldown_seconds:
                 remaining = int(cooldown_seconds - time_since_exit)
                 self._mean_reversion_states[bot.id] = state
@@ -2751,7 +2714,7 @@ class TradingEngine:
         from .config import config_service
 
         interval = config_service.get("trading.reconciliation_interval_seconds") or 300
-        now = datetime.utcnow()
+        now = self.clock.now()
         if self._last_reconciliation and (now - self._last_reconciliation).total_seconds() < interval:
             return
         self._last_reconciliation = now
@@ -2946,7 +2909,7 @@ class TradingEngine:
         # well inside the fee hurdle (guaranteed loss on every trade).
         # 60-second bar H-L ranges (~$50-200 on BTC) reflect actual volatility.
         bar_interval_seconds = params.get("bar_interval_seconds", 60)
-        _now = datetime.utcnow()
+        _now = self.clock.now()
         if state.get("tf_current_bar") is None:
             state["tf_current_bar"] = {
                 "high": current_price, "low": current_price,
@@ -3003,7 +2966,7 @@ class TradingEngine:
         if state.get("last_exit_time") is not None:
             tf_cd_remaining = max(
                 0,
-                int(cooldown_seconds - (datetime.utcnow() - state["last_exit_time"]).total_seconds()),
+                int(cooldown_seconds - (self.clock.now() - state["last_exit_time"]).total_seconds()),
             )
         exp.update({
             "current_price": current_price,
@@ -3077,7 +3040,7 @@ class TradingEngine:
 
             # Check re-entry cooldown (anti-churn protection)
             if state["last_exit_time"] is not None:
-                time_since_exit = (datetime.utcnow() - state["last_exit_time"]).total_seconds()
+                time_since_exit = (self.clock.now() - state["last_exit_time"]).total_seconds()
                 if time_since_exit < cooldown_seconds:
                     remaining = int(cooldown_seconds - time_since_exit)
                     return TradeSignal(
@@ -3158,7 +3121,7 @@ class TradingEngine:
                     "trailing_stop": trailing_stop_price,
                     "highest_price": current_price,
                     "entry_atr": atr,  # LOCKED - trailing stop distance will always use this
-                    "entry_time": datetime.utcnow(),
+                    "entry_time": self.clock.now(),
                     "last_exit_time": None,
                     "entry_confirmation_count": 0,
                     "exit_confirmation_count": 0,
@@ -3228,7 +3191,7 @@ class TradingEngine:
                         "highest_price": None,
                         "entry_atr": None,
                         "entry_time": None,
-                        "last_exit_time": datetime.utcnow(),
+                        "last_exit_time": self.clock.now(),
                         "entry_confirmation_count": 0,
                         "exit_confirmation_count": 0,
                     }
@@ -3268,7 +3231,7 @@ class TradingEngine:
                         "highest_price": None,
                         "entry_atr": None,
                         "entry_time": None,
-                        "last_exit_time": datetime.utcnow(),
+                        "last_exit_time": self.clock.now(),
                         "entry_confirmation_count": 0,
                         "exit_confirmation_count": 0,
                     }
@@ -3298,305 +3261,6 @@ class TradingEngine:
                 amount=0,
                 reason=f"Trend Following: Holding position, stop at {stop_str}"
             )
-
-    async def _get_funding_signal(
-        self,
-        bot: Bot,
-        lookback_periods: int,
-        refresh_seconds: float,
-    ) -> Optional[float]:
-        """Return the mean funding rate over the lookback, cached per bot.
-
-        Fetches perpetual funding-rate history via the bot's exchange service
-        (reusing ExchangeService.get_funding_rate_history) and averages the most
-        recent `lookback_periods` windows using the shared compute_funding_stats
-        helper. Cached for `refresh_seconds` to avoid hitting the API every loop.
-
-        Returns None when no exchange service or funding data is available, so
-        the strategy never trades on missing data.
-        """
-        if not hasattr(self, "_funding_cache"):
-            self._funding_cache = {}
-
-        now = datetime.utcnow()
-        cached = self._funding_cache.get(bot.id)
-        if cached and (now - cached["time"]).total_seconds() < refresh_seconds:
-            return cached["mean_rate"]
-
-        exchange = self._exchange_services.get(bot.id)
-        if exchange is None:
-            return None
-
-        swap_symbol = exchange.to_swap_symbol(bot.trading_pair)
-        history = await exchange.get_funding_rate_history(
-            swap_symbol, limit=max(lookback_periods, 1)
-        )
-        if not history:
-            return None
-
-        recent = history[-lookback_periods:]
-        rates = [h.funding_rate for h in recent]
-        interval_hours = recent[-1].interval_hours
-        mean_rate = compute_funding_stats(rates, interval_hours).mean_rate
-
-        self._funding_cache[bot.id] = {"time": now, "mean_rate": mean_rate}
-        return mean_rate
-
-    async def _strategy_funding_carry(
-        self,
-        bot: Bot,
-        current_price: float,
-        params: dict,
-        session: AsyncSession,
-    ) -> Optional[TradeSignal]:
-        """Funding Carry (funding-aware trend) strategy.
-
-        Long-only SPOT strategy that uses perpetual funding rates as a
-        positioning/crowdedness signal, gated by a directional trend filter.
-
-        IMPORTANT: This does NOT short, hedge, or directly harvest funding (a
-        market-neutral basis trade needs a perpetual leg, intentionally out of
-        scope). Funding is used purely as a FILTER on spot entries. True funding
-        harvesting would require the perp leg; this strategy instead aims to
-        improve risk-adjusted entries, not trade frequency.
-
-        Entry (ALL required):
-            - mean funding over `funding_lookback_periods` lies within the
-              favourable band [min_funding_rate, max_funding_rate] (avoids
-              both falling-knife and over-crowded/euphoric regimes)
-            - market regime trend_state is in `allowed_regimes`
-            - no open position, not in cooldown, sufficient balance
-        Exit (ANY):
-            - funding leaves the favourable band
-            - market regime no longer favourable
-
-        Parameters:
-            min_funding_rate: Lower bound of favourable funding band (default -0.0005)
-            max_funding_rate: Upper bound of favourable funding band (default 0.0005)
-            funding_lookback_periods: Funding windows to average (default 3)
-            allowed_regimes: Favourable trend regimes (default ["trend_up"])
-            max_allocation_percent: Max % of balance per position (default 20)
-            cooldown_seconds: Seconds to wait after exit before re-entry (default 300)
-            funding_refresh_seconds: Funding-rate cache TTL in seconds (default 300)
-        """
-        min_funding = params.get("min_funding_rate", -0.0005)
-        max_funding = params.get("max_funding_rate", 0.0005)
-        lookback = int(params.get("funding_lookback_periods", 3))
-        allowed_regimes = params.get("allowed_regimes", ["trend_up", "trend_flat"])
-        # Migrate stale single-element default written before trend_flat was added.
-        # Bots created under the old default have ["trend_up"] persisted in the DB;
-        # the code default now includes "trend_flat" so we silently upgrade.
-        if allowed_regimes == ["trend_up"]:
-            allowed_regimes = ["trend_up", "trend_flat"]
-        max_alloc = params.get("max_allocation_percent", 20.0) / 100.0
-        cooldown_seconds = params.get("cooldown_seconds", 300)
-        refresh_seconds = params.get("funding_refresh_seconds", 300)
-
-        # Defensive: a misconfigured band would silently block all trades.
-        if min_funding > max_funding:
-            return TradeSignal(
-                action="hold",
-                amount=0,
-                reason="Funding Carry: invalid config (min_funding_rate > max_funding_rate)",
-            )
-
-        # === DIRECTIONAL FILTER (reuses tick-based regime detection) ===
-        price_history = self._get_price_history(bot.id)
-        price_history.append(current_price)
-        self._save_price_history(bot.id, price_history, max_len=250)
-
-        regime = self._detect_market_regime(price_history, None)
-        trend_regime_name = f"trend_{regime.get('trend_state', 'flat')}"
-        market_favorable = trend_regime_name in allowed_regimes
-
-        # === FUNDING FILTER ===
-        mean_funding = await self._get_funding_signal(bot, lookback, refresh_seconds)
-        if not hasattr(self, "_funding_unavailable_warned"):
-            self._funding_unavailable_warned = set()
-        if mean_funding is None:
-            # L1: a pair with no perpetual market yields a permanent silent hold.
-            # Warn once per outage so the operator can see why nothing trades.
-            if bot.id not in self._funding_unavailable_warned:
-                self._funding_unavailable_warned.add(bot.id)
-                msg = (
-                    f"Funding Carry: no funding-rate data for {bot.trading_pair} "
-                    "(no perpetual market or unsupported); holding until data is available."
-                )
-                logger.warning(f"Bot {bot.id}: {msg}")
-                if bot.id in self._bot_loggers:
-                    self._bot_loggers[bot.id].log_activity(msg)
-            self._explain(bot.id).state("WAITING_FUNDING_RATE").metric(
-                "current_price", current_price
-            ).check(
-                "Funding data available", "none", "perpetual funding history", False,
-                detail="no perpetual market for this pair",
-            )
-            return TradeSignal(
-                action="hold",
-                amount=0,
-                reason="Funding Carry: funding-rate data unavailable (holding)",
-            )
-        # Data available again: clear the one-time warning latch.
-        self._funding_unavailable_warned.discard(bot.id)
-        funding_favorable = min_funding <= mean_funding <= max_funding
-
-        # Per-bot state (cooldown tracking), mirroring other strategies.
-        if not hasattr(self, "_funding_states"):
-            self._funding_states = {}
-        state = self._funding_states.get(bot.id, {"last_exit_time": None})
-
-        positions = await self._get_bot_positions(bot.id, session)
-        has_position = len(positions) > 0
-
-        funding_pct = mean_funding * 100.0
-
-        # --- Structured decision explanation (observe-only) -----------------
-        # Funding is used purely as an ENTRY FILTER here (this strategy does not
-        # short or harvest funding), so there is no carry-edge / expected-fee
-        # math to expose — only the funding band, regime gate and cooldown that
-        # actually gate the spot entry/exit.
-        exp = self._explain(bot.id)
-        fc_cd_remaining = 0
-        if state.get("last_exit_time") is not None:
-            fc_cd_remaining = max(
-                0,
-                int(cooldown_seconds - (datetime.utcnow() - state["last_exit_time"]).total_seconds()),
-            )
-        _band = f"in [{min_funding * 100:.5f}%, {max_funding * 100:.5f}%]"
-        exp.update({
-            "current_price": current_price,
-            "funding_rate_pct": funding_pct,
-            "min_funding_pct": min_funding * 100.0,
-            "max_funding_pct": max_funding * 100.0,
-            "funding_lookback_periods": lookback,
-            "regime": trend_regime_name,
-            "allowed_regimes": ", ".join(allowed_regimes),
-            "cooldown_seconds": cooldown_seconds,
-            "cooldown_remaining_s": fc_cd_remaining,
-            "has_position": has_position,
-        })
-        _min_pct, _max_pct = min_funding * 100.0, max_funding * 100.0
-        if not has_position:
-            exp.check("Cooldown", f"{fc_cd_remaining} sec remaining", f">= {cooldown_seconds} sec elapsed", fc_cd_remaining == 0)
-            exp.check("Funding in band", f"{funding_pct:.5f}%", _band, funding_favorable)
-            exp.check("Regime favourable", trend_regime_name, f"in [{', '.join(allowed_regimes)}]", market_favorable)
-            if fc_cd_remaining > 0:
-                exp.state("COOLDOWN").next_trade(
-                    current=fc_cd_remaining, current_label="Cooldown remaining (s)",
-                    target=0, target_label="Ready", distance=fc_cd_remaining,
-                    status=f"{fc_cd_remaining}s until cooldown clears",
-                )
-            elif not funding_favorable:
-                if funding_pct < _min_pct:
-                    _edge, _gap, _dir = _min_pct, _min_pct - funding_pct, "rise"
-                else:
-                    _edge, _gap, _dir = _max_pct, funding_pct - _max_pct, "fall"
-                exp.state("WAITING_FUNDING_RATE").next_trade(
-                    current=funding_pct, current_label="Funding rate (%)",
-                    target=_edge, target_label="Band edge (%)", distance=_gap,
-                    status=f"needs to {_dir} {_gap:.5f}% into band",
-                )
-            elif not market_favorable:
-                exp.state("WAITING_REGIME").next_trade(
-                    current=trend_regime_name, current_label="Regime",
-                    target=", ".join(allowed_regimes), target_label="Allowed",
-                    status=f"waiting for regime in [{', '.join(allowed_regimes)}]",
-                )
-            else:
-                exp.state("ENTRY_ARMED")
-        else:
-            exp.check("Funding still in band", f"{funding_pct:.5f}%", _band, funding_favorable, detail="exit when funding leaves band")
-            exp.check("Regime still favourable", trend_regime_name, f"in [{', '.join(allowed_regimes)}]", market_favorable, detail="exit when regime turns")
-            exp.state("LONG_OPEN").next_trade(
-                current=funding_pct, current_label="Funding rate (%)",
-                target=f"[{_min_pct:.5f}%, {_max_pct:.5f}%]", target_label="Favourable band",
-                status="holding — exits when funding or regime leaves favourable",
-            )
-        # ---------------------------------------------------------------------
-
-        if not has_position:
-            # --- Entry path ---
-            if state.get("last_exit_time") is not None:
-                elapsed = (datetime.utcnow() - state["last_exit_time"]).total_seconds()
-                if elapsed < cooldown_seconds:
-                    remaining = int(cooldown_seconds - elapsed)
-                    return TradeSignal(
-                        action="hold",
-                        amount=0,
-                        reason=f"Funding Carry: re-entry cooldown ({remaining}s remaining)",
-                    )
-
-            if not funding_favorable:
-                return TradeSignal(
-                    action="hold",
-                    amount=0,
-                    reason=(
-                        f"Funding Carry: funding {funding_pct:.5f}% outside favourable "
-                        f"band [{min_funding * 100:.5f}%, {max_funding * 100:.5f}%]"
-                    ),
-                )
-
-            if not market_favorable:
-                return TradeSignal(
-                    action="hold",
-                    amount=0,
-                    reason=(
-                        f"Funding Carry: regime {trend_regime_name} not in {allowed_regimes}"
-                    ),
-                )
-
-            buy_amount = min(bot.current_balance * max_alloc, bot.current_balance * _BUY_BALANCE_FRACTION)
-            if buy_amount < 1:
-                return TradeSignal(
-                    action="hold",
-                    amount=0,
-                    reason="Funding Carry: insufficient balance for entry",
-                )
-
-            logger.info(
-                f"Bot {bot.id}: Funding Carry ENTRY - funding {funding_pct:.5f}% in band, "
-                f"regime {trend_regime_name}, position ${buy_amount:.2f}"
-            )
-            self._funding_states[bot.id] = {"last_exit_time": None}
-            return TradeSignal(
-                action="buy",
-                amount=buy_amount,
-                order_type="market",
-                reason=(
-                    f"Funding Carry: favourable funding ({funding_pct:.5f}%) "
-                    f"and regime ({trend_regime_name})"
-                ),
-                is_accumulation=True,
-            )
-
-        # --- Exit path: leave when either condition stops being favourable ---
-        if funding_favorable and market_favorable:
-            return TradeSignal(
-                action="hold",
-                amount=0,
-                reason=(
-                    f"Funding Carry: holding (funding {funding_pct:.5f}%, {trend_regime_name})"
-                ),
-            )
-
-        pos = positions[0]
-        sell_amount = pos.amount * current_price
-        exit_reason = (
-            "funding left favourable band"
-            if not funding_favorable
-            else f"regime {trend_regime_name} unfavourable"
-        )
-        logger.info(
-            f"Bot {bot.id}: Funding Carry EXIT - {exit_reason} "
-            f"(funding {funding_pct:.5f}%)"
-        )
-        self._funding_states[bot.id] = {"last_exit_time": datetime.utcnow()}
-        return TradeSignal(
-            action="sell",
-            amount=sell_amount,
-            order_type="market",
-            reason=f"Funding Carry: exit ({exit_reason})",
-        )
 
     async def _strategy_volatility_breakout(
         self,
@@ -3679,7 +3343,7 @@ class TradingEngine:
             "last_breakout_attempt": None,
         })
 
-        now = datetime.utcnow()
+        now = self.clock.now()
 
         # Initialize current bar if needed
         if state["current_bar"] is None:
@@ -4015,7 +3679,7 @@ class TradingEngine:
             if is_compressed:
                 if not state["compression_active"]:
                     state["compression_active"] = True
-                    state["compression_start"] = datetime.utcnow().isoformat()
+                    state["compression_start"] = self.clock.now().isoformat()
                     state["compression_bars"] = 1
                     logger.info(
                         f"Bot {bot.id}: Volatility Breakout compression STARTED - "
@@ -4124,7 +3788,7 @@ class TradingEngine:
         # longer blocks compression tracking.
         if is_breakout and state["last_breakout_attempt"] is not None:
             last_attempt = datetime.fromisoformat(state["last_breakout_attempt"])
-            hours_since = (datetime.utcnow() - last_attempt).total_seconds() / 3600
+            hours_since = (self.clock.now() - last_attempt).total_seconds() / 3600
             if hours_since < cooldown_hours:
                 self._volatility_breakout_states[bot.id] = state
                 return TradeSignal(
@@ -4213,7 +3877,7 @@ class TradingEngine:
             state["entry_atr"] = atr  # LOCKED - trailing stop distance will always use this
             state["bars_since_entry"] = 0
             state["breakout_armed"] = False  # consumed this setup
-            state["last_breakout_attempt"] = datetime.utcnow().isoformat()
+            state["last_breakout_attempt"] = self.clock.now().isoformat()
 
             self._volatility_breakout_states[bot.id] = state
 
@@ -4364,7 +4028,7 @@ class TradingEngine:
         risk_percent = params.get("risk_percent", 1.0) / 100
         spike_guard_mult = params.get("spike_guard_atr_multiplier", 6.0)
 
-        now = datetime.utcnow()
+        now = self.clock.now()
 
         # === Price history (shared tick history, same source as trend_following) ===
         price_history = self._get_price_history(bot.id)
@@ -4928,7 +4592,7 @@ class TradingEngine:
 
         # === STATE INITIALIZATION ===
         auto_state = self._get_auto_state(bot.id)
-        now = datetime.utcnow()
+        now = self.clock.now()
 
         if "current_strategy" not in auto_state:
             auto_state["current_strategy"] = "dca_accumulator"
@@ -5106,6 +4770,39 @@ class TradingEngine:
         open_positions = await self._get_bot_positions(bot.id, session)
         has_open_position = len(open_positions) > 0
 
+        # === OWNERSHIP SELF-HEAL ===
+        # auto_state["current_strategy"] is a mutable, bot-level pointer. The
+        # persisted Position.owning_strategy (set once, at the moment the
+        # position was opened - see _resolve_owning_strategy /
+        # _open_or_add_position) is the source of truth for which strategy is
+        # actually managing an open position. If the two ever disagree (e.g. a
+        # crash between opening the position and the next state checkpoint,
+        # or the in-memory pointer drifting for any other reason), the
+        # persisted fact wins: correct the pointer rather than let dispatch
+        # follow a value that does not match what actually opened the trade.
+        # NULL owning_strategy (a position opened before this field existed)
+        # is treated as unowned, not as a mismatch.
+        owning_strategy = None
+        if has_open_position:
+            owned_position = next(
+                (
+                    p for p in open_positions
+                    if isinstance(getattr(p, "owning_strategy", None), str)
+                    and getattr(p, "owning_strategy")
+                ),
+                None,
+            )
+            if owned_position is not None:
+                owning_strategy = owned_position.owning_strategy
+                if owning_strategy != auto_state["current_strategy"]:
+                    logger.warning(
+                        f"Bot {bot.id}: Auto Mode ownership mismatch - in-memory "
+                        f"pointer {auto_state['current_strategy']!r} != persisted "
+                        f"position owner {owning_strategy!r}; correcting to the "
+                        f"persisted owner (self-heal)."
+                    )
+                    auto_state["current_strategy"] = owning_strategy
+
         # === FORCE-EXIT CHECK ===
         # _is_strategy_eligible() is an ENTRY ALLOCATION GATE ONLY (regime match,
         # cooldown, blacklist, kill switch) - it answers "should Auto put new
@@ -5164,6 +4861,21 @@ class TradingEngine:
             selected_strategy = best_strategy
             should_switch = True
             switch_reason = f"current strategy ineligible, switching to {best_strategy}"
+        elif has_open_position:
+            # Bug fix: current_strategy is still entry-eligible (regime still
+            # matches) but a competitor may score higher. Ownership of an open
+            # position is not up for re-auction just because the market moved
+            # - the strategy that opened it keeps it, and only its own exit
+            # rules can close it, until it does. Without this branch the
+            # hysteresis/score comparison below would happily switch
+            # current_strategy away while a position was open, and the newly
+            # selected strategy's executor would then run against a position
+            # it never opened (this was the "Strategy A opens, Strategy B
+            # closes" defect).
+            switch_reason = (
+                f"{current_strategy} owns an open position; holding regardless "
+                f"of competing scores until it closes"
+            )
         elif best_strategy != current_strategy:
             current_score = next((s[1] for s in scored_strategies if s[0] == current_strategy), 0.0)
 
@@ -5794,21 +5506,6 @@ class TradingEngine:
 
             return _clamp(compression_score * 0.75 + expansion_bonus * 0.25)
 
-        elif strategy_name == "funding_carry":
-            # Funding rate requires exchange API; proxy on trend + vol direction
-            trend = current_regime.get("trend_state", "flat")
-            vol_dir = current_regime.get("volatility_direction", "stable")
-            score = 5.0
-            if trend == "up":
-                score += 2.0    # uptrend = best environment for positive carry
-            elif trend == "down":
-                score -= 2.0    # downtrend = adverse
-            if vol_dir == "contracting":
-                score += 1.0    # low and falling vol = stable carry environment
-            elif vol_dir == "expanding":
-                score -= 1.0    # expanding vol = higher risk to carry position
-            return _clamp(score)
-
         elif strategy_name == "dca_accumulator":
             # Attractiveness = how far price has fallen from recent high (buy the dip)
             recent_c = closes[-min(30, n):]
@@ -5965,7 +5662,7 @@ class TradingEngine:
         if last_exit_time:
             try:
                 exit_time = datetime.fromisoformat(last_exit_time)
-                hours_since_exit = (datetime.utcnow() - exit_time).total_seconds() / 3600
+                hours_since_exit = (self.clock.now() - exit_time).total_seconds() / 3600
                 if hours_since_exit < 1.0:
                     risk_penalty += 3.0
                 elif hours_since_exit < 6.0:
@@ -6260,7 +5957,7 @@ class TradingEngine:
             existing.failure_count = metrics.get("failure_count", 0)
             existing.last_exit_time = _parse_dt(metrics.get("last_exit_time"))
             existing.cooldown_until = _parse_dt(metrics.get("cooldown_until"))
-            existing.last_updated = datetime.utcnow()
+            existing.last_updated = self.clock.now()
         else:
             new_metrics = StrategyPerformanceMetrics.from_dict(
                 bot_id=bot_id,
@@ -6420,14 +6117,6 @@ class TradingEngine:
                 "typical_holding_time": "medium",
                 "description": "Range-bound grid trading for sideways markets"
             },
-            "funding_carry": {
-                # Eligible in uptrend and flat markets; downtrend disqualifies.
-                # Matches _strategy_funding_carry's own default exactly.
-                "allowed_regimes": ["trend_up", "trend_flat"],
-                "priority": 3,
-                "typical_holding_time": "long",
-                "description": "Spot entry gated on funding rate band and trend regime"
-            },
             # Note: VWAP removed - it is an execution algorithm, not an alpha strategy
             "dca_accumulator": {
                 # Always eligible as the default fallback accumulator
@@ -6545,7 +6234,7 @@ class TradingEngine:
                 last_switch = auto_state.get("last_switch_time")
                 if last_switch:
                     time_since_switch = (
-                        datetime.utcnow() - datetime.fromisoformat(last_switch)
+                        self.clock.now() - datetime.fromisoformat(last_switch)
                     ).total_seconds() / 60
 
                     if time_since_switch < min_switch_interval:
@@ -6912,7 +6601,7 @@ class TradingEngine:
         )
 
         if order.status == OrderStatus.FILLED:
-            order.filled_at = datetime.utcnow()
+            order.filled_at = self.clock.now()
 
         session.add(order)
         await session.flush()  # Get order.id for trade recording
@@ -6966,7 +6655,7 @@ class TradingEngine:
         # Log trade to per-bot file
         if bot.id in self._bot_loggers:
             self._bot_loggers[bot.id].log_trade(TradeLogEntry(
-                timestamp=datetime.utcnow(),
+                timestamp=self.clock.now(),
                 bot_id=bot.id,
                 bot_name=bot.name,
                 order_id=order.id,
@@ -7044,7 +6733,7 @@ class TradingEngine:
             fee_asset=fee_asset,
             modeled_cost=cost_estimate.total_cost,
             exchange_trade_id=exchange_order.id,
-            executed_at=datetime.utcnow(),
+            executed_at=self.clock.now(),
             strategy_used=bot.strategy,
         )
 
@@ -7124,9 +6813,13 @@ class TradingEngine:
         # Use the actual filled amount so partial fills cannot
         # desynchronize positions from the ledger
         if action == "buy":
+            owning_strategy = self._resolve_owning_strategy(bot, order.reason)
             await self._open_or_add_position(
                 bot.id, bot.trading_pair, filled_amount,
-                exchange_order.price, session
+                exchange_order.price, session,
+                owning_strategy=owning_strategy,
+                entry_reason=order.reason,
+                entry_strategy_state=self._snapshot_entry_strategy_state(owning_strategy, bot.id),
             )
         else:
             await self._close_or_reduce_position(
@@ -7194,7 +6887,7 @@ class TradingEngine:
                 action = self._action_for_order_type(order.order_type)
                 # Sync the local order to the exchange's reported fill.
                 order.status = OrderStatus.FILLED
-                order.filled_at = datetime.utcnow()
+                order.filled_at = self.clock.now()
                 order.amount = filled or ex_order.amount or order.amount
                 order.price = ex_order.price or order.price
                 order.fees = ex_order.fee or order.fees
@@ -7277,7 +6970,7 @@ class TradingEngine:
                 strategy_used=bot.strategy,
                 is_simulated=bot.is_dry_run,
                 reason="recovered: imported from exchange",
-                filled_at=datetime.utcnow(),
+                filled_at=self.clock.now(),
             )
             session.add(order)
             await session.flush()
@@ -7371,8 +7064,8 @@ class TradingEngine:
                 bot = result.scalar_one_or_none()
                 if bot:
                     bot.status = BotStatus.PAUSED
-                    bot.paused_at = datetime.utcnow()
-                    bot.updated_at = datetime.utcnow()
+                    bot.paused_at = self.clock.now()
+                    bot.updated_at = self.clock.now()
                     await session.commit()
                     await self._emit_alert(
                         session, bot_id, "failure_circuit_breaker", reason,
@@ -7397,7 +7090,7 @@ class TradingEngine:
         """
         recovery_state = {
             "active": True,
-            "entered_at": datetime.utcnow().isoformat(),
+            "entered_at": self.clock.now().isoformat(),
             "trigger_reason": reason,
             "paper_position": None,
             "paper_trades": [],
@@ -7483,7 +7176,7 @@ class TradingEngine:
                     "entry_price": current_price,
                     "amount_usd": amount_usd,
                     "trading_pair": bot.trading_pair,
-                    "entered_at": datetime.utcnow().isoformat(),
+                    "entered_at": self.clock.now().isoformat(),
                 }
                 logger.info(
                     f"Bot {bot_id}: [PAPER] BUY @ {current_price:.4f} "
@@ -7508,7 +7201,7 @@ class TradingEngine:
                 "win": win,
                 "entry_price": entry_price,
                 "exit_price": current_price,
-                "timestamp": datetime.utcnow().isoformat(),
+                "timestamp": self.clock.now().isoformat(),
             }
             recovery["paper_trades"].append(trade_record)
 
@@ -7556,7 +7249,7 @@ class TradingEngine:
             # Warn if stuck > 7 days.
             try:
                 entered_at = datetime.fromisoformat(recovery["entered_at"])
-                days_stuck = (datetime.utcnow() - entered_at).days
+                days_stuck = (self.clock.now() - entered_at).days
                 if days_stuck >= 7:
                     logger.warning(
                         f"Bot {bot_id}: RECOVERY_MODE for {days_stuck} days — "
@@ -7622,8 +7315,8 @@ class TradingEngine:
                 bot = result.scalar_one_or_none()
                 if bot:
                     bot.status = BotStatus.PAUSED
-                    bot.paused_at = datetime.utcnow()
-                    bot.updated_at = datetime.utcnow()
+                    bot.paused_at = self.clock.now()
+                    bot.updated_at = self.clock.now()
                     await session.commit()
                     await self._emit_alert(
                         session, bot_id, "repeated_rejection_breaker", reason,
@@ -7642,7 +7335,7 @@ class TradingEngine:
     def _cleanup_bot_state(self, bot_id: int) -> None:
         """Drop a bot's in-memory state to prevent unbounded growth (L4)."""
         state_dicts = (
-            "_price_histories", "_funding_cache", "_funding_states", "_trend_states",
+            "_price_histories", "_trend_states",
             "_grid_states", "_mean_reversion_states", "_volatility_breakout_states",
             "_twap_states", "_vwap_states", "_auto_states", "_last_pending_resolve",
             "_bot_loggers", "_exec_rejections", "_explanations",
@@ -7651,9 +7344,6 @@ class TradingEngine:
             store = getattr(self, attr, None)
             if isinstance(store, dict):
                 store.pop(bot_id, None)
-        warned = getattr(self, "_funding_unavailable_warned", None)
-        if isinstance(warned, set):
-            warned.discard(bot_id)
         # Drop the transient decision status too (bot stopped/deleted).
         decision_status_store.clear(bot_id)
 
@@ -7719,7 +7409,7 @@ class TradingEngine:
         if "start_time" not in twap_state or twap_state.get("completed", False):
             twap_state.clear()
             twap_state.update({
-                "start_time": datetime.utcnow(),
+                "start_time": self.clock.now(),
                 "slices_executed": 0,
                 "total_executed_usd": 0.0,
                 "target_amount_usd": total_amount,
@@ -7757,7 +7447,7 @@ class TradingEngine:
         # Calculate slice interval
         slice_interval_seconds = (duration_minutes * 60) / slice_count
         start_time = twap_state["start_time"]
-        elapsed_seconds = (datetime.utcnow() - start_time).total_seconds()
+        elapsed_seconds = (self.clock.now() - start_time).total_seconds()
 
         # Check if enough time has passed for next slice
         expected_time_for_next_slice = slices_executed * slice_interval_seconds
@@ -7840,7 +7530,7 @@ class TradingEngine:
         )
 
         if order.status == OrderStatus.FILLED:
-            order.filled_at = datetime.utcnow()
+            order.filled_at = self.clock.now()
 
         session.add(order)
 
@@ -7850,9 +7540,13 @@ class TradingEngine:
         wallet = VirtualWalletService(session)
         if signal.action == "buy":
             await wallet.record_trade_result(bot.id, -exchange_order.fee, 0)
+            owning_strategy = self._resolve_owning_strategy(bot, signal.reason)
             await self._open_or_add_position(
                 bot.id, bot.trading_pair, filled_amount,
-                exchange_order.price, session
+                exchange_order.price, session,
+                owning_strategy=owning_strategy,
+                entry_reason=signal.reason,
+                entry_strategy_state=self._snapshot_entry_strategy_state(owning_strategy, bot.id),
             )
         else:
             await wallet.record_trade_result(bot.id, -exchange_order.fee, 0)
@@ -7927,13 +7621,13 @@ class TradingEngine:
         simulated_volume = 1000.0  # Placeholder volume
 
         vwap_state["price_volume_data"].append({
-            "timestamp": datetime.utcnow(),
+            "timestamp": self.clock.now(),
             "price": current_price,
             "volume": simulated_volume,
         })
 
         # Keep only recent data
-        cutoff = datetime.utcnow() - timedelta(minutes=lookback_minutes)
+        cutoff = self.clock.now() - timedelta(minutes=lookback_minutes)
         vwap_state["price_volume_data"] = [
             pv for pv in vwap_state["price_volume_data"]
             if pv["timestamp"] > cutoff
@@ -8002,7 +7696,7 @@ class TradingEngine:
         )
 
         if order.status == OrderStatus.FILLED:
-            order.filled_at = datetime.utcnow()
+            order.filled_at = self.clock.now()
 
         session.add(order)
 
@@ -8012,9 +7706,13 @@ class TradingEngine:
         wallet = VirtualWalletService(session)
         if signal.action == "buy":
             await wallet.record_trade_result(bot.id, -exchange_order.fee, 0)
+            owning_strategy = self._resolve_owning_strategy(bot, signal.reason)
             await self._open_or_add_position(
                 bot.id, bot.trading_pair, filled_amount,
-                exchange_order.price, session
+                exchange_order.price, session,
+                owning_strategy=owning_strategy,
+                entry_reason=signal.reason,
+                entry_strategy_state=self._snapshot_entry_strategy_state(owning_strategy, bot.id),
             )
         else:
             await wallet.record_trade_result(bot.id, -exchange_order.fee, 0)
@@ -8065,6 +7763,53 @@ class TradingEngine:
             self._execution_states[bot_id] = {}
         self._execution_states[bot_id][execution_type] = state
 
+    # Per-bot in-memory state attribute a strategy uses to remember its own
+    # exit-relevant fields (locked entry ATR, trailing-stop anchor, ...).
+    # Used only to opportunistically snapshot that state onto the Position at
+    # entry time (entry_strategy_state) for forensic/debugging purposes - the
+    # engine still reads the live dict during actual exit decisions. Strategies
+    # without per-bot exit state (e.g. dca_accumulator, which has no stop or
+    # target) simply have no entry here.
+    _STRATEGY_STATE_ATTR = {
+        "trend_following": "_trend_states",
+        "mean_reversion": "_mean_reversion_states",
+        "volatility_breakout": "_volatility_breakout_states",
+        "adaptive_grid": "_grid_states",
+        "dip_recovery": "_dip_recovery_states",
+    }
+
+    def _resolve_owning_strategy(self, bot: Bot, reason: Optional[str]) -> str:
+        """Resolve the strategy that actually made this trade decision.
+
+        For fixed-strategy bots this is just ``bot.strategy``. For an
+        auto_mode bot, ``bot.strategy`` reads "auto_mode" for every sub-
+        strategy it ever dispatches to, so the real sub-strategy name is
+        recovered from the "[Auto:strategy_name|regime]" prefix _strategy_auto
+        stamps onto the signal's reason (mirrors the parsing already used by
+        _update_strategy_performance_metrics for historical attribution -
+        this makes the same fact available at write time instead of only
+        recoverable later from text).
+        """
+        if reason and reason.startswith("[Auto:"):
+            try:
+                return reason.split("|")[0].replace("[Auto:", "").strip()
+            except Exception:
+                pass
+        return bot.strategy
+
+    def _snapshot_entry_strategy_state(self, owning_strategy: str, bot_id: int) -> Optional[dict]:
+        """Best-effort copy of the owning strategy's own per-bot state at
+        entry time, for Position.entry_strategy_state. Returns None if the
+        strategy keeps no such state (e.g. dca_accumulator)."""
+        attr = self._STRATEGY_STATE_ATTR.get(owning_strategy)
+        if not attr:
+            return None
+        store = getattr(self, attr, None)
+        if not isinstance(store, dict):
+            return None
+        state = store.get(bot_id)
+        return dict(state) if isinstance(state, dict) else None
+
     async def _open_or_add_position(
         self,
         bot_id: int,
@@ -8072,6 +7817,9 @@ class TradingEngine:
         amount: float,
         price: float,
         session: AsyncSession,
+        owning_strategy: Optional[str] = None,
+        entry_reason: Optional[str] = None,
+        entry_strategy_state: Optional[dict] = None,
     ) -> None:
         """Open or add to a position."""
         result = await session.execute(
@@ -8083,7 +7831,11 @@ class TradingEngine:
         position = result.scalar_one_or_none()
 
         if position:
-            # Average into existing position
+            # Average into existing position. Ownership is NOT overwritten -
+            # while a position is open, Auto Mode only ever dispatches to its
+            # owning strategy (see _strategy_auto), so any add-to-position buy
+            # can only come from the same strategy that already owns it; the
+            # original entry_reason/entry_strategy_state stay authoritative.
             total_value = position.amount * position.entry_price + amount * price
             total_amount = position.amount + amount
             position.entry_price = total_value / total_amount
@@ -8100,6 +7852,9 @@ class TradingEngine:
                 current_price=price,
                 amount=amount,
                 unrealized_pnl=0,
+                owning_strategy=owning_strategy,
+                entry_reason=entry_reason,
+                entry_strategy_state=entry_strategy_state,
             )
             session.add(position)
 
@@ -8153,13 +7908,13 @@ class TradingEngine:
             # Calculate holding period
             holding_days = None
             if position.created_at:
-                holding_days = (datetime.utcnow() - position.created_at).days
+                holding_days = (self.clock.now() - position.created_at).days
 
             proceeds = sell_amount * price
             cost_basis = sell_amount * position.entry_price
 
             self._bot_loggers[bot_id].log_fiscal_entry(FiscalLogEntry(
-                date=datetime.utcnow(),
+                date=self.clock.now(),
                 trading_pair=trading_pair,
                 token=token,
                 buy_date=position.created_at,
@@ -8330,7 +8085,7 @@ class TradingEngine:
         last = last_snapshot.scalar_one_or_none()
 
         if last:
-            time_since = datetime.utcnow() - last.snapshot_at
+            time_since = self.clock.now() - last.snapshot_at
             if time_since.total_seconds() < 300:  # 5 minutes
                 return
 
@@ -8664,7 +8419,7 @@ class TradingEngine:
             if cleaned != bot.strategy_params:
                 bot.strategy_params = cleaned
 
-        bot.updated_at = datetime.utcnow()
+        bot.updated_at = self.clock.now()
 
         logger.debug(f"Saved state for bot {bot_id}")
 

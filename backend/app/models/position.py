@@ -2,7 +2,7 @@
 
 from datetime import datetime
 from enum import Enum
-from sqlalchemy import Column, Integer, String, Float, DateTime, ForeignKey, Enum as SQLEnum
+from sqlalchemy import Column, Integer, String, Float, DateTime, JSON, ForeignKey, Enum as SQLEnum
 from sqlalchemy.orm import relationship
 
 from .database import Base
@@ -27,6 +27,18 @@ class Position(Base):
     current_price = Column(Float, nullable=False)
     amount = Column(Float, nullable=False)
     unrealized_pnl = Column(Float, default=0.0)
+
+    # Ownership: which strategy opened this position. Until this position
+    # closes, Auto Mode MUST dispatch only to this strategy - see
+    # auto-mode-position-ownership. NULL means "unowned" (e.g. a position that
+    # predates this column), which is treated as "do not force-switch away
+    # from whatever strategy is currently selected", never as an error.
+    owning_strategy = Column(String(50), nullable=True)
+    entry_reason = Column(String(500), nullable=True)
+    # Minimal strategy state needed to make exit decisions for this specific
+    # position (e.g. locked entry ATR, trailing-stop anchor) - NOT the full
+    # per-bot strategy state blob (that stays in Bot.strategy_state).
+    entry_strategy_state = Column(JSON, nullable=True)
 
     # Timestamps
     created_at = Column(DateTime, default=datetime.utcnow)

@@ -84,7 +84,7 @@ def test_derive_none_is_evaluating():
     ("Trend Following: Collecting data (10/200)", DecisionState.WARMING_UP),
     ("Volatility Breakout: Collecting bars (3/20)", DecisionState.WARMING_UP),
     # Waiting for data — an external feed is down.
-    ("Funding Carry: funding-rate data unavailable (holding)", DecisionState.WAITING_FOR_DATA),
+    ("market data unavailable for BTC/USDT", DecisionState.WAITING_FOR_DATA),
     # Cooldown / risk.
     ("Grid: Cooldown after kill (30min remaining)", DecisionState.COOLDOWN),
     ("Grid: Kill switch (drawdown 16.0%)", DecisionState.RISK_LIMIT),
@@ -125,7 +125,7 @@ def test_five_required_categories_are_distinct():
 
 
 @pytest.mark.parametrize("reason", [
-    "Funding Carry: regime trend_flat not in ['trend_up']",
+    "Trend Following: regime trend_flat not in ['trend_up']",
     "DCA: Paused (regime=trend_down)",
     "Grid: Paused (regime=trend_up, need flat/normal markets)",
     "Mean Reversion: Waiting for suitable regime (current: trend_up)",

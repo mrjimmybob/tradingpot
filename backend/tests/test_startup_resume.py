@@ -67,7 +67,7 @@ async def test_resume_starts_persisted_running_bot(test_db):
     bot = Bot(
         name="resume-me",
         trading_pair="BTC/USDT",
-        strategy="funding_carry",
+        strategy="trend_following",
         strategy_params={},
         budget=1000.0,
         current_balance=1000.0,
@@ -135,7 +135,7 @@ async def test_resume_starts_persisted_recovery_mode_bot(test_db):
     bot = Bot(
         name="recover-me",
         trading_pair="BTC/USDT",
-        strategy="funding_carry",
+        strategy="trend_following",
         strategy_params={},
         # Recovery state persisted exactly as _enter_recovery_mode writes it;
         # the loop restores it on the first iteration after resume.

@@ -565,7 +565,7 @@ class TestExplanationExactValues:
 # ---------------------------------------------------------------------------
 
 class TestExistingStrategiesUnchanged:
-    def test_original_six_strategies_still_dispatch_to_the_same_methods(self):
+    def test_original_strategies_still_dispatch_to_the_same_methods(self):
         engine = _engine()
         expected = {
             "dca_accumulator": TradingEngine._strategy_dca,
@@ -573,7 +573,6 @@ class TestExistingStrategiesUnchanged:
             "mean_reversion": TradingEngine._strategy_mean_reversion,
             "trend_following": TradingEngine._strategy_trend_following,
             "volatility_breakout": TradingEngine._strategy_volatility_breakout,
-            "funding_carry": TradingEngine._strategy_funding_carry,
             "auto_mode": TradingEngine._strategy_auto,
         }
         for name, unbound in expected.items():
@@ -593,13 +592,13 @@ class TestExistingStrategiesUnchanged:
             "allowed_regimes": ["all"], "priority": 0, "typical_holding_time": "long",
             "description": "Safe default accumulator for all market conditions",
         }
-        assert len(caps) == 7  # 6 original + dip_recovery
+        assert len(caps) == 6  # 5 remaining original + dip_recovery
 
     def test_persisted_state_attrs_still_include_all_originals(self):
         from app.services.trading_engine import _PERSISTED_STATE_ATTRS
         for original in (
             "_grid_states", "_mean_reversion_states", "_trend_states",
-            "_funding_states", "_volatility_breakout_states", "_twap_states",
+            "_volatility_breakout_states", "_twap_states",
             "_vwap_states", "_auto_states",
         ):
             assert original in _PERSISTED_STATE_ATTRS

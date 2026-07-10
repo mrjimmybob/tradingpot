@@ -139,9 +139,9 @@ Create one or more **dry-run** bots via the UI, or the API:
 curl -X POST http://localhost:8000/api/bots \
   -H 'Content-Type: application/json' \
   -d '{
-        "name": "BTC funding-carry (dry)",
+        "name": "BTC trend-following (dry)",
         "trading_pair": "BTC/USDT",
-        "strategy": "funding_carry",
+        "strategy": "trend_following",
         "strategy_params": {},
         "budget": 1000,
         "is_dry_run": true,

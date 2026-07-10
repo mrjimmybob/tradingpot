@@ -8,7 +8,7 @@ Covers the bugs that made the live fleet either pause or never trade:
       every tick, tripping the failure breaker and PAUSING the bot. (Bots 2/8.)
 
   F2  Standalone Mean Reversion & Volatility Breakout detected market regime from
-      a tick price-history buffer that ONLY trend_following/funding_carry ever
+      a tick price-history buffer that ONLY trend_following ever
       populate. Empty -> _detect_market_regime returns neutral 'flat/medium'
       forever, which (a) disabled Mean Reversion's trend force-exit and (b)
       PERMANENTLY blocked Volatility Breakout's entry. Now both read their own

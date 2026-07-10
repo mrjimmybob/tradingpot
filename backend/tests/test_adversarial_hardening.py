@@ -29,7 +29,7 @@ from app.services.virtual_wallet import VirtualWalletService
 
 async def _make_bot(test_db, budget=10000.0, balance=10000.0, compound=True):
     bot = Bot(
-        name="b", trading_pair="BTC/USDT", strategy="funding_carry", strategy_params={},
+        name="b", trading_pair="BTC/USDT", strategy="trend_following", strategy_params={},
         budget=budget, current_balance=balance, compound_enabled=compound,
         is_dry_run=True, status=BotStatus.RUNNING, total_pnl=0.0,
     )

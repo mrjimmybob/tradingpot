@@ -714,51 +714,6 @@ class TestDCAHonestlyReportsNoExpectedMove:
         )
 
 
-# ---- Funding Carry — accumulation strategy with is_accumulation=True ----
-
-class TestFundingCarryHonestlyReportsNoExpectedMove:
-    @pytest.mark.asyncio
-    async def test_D_funding_carry_buy_has_none_expected_move(self):
-        """Funding Carry spots an opportunity via funding rate, not a price target.
-
-        FC sets is_accumulation=True: it builds a spot long position when conditions
-        are favourable, without a per-trade price-move target. expected_move_pct
-        remains None (no fake value). The gate uses the accumulation fee check.
-        """
-        engine = TradingEngine()
-        engine._get_bot_positions = AsyncMock(return_value=[])
-        engine._get_funding_signal = AsyncMock(return_value=0.0001)  # in band
-
-        bot = MagicMock()
-        bot.id = 905
-        bot.strategy = "funding_carry"
-        bot.trading_pair = "BTC/USDT"
-        bot.current_balance = 1_000.0
-        bot.budget = 1_000.0
-        bot.exchange_fee = 0.1
-        bot.started_at = datetime.utcnow() - timedelta(hours=2)
-
-        # Pre-populate enough price history for a trend_up regime
-        engine._price_histories = {bot.id: [100.0 * (1 + 0.001 * i) for i in range(100)]}
-
-        params = {
-            "min_funding_rate": -0.001,
-            "max_funding_rate": 0.001,
-            "allowed_regimes": ["trend_up", "trend_flat"],
-            "regime_filter_enabled": False,
-        }
-        signal = await engine._strategy_funding_carry(bot, 110.0, params, AsyncMock())
-
-        if signal is not None and signal.action == "buy":
-            assert signal.expected_move_pct is None, (
-                "Funding Carry must NOT fake expected_move_pct — it has no price target."
-            )
-            assert signal.is_accumulation is True, (
-                "Funding Carry must set is_accumulation=True so the gate applies "
-                "fee-sanity check instead of requiring a directional edge estimate."
-            )
-
-
 # ---------------------------------------------------------------------------
 # Test E: recovery paper trading uses bot.exchange_fee (not hardcoded 0.1%)
 # ---------------------------------------------------------------------------

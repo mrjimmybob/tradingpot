@@ -127,7 +127,7 @@ class TestEmergencyFallbackToDca:
         future_cooldown = (now + timedelta(hours=1)).isoformat()
         all_strategies = [
             "trend_following", "volatility_breakout", "mean_reversion",
-            "adaptive_grid", "funding_carry", "dip_recovery", "dca_accumulator",
+            "adaptive_grid", "dip_recovery", "dca_accumulator",
         ]
         # Cooldown everything, including DCA itself, to force the true
         # "no eligible strategies" fallback branch rather than DCA winning
