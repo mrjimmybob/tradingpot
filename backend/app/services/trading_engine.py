@@ -45,6 +45,10 @@ from .diagnostics import (
     BLOCK_OTHER,
     DATA_UNAVAILABLE,
 )
+from .strategy_framework.explanation_persistence import (
+    extract_edge_management_category,
+    summarize_decision_explanation,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -1071,6 +1075,28 @@ class TradingEngine:
             builder = ExplanationBuilder("unknown")
             self._explanations[bot_id] = builder
         return builder
+
+    def _decision_explanation_for_order(self, bot_id: int) -> tuple:
+        """Summarized (decision_explanation, edge_management_category) for
+        the order about to be persisted, from THIS cycle's explanation
+        builder (add-strategy-decision-framework, Phase 0.6 - closes the
+        Pillar 8 persistence gap: a historical trade should be explainable
+        from the DB, not only from the in-memory DiagnosticsStore).
+
+        Never raises: observability must never affect a trading decision or
+        block an order from being recorded.
+        """
+        try:
+            builder = self._explanations.get(bot_id)
+            if builder is None:
+                return None, None
+            explanation = builder.to_dict()
+            summary = summarize_decision_explanation(explanation)
+            edge_category = extract_edge_management_category(explanation)
+            return summary, edge_category
+        except Exception as exc:  # noqa: BLE001 - observability must never throw
+            logger.debug("Bot %s: decision explanation summarization failed (non-fatal): %s", bot_id, exc)
+            return None, None
 
     def _get_strategy_executor(
         self,
@@ -6683,6 +6709,13 @@ class TradingEngine:
         if order.status == OrderStatus.FILLED:
             order.filled_at = self.clock.now()
 
+        # add-strategy-decision-framework Phase 0.6: persist this cycle's
+        # decision explanation onto the order (closes the Pillar 8
+        # persistence gap - purely additive, never affects the trade itself).
+        order.decision_explanation, order.edge_management_category = (
+            self._decision_explanation_for_order(bot.id)
+        )
+
         session.add(order)
         await session.flush()  # Get order.id for trade recording
 
@@ -7622,6 +7655,12 @@ class TradingEngine:
         if order.status == OrderStatus.FILLED:
             order.filled_at = self.clock.now()
 
+        # add-strategy-decision-framework Phase 0.6: see the standard
+        # execution path's identical comment above.
+        order.decision_explanation, order.edge_management_category = (
+            self._decision_explanation_for_order(bot.id)
+        )
+
         session.add(order)
 
         # Update wallet and positions (same as standard execution)
@@ -7787,6 +7826,12 @@ class TradingEngine:
 
         if order.status == OrderStatus.FILLED:
             order.filled_at = self.clock.now()
+
+        # add-strategy-decision-framework Phase 0.6: see the standard
+        # execution path's identical comment above.
+        order.decision_explanation, order.edge_management_category = (
+            self._decision_explanation_for_order(bot.id)
+        )
 
         session.add(order)
 

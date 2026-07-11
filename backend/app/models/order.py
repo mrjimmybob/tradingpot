@@ -2,7 +2,7 @@
 
 from datetime import datetime
 from enum import Enum
-from sqlalchemy import Column, Integer, String, Float, Boolean, DateTime, ForeignKey, Enum as SQLEnum
+from sqlalchemy import Column, Integer, String, Float, Boolean, DateTime, JSON, ForeignKey, Enum as SQLEnum
 from sqlalchemy.orm import relationship
 
 from .database import Base
@@ -53,6 +53,21 @@ class Order(Base):
 
     # Dry run flag
     is_simulated = Column(Boolean, default=False)
+
+    # Structured decision explanation (add-strategy-decision-framework,
+    # Phase 0.6): a bounded summary of the ExplanationBuilder/
+    # DecisionExplanation that produced this order, persisted once at
+    # execution time so a historical trade is explainable from the DB, not
+    # only from the in-memory, current-state-only DiagnosticsStore. See
+    # app/services/strategy_framework/explanation_persistence.py. Nullable -
+    # absent for orders with no strategy decision behind them (e.g. a
+    # recovered/imported untracked exchange fill).
+    decision_explanation = Column(JSON, nullable=True)
+    # Active Strategy Edge Management category (A/B/C) at execution time,
+    # if the strategy that produced this order has been migrated to
+    # StrategyEdgeManager (Phase 1-6). Null for every strategy prior to its
+    # own migration, and for orders with no active degradation classified.
+    edge_management_category = Column(String(20), nullable=True)
 
     # Timestamps
     created_at = Column(DateTime, default=datetime.utcnow)
