@@ -18,7 +18,7 @@ from dataclasses import dataclass
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, and_, func
 
-from ..models import Bot, BotStatus, Order, OrderStatus, Position, PortfolioRisk
+from ..models import Bot, Position, PortfolioRisk, Trade, RealizedGain
 
 logger = logging.getLogger(__name__)
 
@@ -91,8 +91,7 @@ class PortfolioRiskService:
                 adjusted_amount=None,
             )
 
-        # TODO: Bot model needs owner_id field - for now use bot_id as owner_id
-        owner_id = str(bot.id)  # FIXME: Replace with bot.owner_id when added
+        owner_id = bot.owner_id
 
         # Get portfolio risk config
         result = await self.session.execute(
@@ -110,17 +109,18 @@ class PortfolioRiskService:
                 adjusted_amount=order_amount_usd,
             )
 
-        # Get all bots for this owner
+        # Get all bots for this owner - the whole point of a PORTFOLIO risk
+        # check is that it aggregates across every bot the owner has, not
+        # just the one bot currently attempting to trade.
         result = await self.session.execute(
-            select(Bot)
-            # TODO: Add .where(Bot.owner_id == owner_id) when owner_id field exists
+            select(Bot).where(Bot.owner_id == owner_id)
         )
         owner_bots = result.scalars().all()
-        bot_ids = [b.id for b in owner_bots if b.id == bot_id]  # FIXME: Get all owner bots
+        bot_ids = [b.id for b in owner_bots]
 
         # Calculate portfolio metrics
-        portfolio_balance = sum(b.current_balance for b in owner_bots if b.id in bot_ids)
-        portfolio_initial = sum(b.budget for b in owner_bots if b.id in bot_ids)
+        portfolio_balance = sum(b.current_balance for b in owner_bots)
+        portfolio_initial = sum(b.budget for b in owner_bots)
 
         # === CHECK 1: Daily Loss Cap ===
         if portfolio_risk.daily_loss_cap_pct:
@@ -275,40 +275,49 @@ class PortfolioRiskService:
         bot_ids: list,
         start_time: datetime,
     ) -> float:
-        """Calculate total loss across portfolio for a period.
+        """Calculate total REALIZED trading loss across the portfolio for a
+        period.
+
+        Uses RealizedGain - "the AUTHORITATIVE source for tax reporting"
+        (see tax_lot.py) - joined to the closing Trade for its bot_id (a
+        real FK) and fee_amount, rather than the previous "sum order fees
+        and modeled costs" approximation, which measured cost drag, not
+        trading loss: a bot that lost $2,000 on a bad trade but paid $5 in
+        fees used to register as a $5 "loss" against the daily/weekly cap.
+
+        RealizedGain.gain_loss = proceeds - cost_basis, where cost_basis
+        already includes the BUY-side fee (Trade.get_cost_basis_per_unit)
+        but proceeds is gross of the SELL-side fee - so the closing trade's
+        fee_amount is subtracted here to get the true net realized P&L.
 
         Args:
             bot_ids: List of bot IDs in portfolio
             start_time: Start of period
 
         Returns:
-            Total loss amount (positive number)
+            Total realized loss for the period (positive number; 0 if the
+            portfolio was net profitable, not negative).
         """
         if not bot_ids:
             return 0.0
 
-        # Get all filled orders in period
-        query = select(Order).where(
-            and_(
-                Order.bot_id.in_(bot_ids),
-                Order.status == OrderStatus.FILLED,
-                Order.created_at >= start_time,
+        query = (
+            select(RealizedGain.gain_loss, Trade.fee_amount)
+            .join(Trade, RealizedGain.sell_trade_id == Trade.id)
+            .where(
+                and_(
+                    Trade.bot_id.in_(bot_ids),
+                    RealizedGain.sell_date >= start_time,
+                )
             )
         )
         result = await self.session.execute(query)
-        orders = result.scalars().all()
+        rows = result.all()
 
-        # Calculate total loss (simplified - sum fees and modeled costs)
-        total_loss = 0.0
-        for order in orders:
-            # Include exchange fees
-            total_loss += order.fees
-
-            # Include modeled execution costs if available
-            if order.modeled_total_cost:
-                total_loss += order.modeled_total_cost
-
-        return total_loss
+        total_realized_pnl = sum(
+            gain_loss - (fee_amount or 0.0) for gain_loss, fee_amount in rows
+        )
+        return max(0.0, -total_realized_pnl)
 
     async def get_portfolio_metrics(self, owner_id: str) -> dict:
         """Get current portfolio metrics for an owner.
@@ -321,8 +330,7 @@ class PortfolioRiskService:
         """
         # Get all bots for this owner
         result = await self.session.execute(
-            select(Bot)
-            # TODO: Add .where(Bot.owner_id == owner_id) when owner_id field exists
+            select(Bot).where(Bot.owner_id == owner_id)
         )
         owner_bots = result.scalars().all()
 

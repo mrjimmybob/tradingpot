@@ -23,6 +23,13 @@ class Bot(Base):
     __tablename__ = "bots"
 
     id = Column(Integer, primary_key=True, index=True)
+    # Cross-bot grouping key for PortfolioRiskService (see
+    # add-trading-safety-boundaries). Every bot for a single-operator
+    # deployment shares the same default value ("default") so portfolio-wide
+    # caps aggregate across ALL bots out of the box - explicit multi-tenant
+    # support (a real owner/user model) is a separate, future concern; this
+    # only needs to be a stable grouping key today.
+    owner_id = Column(String(100), nullable=False, default="default", server_default="default", index=True)
     name = Column(String(255), nullable=False)
     trading_pair = Column(String(50), nullable=False)
     strategy = Column(String(50), nullable=False)
@@ -55,6 +62,15 @@ class Bot(Base):
     # which matches the simulated exchange's hard-coded rate and is a common
     # taker fee on major crypto exchanges. Explicit — never silently zero.
     exchange_fee = Column(Float, nullable=False, default=0.1, server_default="0.1")
+
+    # Market spread / slippage (percentage) fed into the live execution cost
+    # model (see add-trading-safety-boundaries). Default 0.0 preserves prior
+    # behavior exactly (live previously hardcoded these to 0.0 with no way to
+    # configure them at all) - set non-zero here to make live cost estimates
+    # as realistic as the backtest CLI's --spread-pct/--slippage-pct already
+    # allow.
+    market_spread_pct = Column(Float, nullable=False, default=0.0, server_default="0.0")
+    slippage_pct = Column(Float, nullable=False, default=0.0, server_default="0.0")
 
     # Dry run mode
     is_dry_run = Column(Boolean, default=False)

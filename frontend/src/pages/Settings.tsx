@@ -20,6 +20,8 @@ import {
   Info,
 } from 'lucide-react'
 import { useToast } from '../components/Toast'
+import { PortfolioRiskSettings } from '../components/PortfolioRiskSettings'
+import { RiskSafetyPanel } from '../components/RiskSafetyPanel'
 
 // Data source types
 interface DataSourceConfig {
@@ -407,6 +409,7 @@ export default function Settings() {
   const queryClient = useQueryClient()
   const toast = useToast()
   const [updatingSource, setUpdatingSource] = useState<string | null>(null)
+  const [isSimulated, setIsSimulated] = useState(true)
 
   const { data: sources, isLoading } = useQuery({
     queryKey: ['data-sources'],
@@ -472,6 +475,19 @@ export default function Settings() {
 
   return (
     <div className="space-y-6">
+      {/* Portfolio Risk (add-trading-safety-boundaries) */}
+      <div className="flex items-center justify-between">
+        <h2 className="text-2xl font-bold">Portfolio Risk</h2>
+        <button
+          onClick={() => setIsSimulated(!isSimulated)}
+          className="px-3 py-1.5 rounded-lg text-sm border border-gray-700 text-gray-300 hover:bg-gray-700"
+        >
+          Viewing: {isSimulated ? 'Simulated' : 'Live'} (switch to {isSimulated ? 'Live' : 'Simulated'})
+        </button>
+      </div>
+      <PortfolioRiskSettings />
+      <RiskSafetyPanel isSimulated={isSimulated} ownerId="default" />
+
       <div className="flex items-center justify-between">
         <div className="flex items-center gap-4">
           <SettingsIcon size={32} className="text-accent" />

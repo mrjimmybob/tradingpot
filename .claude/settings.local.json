@@ -187,7 +187,16 @@
       "Bash(/opt/tradingbot/venv/bin/python -m pytest tests/ -q -x --timeout=300)",
       "Bash(timeout 280 /opt/tradingbot/venv/bin/python -m pytest tests/ -q)",
       "Bash(/opt/tradingbot/venv/bin/python -m pytest tests/test_expectancy_diagnostics.py tests/test_mean_reversion_target_lock.py -q)",
-      "Bash(../venv/bin/python -m pytest)"
+      "Bash(../venv/bin/python -m pytest)",
+      "Bash(/opt/tradingbot/venv/bin/python -m pytest tests/test_fee_headroom_regression.py tests/test_strategy_activity.py tests/test_reward_risk_gate.py tests/test_strategy_integrity.py tests/test_strategy_activation.py tests/test_dip_recovery_strategy.py tests/test_diagnostics.py tests/test_auto_mode_dca_dispatch.py tests/test_trade_viability.py tests/test_auto_mode_fixes.py tests/test_strategy_validation.py -q -k volatility)",
+      "Bash(/opt/tradingbot/venv/bin/python -m pytest tests/test_strategy_activity.py -q -k volatility)",
+      "Bash(/opt/tradingbot/venv/bin/python -m pytest tests/ -q)",
+      "Bash(timeout 60 /opt/tradingbot/venv/bin/python -m backend.app.backtesting.run --exchange binance --symbol BTCUSDT --timeframe 1h --strategy volatility_breakout --start 2024-01-01 --end 2024-02-01)",
+      "Bash(/opt/tradingbot/venv/bin/python -m pytest tests/ -q -k \"mean_reversion or trend_following or volatility_breakout or dip_recovery\")",
+      "Bash(/opt/tradingbot/venv/bin/python -m pytest tests/test_strategy_activity.py -q -k \"LegacyPosition\")",
+      "Bash(sed -i '2436s/.*/                entry_atr_locked = state.get\\(\"entry_atr\"\\) or atr  # Fallback for legacy positions/' app/services/trading_engine.py)",
+      "Bash(sed -i '3176s/.*/                entry_atr_locked = state.get\\(\"entry_atr\"\\) or atr  # Fallback to current ATR for legacy positions/' app/services/trading_engine.py)",
+      "Bash(timeout 90 /opt/tradingbot/venv/bin/python -m backend.app.backtesting.run --exchange binance --symbol BTCUSDT --timeframe 1d --strategy trend_following --start 2020-01-01 --end 2026-07-08)"
     ]
   }
 }

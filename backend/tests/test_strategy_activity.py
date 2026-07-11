@@ -446,6 +446,288 @@ class TestVolatilityBreakoutDefaults:
             f"Expected buy on upper-band close while armed, got: {signal.reason}"
         )
 
+    @pytest.mark.asyncio
+    async def test_trailing_stop_exit_does_not_crash_on_reason_string(self):
+        """Regression: hitting the trailing stop used to crash with
+        TypeError: unsupported format string passed to NoneType.__format__
+        because state["trailing_stop"] was reset to None a few lines before
+        the exit TradeSignal's reason string tried to format it. The sell
+        must fire and its reason must still report the stop price that was
+        actually hit."""
+        engine = _engine()
+
+        bot = MagicMock()
+        bot.id = 57
+        bot.strategy = "volatility_breakout"
+        bot.trading_pair = "BTC/USDT"
+        bot.current_balance = 100.0
+        bot.budget = 100.0
+
+        session = AsyncMock()
+
+        base_price = 64000.0
+        bars = [
+            {"open": base_price, "high": base_price + 2, "low": base_price - 2,
+             "close": base_price,
+             "start_ts": datetime.utcnow() - timedelta(minutes=30 - i)}
+            for i in range(25)
+        ]
+
+        stop_price = base_price - 100.0
+        current_price = stop_price - 1.0  # price has fallen through the stop
+
+        engine._volatility_breakout_states = {
+            bot.id: {
+                "bars": bars,
+                "current_bar": None,
+                "bb_width_history": [0.01] * 20,
+                "atr_history": [10.0] * 20,
+                "compression_active": False,
+                "compression_bars": 0,
+                "compression_start": None,
+                "breakout_armed": False,
+                "entry_price": base_price,
+                "entry_atr": 10.0,
+                "highest_price": base_price + 200.0,  # above current, so it's not re-raised
+                "trailing_stop": stop_price,
+                "bars_since_entry": 10,  # past failed_breakout_bars so that exit isn't hit first
+                "last_breakout_attempt": None,
+            }
+        }
+
+        position = MagicMock()
+        position.amount = 0.001
+
+        with patch.object(engine, "_get_bot_positions", new=AsyncMock(return_value=[position])):
+            signal = await engine._strategy_volatility_breakout(
+                bot, current_price, {"regime_filter_enabled": False}, session,
+            )
+
+        assert signal is not None
+        assert signal.action == "sell"
+        assert f"{stop_price:.2f}" in signal.reason
+
+
+class TestVolatilityDirectionRegimeGate:
+    """Regression tests for fix-regime-detection-consistency.
+
+    volatility_breakout's regime diagnostic used to relabel volatility
+    STATE (low/medium/high, an ATR percentile LEVEL) as if it were
+    volatility DIRECTION (expanding/contracting/stable, a rate-of-change
+    measure) - so a market that had been choppy and high-vol for a week
+    read identically to one that had just broken out of compression. The
+    fix reuses _detect_market_regime_bar_based (the same detector
+    _strategy_auto already uses correctly) directly against the strategy's
+    own bar history.
+
+    Note: regime_allows_entry/volatility_regime_name are diagnostic only in
+    this strategy - the entry decision (is_breakout) never consults them
+    (see the REGIME DIAGNOSTICS comment in trading_engine.py) - so these
+    tests assert on the computed/persisted regime value, not on
+    signal.action.
+    """
+
+    @staticmethod
+    def _bar(tr: float, close: float = 100.0) -> dict:
+        half = tr / 2
+        return {"open": close, "high": close + half, "low": close - half, "close": close}
+
+    def test_sustained_flat_volatility_is_not_expanding(self):
+        """25 bars: 11 older bars with a small true range (outside the
+        detector's recent-14 window), then 14 uniformly-elevated bars. The
+        elevated block is flat *within itself* (recent 7 == older 7 of that
+        block), so the level reads "high" but the direction must read
+        "stable", not "expanding"."""
+        engine = _engine()
+        bars = [self._bar(1.0) for _ in range(11)] + [self._bar(10.0) for _ in range(14)]
+        assert len(bars) == 25
+
+        regime = engine._detect_market_regime_bar_based(bars, None)
+        assert regime["volatility_state"] == "high"
+        assert regime["volatility_direction"] == "stable"
+
+    def test_expansion_after_compression_is_detected(self):
+        """25 bars: 18 compressed (small true range) bars, then 7 bars
+        where the true range jumps up - a genuine compression-then-
+        expansion sequence must read direction "expanding"."""
+        engine = _engine()
+        bars = [self._bar(1.0) for _ in range(18)] + [self._bar(10.0) for _ in range(7)]
+        assert len(bars) == 25
+
+        regime = engine._detect_market_regime_bar_based(bars, None)
+        assert regime["volatility_direction"] == "expanding"
+
+    def _volatility_breakout_state(self, bars: list) -> dict:
+        return {
+            "bars": bars,
+            "current_bar": None,
+            "bb_width_history": [],
+            "atr_history": [],
+            "compression_active": False,
+            "compression_bars": 0,
+            "compression_start": None,
+            "breakout_armed": False,
+            "entry_price": None,
+            "entry_atr": None,
+            "highest_price": None,
+            "trailing_stop": None,
+            "bars_since_entry": 0,
+            "last_breakout_attempt": None,
+            "regime_state": None,
+        }
+
+    @pytest.mark.asyncio
+    async def test_strategy_reports_stable_not_expanding_for_flat_high_volatility(self):
+        engine = _engine()
+        bot = MagicMock()
+        bot.id = 80
+        bot.strategy = "volatility_breakout"
+        bot.trading_pair = "BTC/USDT"
+        bot.current_balance = 10_000.0
+        bot.budget = 10_000.0
+        session = AsyncMock()
+
+        bars = [self._bar(1.0) for _ in range(11)] + [self._bar(10.0) for _ in range(14)]
+        engine._volatility_breakout_states = {bot.id: self._volatility_breakout_state(bars)}
+
+        with patch.object(engine, "_get_bot_positions", new=AsyncMock(return_value=[])):
+            signal = await engine._strategy_volatility_breakout(bot, 100.0, {}, session)
+
+        assert signal is not None
+        regime = engine._volatility_breakout_states[bot.id]["regime_state"]
+        assert regime["volatility_direction"] == "stable"
+
+    @pytest.mark.asyncio
+    async def test_strategy_reports_expanding_after_compression(self):
+        engine = _engine()
+        bot = MagicMock()
+        bot.id = 81
+        bot.strategy = "volatility_breakout"
+        bot.trading_pair = "BTC/USDT"
+        bot.current_balance = 10_000.0
+        bot.budget = 10_000.0
+        session = AsyncMock()
+
+        bars = [self._bar(1.0) for _ in range(18)] + [self._bar(10.0) for _ in range(7)]
+        engine._volatility_breakout_states = {bot.id: self._volatility_breakout_state(bars)}
+
+        with patch.object(engine, "_get_bot_positions", new=AsyncMock(return_value=[])):
+            signal = await engine._strategy_volatility_breakout(bot, 100.0, {}, session)
+
+        assert signal is not None
+        regime = engine._volatility_breakout_states[bot.id]["regime_state"]
+        assert regime["volatility_direction"] == "expanding"
+
+
+class TestLegacyPositionEntryAtrFallback:
+    """Regression tests for the same defect class across trend_following,
+    mean_reversion, and volatility_breakout: `state.get("entry_atr", atr)`
+    is not a working fallback because each strategy's own state
+    initialization/normalization always pre-populates "entry_atr" (as None
+    when no entry has locked one in yet), so dict.get's default argument
+    never fires. A position whose state has no locked entry_atr - e.g. the
+    strategy's own state was reset by an exit signal whose sell never
+    actually closed the DB position, or a bot resumed after switching
+    strategies mid-position - crashed instead of falling back to the
+    current ATR, exactly like the already-fixed instance in
+    _strategy_dip_recovery (`state.get("entry_atr") or atr`)."""
+
+    @pytest.mark.asyncio
+    async def test_trend_following_legacy_position_does_not_crash_on_none_entry_atr(self):
+        """Regression: used to crash with TypeError: unsupported operand
+        type(s) for *: 'NoneType' and 'float' at
+        `current_price - (entry_atr_locked * atr_multiplier)`."""
+        engine = _engine()
+
+        bot = MagicMock()
+        bot.id = 70
+        bot.strategy = "trend_following"
+        bot.trading_pair = "BTC/USDT"
+        bot.current_balance = 10_000.0
+        bot.budget = 10_000.0
+
+        session = AsyncMock()
+
+        base_price = 64000.0
+        # Long enough flat history to clear the "collecting data" warmup
+        # (default long_period=100) without needing to loop live calls.
+        engine._price_histories = {bot.id: [base_price] * 150}
+        engine._trend_states = {
+            bot.id: {
+                "trailing_stop": None,
+                "highest_price": None,  # forces trailing-stop (re)computation this tick
+                "entry_atr": None,      # legacy/mismatched state - the bug trigger
+                "entry_time": None,
+                "last_exit_time": None,
+                "entry_confirmation_count": 0,
+                "exit_confirmation_count": 0,
+                "tf_bars": [],
+                "tf_current_bar": None,
+            }
+        }
+
+        position = MagicMock()
+        position.amount = 0.01
+
+        with patch.object(engine, "_get_bot_positions", new=AsyncMock(return_value=[position])):
+            signal = await engine._strategy_trend_following(
+                bot, base_price, {}, session,
+            )
+
+        assert signal is not None
+        assert engine._trend_states[bot.id]["trailing_stop"] is not None
+
+    @pytest.mark.asyncio
+    async def test_mean_reversion_legacy_position_does_not_crash_on_none_entry_atr(self):
+        """Regression: used to crash formatting entry_atr_locked (None) with
+        `:.4f` in the hard-stop exit's log message."""
+        engine = _engine()
+
+        bot = MagicMock()
+        bot.id = 71
+        bot.strategy = "mean_reversion"
+        bot.trading_pair = "BTC/USDT"
+        bot.current_balance = 10_000.0
+        bot.budget = 10_000.0
+
+        session = AsyncMock()
+
+        base_price = 64000.0
+        bars = [
+            {"open": base_price, "high": base_price + 2, "low": base_price - 2,
+             "close": base_price,
+             "start_ts": datetime.utcnow() - timedelta(minutes=30 - i)}
+            for i in range(25)
+        ]
+        hard_stop = base_price + 50.0
+        target_price = base_price + 1000.0
+        current_price = base_price  # <= hard_stop, well below target_price
+
+        engine._mean_reversion_states = {
+            bot.id: {
+                "bars": bars,
+                "current_bar": None,
+                "entry_price": base_price,
+                "entry_atr": None,  # legacy/mismatched state - the bug trigger
+                "target_price": target_price,
+                "hard_stop": hard_stop,
+                "bars_since_entry": 0,
+                "last_exit_time": None,
+            }
+        }
+
+        position = MagicMock()
+        position.amount = 0.01
+
+        with patch.object(engine, "_get_bot_positions", new=AsyncMock(return_value=[position])):
+            signal = await engine._strategy_mean_reversion(
+                bot, current_price, {"regime_filter_enabled": False}, session,
+            )
+
+        assert signal is not None
+        assert signal.action == "sell"
+        assert "Hard stop" in signal.reason
+
 
 # ---------------------------------------------------------------------------
 # ISSUE 5 – TF long_period 200→100; MR bollinger_std 2.0→1.8

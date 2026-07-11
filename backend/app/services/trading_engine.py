@@ -2429,7 +2429,11 @@ class TradingEngine:
                     state["bars_since_entry"] += 1
 
                 # CRITICAL: Use LOCKED entry_atr (risk never expands)
-                entry_atr_locked = state.get("entry_atr", atr)  # Fallback for legacy positions
+                # state.get("entry_atr", atr) is NOT a working fallback: the
+                # normalizer always pre-populates this key (as None), so the
+                # default arg never fires and a legacy/state-mismatched
+                # position crashes downstream on `None * atr_multiplier`.
+                entry_atr_locked = state.get("entry_atr") or atr  # Fallback for legacy positions
                 hard_stop = state.get("hard_stop", None)
 
                 # === EXIT CONDITION 1: Regime Flip (FORCE EXIT) ===
@@ -3165,7 +3169,11 @@ class TradingEngine:
             # Have position - manage exit
             for pos in positions:
                 # CRITICAL: Use LOCKED entry_atr for trailing stop distance (risk must never increase)
-                entry_atr_locked = state.get("entry_atr", atr)  # Fallback to current ATR for legacy positions
+                # state.get("entry_atr", atr) is NOT a working fallback: the
+                # normalizer always pre-populates this key (as None), so the
+                # default arg never fires and a legacy/state-mismatched
+                # position crashes downstream on `None * atr_multiplier`.
+                entry_atr_locked = state.get("entry_atr") or atr  # Fallback to current ATR for legacy positions
 
                 # Update trailing stop if price made new high
                 # Trailing stop distance is ALWAYS based on entry_atr, not current ATR
@@ -3283,8 +3291,13 @@ class TradingEngine:
         CRITICAL: All logic operates on AGGREGATED PSEUDO-BARS, not tick data.
         Bar interval defines time granularity (default: 60 seconds per bar).
 
-        Regime-aware by default: Pauses during unfavorable regimes (e.g. volatility
-        contracting, strong downtrends) to prevent entries in wrong conditions.
+        Regime-aware diagnostics: computes and reports the current volatility
+        regime (direction-based: expanding/contracting/normal, see REGIME
+        GATING below) on every call. This is NOT a hard entry gate - the
+        compression-then-breakout sequence (is_breakout below) already
+        encodes the volatility thesis, so a separate veto would be
+        redundant; the regime value is logged and surfaced via _explain for
+        operator visibility, not consulted by the entry decision.
 
         Parameters:
             bar_interval_seconds: Time per bar for aggregation (default: 60)
@@ -3299,8 +3312,21 @@ class TradingEngine:
             risk_percent: Percent of capital to risk (default: 1.0)
             cooldown_hours: Hours between breakout attempts (default: 72, SPARSE)
             failed_breakout_bars: Bars to detect failed breakout (default: 3)
-            regime_filter_enabled: Enable regime gating (default: True)
-            allowed_regimes: Allowed volatility regimes (default: ["volatility_expanding"])
+            regime_filter_enabled: Enable regime computation/diagnostics
+                (default: True). NOT a hard entry gate - see REGIME
+                DIAGNOSTICS below; disabling this only stops the
+                volatility_regime_name computation and logging.
+            allowed_regimes: Volatility regimes the computed diagnostic is
+                compared against for logging purposes (default:
+                ["volatility_expanding"]) - currently informational only,
+                see above. These are DIRECTION tags -
+                "volatility_expanding"/"_contracting"/"_normal" - derived from
+                the bar-based regime detector's rate-of-change classification
+                (_detect_market_regime_bar_based -> volatility_direction),
+                the same convention _strategy_auto/_is_strategy_eligible use.
+                Do not confuse with the separate LEVEL axis
+                ("volatility_low"/"_medium"/"_high", an ATR percentile) used
+                by other strategies' regime gates (e.g. mean_reversion).
         """
         # Get parameters with SPARSE defaults
         bar_interval_seconds = params.get("bar_interval_seconds", 60)
@@ -3341,6 +3367,7 @@ class TradingEngine:
             "trailing_stop": None,
             "bars_since_entry": 0,
             "last_breakout_attempt": None,
+            "regime_state": None,  # persisted bar-based regime (see REGIME GATING)
         })
 
         now = self.clock.now()
@@ -3456,30 +3483,54 @@ class TradingEngine:
             state["atr_history"].append(atr)
             state["atr_history"] = state["atr_history"][-100:]  # Keep last 100
 
-        # === REGIME GATING (pauses entries during wrong conditions) ===
-        # Uses system-wide regime detection to avoid entries in adverse markets
+        # === REGIME DIAGNOSTICS (NOT a hard entry gate - see ENTRY LOGIC
+        # below: is_breakout = compression_satisfied and breakout above the
+        # upper band is the only behavioral entry condition; the regime
+        # veto was deliberately removed as a hard gate, see the comment
+        # there). This block computes volatility_regime_name purely for
+        # logging/_explain visibility when this strategy runs standalone.
+        # It is entirely separate from Auto Mode's own eligibility check
+        # (_is_strategy_eligible), which computes its own regime from
+        # _strategy_auto's own bar_history before ever dispatching here -
+        # that computation already uses volatility_direction correctly and
+        # is unaffected by this function either way.
+        # Uses the bar-based regime detector (the same one _strategy_auto /
+        # _is_strategy_eligible use) so this gate tests real volatility
+        # DIRECTION (rate of change), not a relabeled LEVEL - see
+        # fix-regime-detection-consistency. The previous implementation
+        # called the price-only _detect_market_regime and remapped its
+        # volatility_state (low/medium/high, an ATR percentile LEVEL)
+        # straight onto the labels volatility_contracting/_normal/
+        # _expanding, so a market that had been choppy and high-vol for a
+        # week read identically to one that had just broken out of
+        # compression a single bar ago - the entry gate was testing "is
+        # volatility currently high", not "is volatility currently
+        # expanding", even though the strategy's whole thesis needs the
+        # latter. state["bars"] already has >= bb_period (>= 20 by the
+        # early-return above) real OHLC bars, so it can be passed directly -
+        # no synthetic close-only point needs to be appended.
         if regime_filter_enabled:
-            # Detect regime from THIS strategy's own bar closes (same fix as
-            # mean_reversion): the shared tick buffer is empty for a standalone
-            # breakout bot, which pinned volatility to 'medium' -> 'volatility_
-            # normal' and, with the default allow-list of ['volatility_expanding']
-            # only, PERMANENTLY blocked every entry. >= bb_period bars exist here.
-            bar_closes = [b["close"] for b in state["bars"]] + [current_price]
-            current_regime = self._detect_market_regime(bar_closes, None)
-            volatility_state = current_regime.get("volatility_state", "medium")
+            current_regime = self._detect_market_regime_bar_based(
+                state["bars"], state.get("regime_state")
+            )
+            state["regime_state"] = current_regime
+            volatility_direction = current_regime.get("volatility_direction", "stable")
 
-            # Map volatility_state to regime names
-            # volatility_state values: "low", "medium", "high"
+            # Map volatility_direction to regime names
+            # volatility_direction values: "expanding", "contracting", "stable"
             # user config values: "volatility_contracting", "volatility_normal", "volatility_expanding"
             volatility_regime_map = {
-                "low": "volatility_contracting",
-                "medium": "volatility_normal",
-                "high": "volatility_expanding",
+                "contracting": "volatility_contracting",
+                "stable": "volatility_normal",
+                "expanding": "volatility_expanding",
             }
-            volatility_regime_name = volatility_regime_map.get(volatility_state, "volatility_normal")
+            volatility_regime_name = volatility_regime_map.get(volatility_direction, "volatility_normal")
 
-            # Block entries (not exits) if regime is wrong
-            # This is a PAUSE, not an exit trigger (hold existing positions)
+            # Diagnostic only (see block comment above) - NOT consulted by
+            # the entry decision below. Kept for _explain/logging and so a
+            # future re-introduction of a hard gate (a real behavior change,
+            # to be validated via add-strategy-validation-tooling, not done
+            # here) has a correct value ready to use.
             regime_allows_entry = volatility_regime_name in allowed_regimes
 
             if not regime_allows_entry:
@@ -3548,7 +3599,11 @@ class TradingEngine:
                     state["bars_since_entry"] += 1
 
                 # CRITICAL: Use LOCKED entry_atr (risk never expands)
-                entry_atr_locked = state.get("entry_atr", atr)  # Fallback for legacy positions
+                # state.get("entry_atr", atr) is NOT a working fallback: the
+                # normalizer always pre-populates this key (as None), so the
+                # default arg never fires and a legacy/state-mismatched
+                # position crashes downstream on `None * atr_stop_mult`.
+                entry_atr_locked = state.get("entry_atr") or atr  # Fallback for legacy positions
 
                 # === EXIT CONDITION 1: Failed Breakout (BAR-BASED) ===
                 # Within N bars after entry, if bar CLOSES back inside BB, exit immediately
@@ -3605,10 +3660,14 @@ class TradingEngine:
                 # === EXIT CONDITION 2: Trailing Stop Hit ===
                 if current_price <= state["trailing_stop"]:
                     sell_amount = pos.amount * current_price
+                    # Captured before state is cleared below - same crash
+                    # class as the "hold" branch's stop_str a few lines down
+                    # (formatting a field that was just reset to None).
+                    trailing_stop_hit = state["trailing_stop"]
 
                     logger.info(
                         f"Bot {bot.id}: Volatility Breakout EXIT (trailing stop) - "
-                        f"Price ${current_price:.2f} <= Stop ${state['trailing_stop']:.2f}, "
+                        f"Price ${current_price:.2f} <= Stop ${trailing_stop_hit:.2f}, "
                         f"Entry ATR (locked): ${entry_atr_locked:.4f}"
                     )
 
@@ -3626,7 +3685,7 @@ class TradingEngine:
                         action="sell",
                         amount=sell_amount,
                         order_type="market",
-                        reason=f"Volatility Breakout: Trailing stop (${state['trailing_stop']:.2f})",
+                        reason=f"Volatility Breakout: Trailing stop (${trailing_stop_hit:.2f})",
                     )
 
             # Update state and hold.
@@ -6090,6 +6149,14 @@ class TradingEngine:
                 # value here declared it Auto-eligible during compression and
                 # then ineligible the instant it actually expanded and entered,
                 # which caused force-exits right at (or just after) entry.
+                # "volatility_expanding" here is a DIRECTION tag (rate of
+                # change, from volatility_direction) - matched via
+                # _is_strategy_eligible's `f"volatility_{vol_direction}"` tag,
+                # NOT the separate `f"volatility_{volatility}"` LEVEL tag used
+                # by e.g. mean_reversion/adaptive_grid below. The strategy's
+                # own standalone regime_filter_enabled path (used outside
+                # Auto) now uses the same direction-based detector for
+                # consistency - see fix-regime-detection-consistency.
                 "allowed_regimes": ["volatility_expanding"],
                 "priority": 3,
                 "typical_holding_time": "medium",
@@ -6391,19 +6458,32 @@ class TradingEngine:
                 )
 
         # === STEP 5: EXECUTION COST ESTIMATION ===
-        # bot.exchange_fee is a persisted column (default 0.1 %).  The getattr
-        # fallback covers the window between a deploy and migration run.  The
-        # isinstance guard ensures tests that use Mock bots (where attribute
-        # access returns a non-numeric Mock) fall back to 0.1 % rather than
+        # bot.exchange_fee/market_spread_pct/slippage_pct are persisted
+        # columns (default 0.1% / 0.0% / 0.0% - see add-trading-safety-
+        # boundaries, which added the latter two so live can be configured
+        # the same way the backtest CLI's --spread-pct/--slippage-pct
+        # already were; previously these were hardcoded to 0.0 with no way
+        # to configure them at all). The getattr fallback covers the window
+        # between a deploy and migration run. The isinstance guard ensures
+        # tests that use Mock bots (where attribute access returns a
+        # non-numeric Mock) fall back to a safe default rather than
         # propagating a non-numeric value into the cost model arithmetic.
         _exec_fee_raw = getattr(bot, 'exchange_fee', 0.1)
         _exec_fee_pct = (
             float(_exec_fee_raw) if isinstance(_exec_fee_raw, (int, float)) else 0.1
         )
+        _exec_spread_raw = getattr(bot, 'market_spread_pct', 0.0)
+        _exec_spread_pct = (
+            float(_exec_spread_raw) if isinstance(_exec_spread_raw, (int, float)) else 0.0
+        )
+        _exec_slippage_raw = getattr(bot, 'slippage_pct', 0.0)
+        _exec_slippage_pct = (
+            float(_exec_slippage_raw) if isinstance(_exec_slippage_raw, (int, float)) else 0.0
+        )
         cost_model = get_cost_model(
             exchange_fee_pct=_exec_fee_pct,
-            market_spread_pct=0.0,  # TODO: Make configurable per bot
-            slippage_pct=0.0,       # TODO: Make configurable per bot
+            market_spread_pct=_exec_spread_pct,
+            slippage_pct=_exec_slippage_pct,
             impact_pct=0.0,         # Not used for spot
         )
 
@@ -6839,10 +6919,20 @@ class TradingEngine:
         return "buy" if order_type in (OrderType.MARKET_BUY, OrderType.LIMIT_BUY) else "sell"
 
     def _cost_estimate_for(self, bot: Bot, action: str, notional: float, price: float):
-        """Build a cost estimate for a recovered fill (mirrors _execute_trade)."""
+        """Build a cost estimate for a recovered fill (mirrors _execute_trade,
+        including its market_spread_pct/slippage_pct - see
+        add-trading-safety-boundaries)."""
         _fee_raw = getattr(bot, 'exchange_fee', 0.1)
         _fee_pct = float(_fee_raw) if isinstance(_fee_raw, (int, float)) else 0.1
-        cost_model = get_cost_model(exchange_fee_pct=_fee_pct)
+        _spread_raw = getattr(bot, 'market_spread_pct', 0.0)
+        _spread_pct = float(_spread_raw) if isinstance(_spread_raw, (int, float)) else 0.0
+        _slippage_raw = getattr(bot, 'slippage_pct', 0.0)
+        _slippage_pct = float(_slippage_raw) if isinstance(_slippage_raw, (int, float)) else 0.0
+        cost_model = get_cost_model(
+            exchange_fee_pct=_fee_pct,
+            market_spread_pct=_spread_pct,
+            slippage_pct=_slippage_pct,
+        )
         return cost_model.estimate_cost(side=action, notional_usd=notional, price=price)
 
     async def _resolve_pending_orders(
