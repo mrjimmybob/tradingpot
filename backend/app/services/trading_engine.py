@@ -49,6 +49,19 @@ from .strategy_framework.explanation_persistence import (
     extract_edge_management_category,
     summarize_decision_explanation,
 )
+from .strategy_framework.market_suitability import MarketSuitabilityGate
+from .strategy_framework.decision_score import DecisionScoreEngine, EvidenceItem
+from .strategy_framework.adaptive_params import AdaptiveParameterResolver
+from .strategy_framework.trade_management import TradeManagementMonitor
+from .strategy_framework.edge_management import EdgeCategory, StrategyEdgeManager
+from .strategy_framework.proposal import (
+    Direction,
+    ExecutionIntent,
+    ProposalValidity,
+    StrategyProposal,
+    derive_reasons,
+)
+from .strategy_framework.standalone_adapter import StandaloneAdapter
 
 logger = logging.getLogger(__name__)
 
@@ -3303,27 +3316,49 @@ class TradingEngine:
         params: dict,
         session: AsyncSession,
     ) -> Optional[TradeSignal]:
-        """Volatility Breakout (volatility expansion) strategy - Institutional Grade.
+        """Volatility Breakout (volatility expansion) strategy.
 
-        RARE, CONVEX, REGIME-AWARE strategy that:
-        - Trades volatility expansion after compression
-        - Enters rarely (default: few trades per month)
-        - Complements trend_following (often enters earlier)
-        - Long-only, upper-band breakouts only
+        Migrated to the Strategy Decision Framework
+        (add-strategy-decision-framework, Phase 1 - see this change's
+        design.md/tasks.md, and audits/volatility_breakout.md for the full
+        Strategy Audit Document). Complete decision flow:
 
-        Uses bar-aggregated Bollinger Band compression + breakout detection with
-        ATR-based trailing stops that can ONLY TIGHTEN (risk never expands).
+            Market Data
+                -> Market Suitability Gate (shared MarketSuitabilityGate -
+                   a HARD gate; refuses new entries in an unsuitable
+                   regime, closing the audit's "computed but never
+                   enforced" Pillar 2 finding)
+                -> Adaptive Parameter Resolver (shared
+                   AdaptiveParameterResolver - the ATR stop multiplier is
+                   resolved from the current ATR percentile every cycle,
+                   then LOCKED at entry; Pillar 4)
+                -> Evidence Collection (breakout magnitude, compression
+                   maturity, compression tightness, volatility expansion
+                   strength - all deterministic, all traced to the Theory
+                   section of the Strategy Audit Document; Pillar 3)
+                -> Evidence-Based Decision Score (shared DecisionScoreEngine)
+                -> Strategy Edge Management (shared StrategyEdgeManager -
+                   refuses new entries once classified Category C; never
+                   force-closes an existing position; Pillar 7)
+                -> StrategyProposal (shared, immutable; Pillar 10)
+                -> Standalone Adapter (shared StandaloneAdapter - the ONLY
+                   place a StrategyProposal is translated into the
+                   TradeSignal this function returns)
+                -> existing execution pipeline (UNCHANGED, downstream of
+                   this function's return value)
 
-        CRITICAL: All logic operates on AGGREGATED PSEUDO-BARS, not tick data.
-        Bar interval defines time granularity (default: 60 seconds per bar).
+        THEORY (Pillar 1 - see the Strategy Audit Document for the full
+        write-up): exploits a liquidity-vacuum / stop-run inefficiency.
+        Price coiled inside a multi-bar compression (a thin order book and
+        suppressed realized volatility) tends to move fast and far once it
+        breaks the range, because the same tight range that compressed
+        volatility also concentrated resting stop and breakout orders just
+        beyond it - the initial move is often mechanically self-reinforcing
+        (stops trigger further stops), not merely a random continuation.
+        RARE, CONVEX, REGIME-AWARE, long-only, upper-band breakouts only.
 
-        Regime-aware diagnostics: computes and reports the current volatility
-        regime (direction-based: expanding/contracting/normal, see REGIME
-        GATING below) on every call. This is NOT a hard entry gate - the
-        compression-then-breakout sequence (is_breakout below) already
-        encodes the volatility thesis, so a separate veto would be
-        redundant; the regime value is logged and surfaced via _explain for
-        operator visibility, not consulted by the entry decision.
+        CRITICAL: All logic operates on AGGREGATED PSEUDO-BARS, not tick
+        data. Bar interval defines time granularity (default: 60 seconds).
 
         Parameters:
             bar_interval_seconds: Time per bar for aggregation (default: 60)
@@ -3332,27 +3367,43 @@ class TradingEngine:
             atr_period: ATR period in bars (default: 14)
             compression_method: "bb_width" or "atr_average" (default: "bb_width")
             compression_percentile: BB width percentile threshold % (default: 20)
-            atr_threshold_multiplier: ATR threshold vs average (default: 0.8)
-            min_compression_bars: Minimum bars of compression (default: 20, SPARSE)
-            atr_stop_multiplier: ATR stop loss multiplier (default: 2.0)
+            atr_threshold_multiplier: ATR threshold vs average, used only by
+                the "atr_average" compression_method (default: 0.8)
+            min_compression_bars: Minimum bars of compression before arming
+                (default: 5) - FIXED (Pillar 4): a debounce count against
+                noise, not a quantity that should scale with volatility.
+            atr_stop_multiplier: BASE ATR stop-loss multiplier (default:
+                2.0) - ADAPTIVE (Pillar 4): resolved every cycle via
+                AdaptiveParameterResolver.atr_percentile_scaled_multiplier
+                against current-ATR-vs-its-own-20-bar-average, then LOCKED
+                at entry (risk never expands mid-trade).
+            min_atr_stop_multiplier / max_atr_stop_multiplier: bounds for
+                the adaptive resolution above (default: 1.0 / 4.0).
+            take_profit_rr_multiple: reward target as a multiple of the
+                locked stop distance (default: 3.0) - FIXED (Pillar 4): a
+                convexity target set by this strategy's own "rare, convex"
+                thesis (a few winners must fund many small, bounded
+                losses), not a quantity that should scale with volatility.
+            max_holding_bars: force a full exit if a breakout has hit
+                neither its stop nor its target within this many bars
+                (default: 48) - FIXED (Pillar 4): a debounce/timeout count,
+                not volatility-scaled. Closes the audit's Pillar 6 gap
+                ("no take-profit, no time-based exit").
             risk_percent: Percent of capital to risk (default: 1.0)
-            cooldown_hours: Hours between breakout attempts (default: 72, SPARSE)
+            cooldown_hours: Hours between breakout attempts (default: 24)
             failed_breakout_bars: Bars to detect failed breakout (default: 3)
-            regime_filter_enabled: Enable regime computation/diagnostics
-                (default: True). NOT a hard entry gate - see REGIME
-                DIAGNOSTICS below; disabling this only stops the
-                volatility_regime_name computation and logging.
-            allowed_regimes: Volatility regimes the computed diagnostic is
-                compared against for logging purposes (default:
-                ["volatility_expanding"]) - currently informational only,
-                see above. These are DIRECTION tags -
-                "volatility_expanding"/"_contracting"/"_normal" - derived from
-                the bar-based regime detector's rate-of-change classification
-                (_detect_market_regime_bar_based -> volatility_direction),
-                the same convention _strategy_auto/_is_strategy_eligible use.
-                Do not confuse with the separate LEVEL axis
-                ("volatility_low"/"_medium"/"_high", an ATR percentile) used
-                by other strategies' regime gates (e.g. mean_reversion).
+            allowed_regimes: Volatility regimes this strategy is suitable
+                in (default: ["volatility_expanding"]) - now a HARD gate
+                (Pillar 2) via the shared MarketSuitabilityGate. DIRECTION
+                tags, derived from the bar-based regime detector's rate-
+                of-change classification, the same convention
+                _strategy_auto/_is_strategy_eligible use. `regime_filter_
+                enabled` (a disable switch for this gate) has been REMOVED
+                - a strategy in this framework cannot opt out of Pillar 2.
+            decision_score_threshold: minimum Evidence-Based Decision Score
+                (0-100) required to enter (default: 40.0) - an initial,
+                certification-pending value; see the Strategy Audit
+                Document's before/after backtest comparison.
         """
         # Get parameters with SPARSE defaults
         bar_interval_seconds = params.get("bar_interval_seconds", 60)
@@ -3363,12 +3414,20 @@ class TradingEngine:
         compression_percentile = params.get("compression_percentile", 20)
         atr_threshold_mult = params.get("atr_threshold_multiplier", 0.8)
         min_compression_bars = params.get("min_compression_bars", 5)
-        atr_stop_mult = params.get("atr_stop_multiplier", 2.0)
+        atr_stop_mult_base = params.get("atr_stop_multiplier", 2.0)
+        min_atr_stop_mult = params.get("min_atr_stop_multiplier", 1.0)
+        max_atr_stop_mult = params.get("max_atr_stop_multiplier", 4.0)
+        take_profit_rr_multiple = params.get("take_profit_rr_multiple", 3.0)
+        max_holding_bars = params.get("max_holding_bars", 48)
         risk_percent = params.get("risk_percent", 1.0) / 100
         cooldown_hours = params.get("cooldown_hours", 24)
         failed_breakout_bars = params.get("failed_breakout_bars", 3)
-        regime_filter_enabled = params.get("regime_filter_enabled", True)
         allowed_regimes = params.get("allowed_regimes", ["volatility_expanding"])
+        decision_score_threshold = params.get("decision_score_threshold", 40.0)
+        # ProposalValidity requires a strictly positive window; some test
+        # harnesses set bar_interval_seconds=0 ("close a bar every call") -
+        # a real proposal must still carry a non-zero validity window.
+        _validity_interval_seconds = max(bar_interval_seconds, 1)
 
         # === BAR AGGREGATION SYSTEM ===
         # Aggregate tick prices into fixed-time bars (OHLC)
@@ -3377,6 +3436,10 @@ class TradingEngine:
         # Initialize state tracking (INSTITUTIONAL STRUCTURE)
         if not hasattr(self, "_volatility_breakout_states"):
             self._volatility_breakout_states = {}
+        if not hasattr(self, "_volatility_breakout_edge_manager"):
+            # Pillar 7: one shared, continuous tracker for this strategy,
+            # keyed internally by (bot_id, strategy) - see edge_management.py.
+            self._volatility_breakout_edge_manager = StrategyEdgeManager()
 
         state = self._volatility_breakout_states.get(bot.id, {
             "bars": [],  # List of {"open", "high", "low", "close", "start_ts"}
@@ -3386,14 +3449,20 @@ class TradingEngine:
             "compression_active": False,
             "compression_bars": 0,
             "compression_start": None,
+            "compression_min_width": None,  # running min bb_width this compression episode
             "breakout_armed": False,  # latched after compression, survives breakout bar
+            "armed_compression_bars": None,  # bars compressed, captured at the moment of arming
+            "armed_compression_min_width": None,  # tightest bb_width seen, captured at arming
             "entry_price": None,
             "entry_atr": None,  # LOCKED at entry - risk never expands
+            "entry_stop_multiplier": None,  # LOCKED adaptive multiplier at entry
+            "entry_time": None,  # LOCKED entry timestamp (isoformat) - holding time / time-stop
             "highest_price": None,  # For monotonic trailing stop
             "trailing_stop": None,
+            "take_profit_price": None,  # LOCKED at entry - Pillar 6 gap closure
             "bars_since_entry": 0,
             "last_breakout_attempt": None,
-            "regime_state": None,  # persisted bar-based regime (see REGIME GATING)
+            "regime_state": None,  # persisted bar-based regime (see MARKET SUITABILITY below)
         })
 
         now = self.clock.now()
@@ -3509,65 +3578,22 @@ class TradingEngine:
             state["atr_history"].append(atr)
             state["atr_history"] = state["atr_history"][-100:]  # Keep last 100
 
-        # === REGIME DIAGNOSTICS (NOT a hard entry gate - see ENTRY LOGIC
-        # below: is_breakout = compression_satisfied and breakout above the
-        # upper band is the only behavioral entry condition; the regime
-        # veto was deliberately removed as a hard gate, see the comment
-        # there). This block computes volatility_regime_name purely for
-        # logging/_explain visibility when this strategy runs standalone.
-        # It is entirely separate from Auto Mode's own eligibility check
-        # (_is_strategy_eligible), which computes its own regime from
-        # _strategy_auto's own bar_history before ever dispatching here -
-        # that computation already uses volatility_direction correctly and
-        # is unaffected by this function either way.
+        # === PILLAR 2: MARKET SUITABILITY GATE (shared, HARD-enforced) ===
         # Uses the bar-based regime detector (the same one _strategy_auto /
         # _is_strategy_eligible use) so this gate tests real volatility
         # DIRECTION (rate of change), not a relabeled LEVEL - see
-        # fix-regime-detection-consistency. The previous implementation
-        # called the price-only _detect_market_regime and remapped its
-        # volatility_state (low/medium/high, an ATR percentile LEVEL)
-        # straight onto the labels volatility_contracting/_normal/
-        # _expanding, so a market that had been choppy and high-vol for a
-        # week read identically to one that had just broken out of
-        # compression a single bar ago - the entry gate was testing "is
-        # volatility currently high", not "is volatility currently
-        # expanding", even though the strategy's whole thesis needs the
-        # latter. state["bars"] already has >= bb_period (>= 20 by the
-        # early-return above) real OHLC bars, so it can be passed directly -
-        # no synthetic close-only point needs to be appended.
-        if regime_filter_enabled:
-            current_regime = self._detect_market_regime_bar_based(
-                state["bars"], state.get("regime_state")
-            )
-            state["regime_state"] = current_regime
-            volatility_direction = current_regime.get("volatility_direction", "stable")
-
-            # Map volatility_direction to regime names
-            # volatility_direction values: "expanding", "contracting", "stable"
-            # user config values: "volatility_contracting", "volatility_normal", "volatility_expanding"
-            volatility_regime_map = {
-                "contracting": "volatility_contracting",
-                "stable": "volatility_normal",
-                "expanding": "volatility_expanding",
-            }
-            volatility_regime_name = volatility_regime_map.get(volatility_direction, "volatility_normal")
-
-            # Diagnostic only (see block comment above) - NOT consulted by
-            # the entry decision below. Kept for _explain/logging and so a
-            # future re-introduction of a hard gate (a real behavior change,
-            # to be validated via add-strategy-validation-tooling, not done
-            # here) has a correct value ready to use.
-            regime_allows_entry = volatility_regime_name in allowed_regimes
-
-            if not regime_allows_entry:
-                logger.debug(
-                    f"Bot {bot.id}: Volatility Breakout regime gate ACTIVE - "
-                    f"Current: {volatility_regime_name}, Allowed: {allowed_regimes}"
-                )
-
-        else:
-            regime_allows_entry = True
-            volatility_regime_name = "regime_filter_disabled"
+        # fix-regime-detection-consistency. state["bars"] already has
+        # >= bb_period (>= 20 by the early-return above) real OHLC bars, so
+        # it can be passed directly - no synthetic close-only point needs
+        # to be appended. Unlike the pre-migration implementation, `suit-
+        # ability.is_suitable` is now an ACTUAL hard gate on new entries
+        # below (closes the audit's Pillar 2 "computed but never enforced"
+        # finding) - there is no more disable switch for this check.
+        current_regime = self._detect_market_regime_bar_based(
+            state["bars"], state.get("regime_state")
+        )
+        state["regime_state"] = current_regime
+        suitability = MarketSuitabilityGate().evaluate(current_regime, allowed_regimes)
 
         # Get current positions
         positions = await self._get_bot_positions(bot.id, session)
@@ -3576,18 +3602,123 @@ class TradingEngine:
         # Get last completed bar close for logic (current bar is incomplete)
         last_bar_close = state["bars"][-1]["close"] if state["bars"] else current_price
 
+        # === PILLAR 4: ADAPTIVE PARAMETER RESOLVER ===
+        # Stop multiplier scales with current ATR relative to its own
+        # 20-bar average - wider when volatility is currently elevated
+        # (needs more room to avoid a premature stop-out), tighter when
+        # volatility is calm relative to its own recent history. Resolved
+        # every cycle; LOCKED at entry (below) so an open position's risk
+        # never expands mid-trade, matching the pre-migration "risk never
+        # expands" guarantee.
+        recent_atr_window = state["atr_history"][-20:]
+        avg_atr = (sum(recent_atr_window) / len(recent_atr_window)) if recent_atr_window else atr
+        atr_percentile = (atr / avg_atr) if avg_atr > 0 else 1.0
+        resolved_stop = AdaptiveParameterResolver.atr_percentile_scaled_multiplier(
+            name="atr_stop_multiplier",
+            atr_percentile=atr_percentile,
+            base_multiplier=atr_stop_mult_base,
+            min_multiplier=min_atr_stop_mult,
+            max_multiplier=max_atr_stop_mult,
+        )
+        atr_stop_mult = resolved_stop.value
+
+        # === PILLAR 7: STRATEGY EDGE MANAGEMENT ===
+        # regime_outside_suitable_range comes from the Pillar 2 gate above.
+        # parameter_mismatch_evidence is cited only when ATR has drifted
+        # far from the window the adaptive resolver's BASE multiplier
+        # implicitly assumes "normal" - a citation for a future Category B
+        # response (adapting atr_stop_multiplier's base via certification),
+        # never a free-text guess.
+        edge_manager = self._volatility_breakout_edge_manager
+        parameter_mismatch_evidence = None
+        if atr_percentile > 1.5 or atr_percentile < 0.6:
+            parameter_mismatch_evidence = (
+                f"ATR percentile {atr_percentile:.2f}x its 20-bar average - "
+                f"stop multiplier base {atr_stop_mult_base} may be "
+                "miscalibrated for sustained current volatility (the live "
+                "value is already adaptively resolved above; sustained "
+                "drift outside [0.6, 1.5] is evidence the BASE itself may "
+                "need certification-phase recalibration)"
+            )
+        edge_status = edge_manager.evaluate(
+            bot.id, "volatility_breakout",
+            regime_outside_suitable_range=not suitability.is_suitable,
+            parameter_mismatch_evidence=parameter_mismatch_evidence,
+            now=self.clock.now(),
+        )
+
         logger.debug(
             f"Bot {bot.id}: Volatility Breakout - Bar close: ${last_bar_close:.2f}, "
             f"BB: [${lower_band:.2f}, ${sma:.2f}, ${upper_band:.2f}], "
-            f"Width: {bb_width:.4f}, ATR: ${atr:.2f}, Regime: {volatility_regime_name}"
+            f"Width: {bb_width:.4f}, ATR: ${atr:.2f}, "
+            f"Suitable: {suitability.is_suitable} ({suitability.reason}), "
+            f"Edge: {edge_status.category.value}"
         )
 
-        # === POSITION EXIT LOGIC (INSTITUTIONAL GRADE) ===
+        def _single_evidence_proposal(
+            *, direction: "Direction", execution_intent: "ExecutionIntent",
+            evidence_name: str, evidence_value: float, evidence_reason: str,
+            threshold: float, suggested_position_size: Optional[float] = None,
+            assumptions: tuple = (),
+        ) -> StrategyProposal:
+            """Shared helper for every branch that isn't the full multi-
+            factor entry evaluation below: exits, holds, and suitability/
+            cooldown/edge-blocked no-trades. Each is a single, deterministic,
+            already-decided condition (e.g. "stop was hit: yes/no"), not a
+            discretionary multi-factor judgement - a single Evidence Item
+            correctly and honestly represents that, per Pillar 3's
+            determinism/reproducibility requirement (nothing here is
+            subjective, it just isn't MULTI-factor)."""
+            item = EvidenceItem(
+                name=evidence_name,
+                measurement=lambda d: evidence_value,
+                normalization=lambda r: r,
+                weight=100.0,
+                reason=evidence_reason,
+            )
+            score = DecisionScoreEngine().score(
+                "volatility_breakout", [item], {}, threshold=threshold,
+            )
+            reasons_for, reasons_against = derive_reasons(score)
+            generated_at = self.clock.now()
+            return StrategyProposal(
+                strategy_id="volatility_breakout",
+                bot_id=bot.id,
+                generated_at=generated_at,
+                direction=direction,
+                execution_intent=execution_intent,
+                validity=ProposalValidity(
+                    generated_at=generated_at,
+                    valid_until=generated_at + timedelta(seconds=_validity_interval_seconds),
+                ),
+                decision_score=score,
+                market_suitability=suitability,
+                edge_status=edge_status,
+                assumptions=assumptions,
+                reasons_for=reasons_for,
+                reasons_against=reasons_against,
+                suggested_position_size=suggested_position_size,
+                suggested_risk_budget_pct=risk_percent,
+                explanation=self._explain(bot.id).to_dict(),
+            )
+
+        # === PILLAR 6: CONTINUOUS TRADE MANAGEMENT (position open) ===
         if has_position:
-            # --- Structured decision explanation: exit gates (observe-only) ---
             _exp = self._explain(bot.id)
-            _ts = state.get("trailing_stop")
             _bse = state.get("bars_since_entry", 0)
+            _ts = state.get("trailing_stop")
+            take_profit_price = state.get("take_profit_price")
+            # CRITICAL: use LOCKED entry values (risk never expands mid-trade).
+            # Fallback covers legacy positions from before this migration.
+            entry_atr_locked = state.get("entry_atr") or atr
+            entry_stop_mult_locked = state.get("entry_stop_multiplier") or atr_stop_mult
+            entry_time_iso = state.get("entry_time")
+            holding_seconds = (
+                (self.clock.now() - datetime.fromisoformat(entry_time_iso)).total_seconds()
+                if entry_time_iso else 0.0
+            )
+            initial_risk_per_unit = entry_atr_locked * entry_stop_mult_locked
+
             _exp.update({
                 "current_price": current_price,
                 "bar_close": last_bar_close,
@@ -3596,153 +3727,208 @@ class TradingEngine:
                 "bb_lower": lower_band,
                 "bb_width": bb_width,
                 "atr": atr,
+                "atr_percentile": atr_percentile,
                 "trailing_stop": _ts,
+                "take_profit_price": take_profit_price,
                 "bars_since_entry": _bse,
+                "holding_seconds": holding_seconds,
+                "max_holding_bars": max_holding_bars,
                 "highest_price": state.get("highest_price"),
                 "failed_breakout_bars": failed_breakout_bars,
-                "regime": volatility_regime_name,
-                "has_position": True,
+                "regime_tags": suitability.regime_tags,
+                "market_suitable": suitability.is_suitable,
             })
-            if _ts is not None:
-                _exp.check("Trailing stop hit", current_price, f"<= {_ts:.2f}", current_price <= _ts)
+            # Well-known metric key (explanation_persistence.py) so Order
+            # persistence (Phase 0.6) surfaces the active edge category.
+            _exp.metric("edge_status_category", edge_status.category.value)
+
+            # Shared post-entry re-evaluation hook: (a) thesis/suitability
+            # still passing is delegated to MarketSuitabilityGate internally;
+            # (b)/(c)/(d) are this strategy's own pure predicates.
+            trade_monitor = TradeManagementMonitor()
+            tm_report = trade_monitor.evaluate(
+                current_regime=current_regime,
+                allowed_regimes=allowed_regimes,
+                stop_tighten_check=lambda: (
+                    atr_percentile < 0.7,
+                    f"ATR percentile {atr_percentile:.2f} - volatility has "
+                    "contracted since entry (informational: the locked "
+                    "entry stop distance does not itself change, per "
+                    "'risk never expands' - reflected in future entries' "
+                    "adaptive resolution, not this open position's stop)",
+                ),
+                partial_profit_check=lambda: (
+                    bool(take_profit_price is not None and current_price >= take_profit_price),
+                    (f"price {current_price:.2f} reached the "
+                     f"{take_profit_rr_multiple:.1f}x reward:risk target "
+                     f"{take_profit_price:.2f}") if take_profit_price is not None else "",
+                ),
+            )
+            _exp.metric("thesis_intact", tm_report.thesis_intact)
+
+            failed_breakout_hit = _bse <= failed_breakout_bars and last_bar_close < upper_band
+            take_profit_hit = bool(take_profit_price is not None and current_price >= take_profit_price)
+            trailing_stop_hit = bool(_ts is not None and current_price <= _ts)
+            time_stop_hit = _bse >= max_holding_bars
+
             _exp.check(
                 "Failed-breakout exit", last_bar_close,
                 f"< {upper_band:.2f} within {failed_breakout_bars} bars",
-                (_bse <= failed_breakout_bars and last_bar_close < upper_band),
-                detail=f"bar {_bse}/{failed_breakout_bars}",
+                failed_breakout_hit, detail=f"bar {_bse}/{failed_breakout_bars}",
+            )
+            _exp.check(
+                "Take-profit hit", current_price,
+                f">= {take_profit_price:.2f}" if take_profit_price is not None else "n/a",
+                take_profit_hit,
+            )
+            _exp.check(
+                "Trailing stop hit", current_price,
+                f"<= {_ts:.2f}" if _ts is not None else "n/a",
+                trailing_stop_hit,
+            )
+            _exp.check(
+                "Time-stop", _bse, f"< {max_holding_bars} bars", not time_stop_hit,
             )
             _exp.state("LONG_OPEN").next_trade(
                 current=current_price, current_label="Current price",
                 target=(_ts if _ts is not None else upper_band),
                 target_label=("Trailing stop" if _ts is not None else "BB upper"),
                 distance=(current_price - _ts) if _ts is not None else (current_price - upper_band),
-                status="holding — exits on trailing stop or failed breakout",
+                status="holding — exits on stop, target, failed breakout, or time-stop",
             )
-            # -----------------------------------------------------------------
+
+            exit_trigger = None
+            if failed_breakout_hit:
+                exit_trigger = (
+                    "failed_breakout",
+                    f"Bar close ${last_bar_close:.2f} < BB upper ${upper_band:.2f} "
+                    f"within {failed_breakout_bars} bars of entry — the breakout did not hold",
+                )
+            elif take_profit_hit:
+                exit_trigger = (
+                    "take_profit",
+                    f"Price ${current_price:.2f} reached the "
+                    f"{take_profit_rr_multiple:.1f}x reward:risk target ${take_profit_price:.2f}",
+                )
+            elif trailing_stop_hit:
+                exit_trigger = (
+                    "trailing_stop",
+                    f"Price ${current_price:.2f} <= locked trailing stop ${_ts:.2f}",
+                )
+            elif time_stop_hit:
+                exit_trigger = (
+                    "time_stop",
+                    f"Held {_bse} bars without reaching stop or target (max "
+                    f"{max_holding_bars}) — breakout failed to convert into a fast move",
+                )
+
             for pos in positions:
-                # Increment bars_since_entry only when bar completes (not on every tick)
                 if bar_completed and state["entry_price"] is not None:
                     state["bars_since_entry"] += 1
 
-                # CRITICAL: Use LOCKED entry_atr (risk never expands)
-                # state.get("entry_atr", atr) is NOT a working fallback: the
-                # normalizer always pre-populates this key (as None), so the
-                # default arg never fires and a legacy/state-mismatched
-                # position crashes downstream on `None * atr_stop_mult`.
-                entry_atr_locked = state.get("entry_atr") or atr  # Fallback for legacy positions
-
-                # === EXIT CONDITION 1: Failed Breakout (BAR-BASED) ===
-                # Within N bars after entry, if bar CLOSES back inside BB, exit immediately
-                # Uses bar close, not tick noise
-                if state["bars_since_entry"] <= failed_breakout_bars:
-                    if last_bar_close < upper_band:
-                        sell_amount = pos.amount * current_price
-
-                        logger.info(
-                            f"Bot {bot.id}: Volatility Breakout EXIT (failed breakout) - "
-                            f"Bar close ${last_bar_close:.2f} < BB upper ${upper_band:.2f} "
-                            f"after {state['bars_since_entry']} bars (threshold: {failed_breakout_bars})"
+                if exit_trigger is not None:
+                    evidence_name, reason_text = exit_trigger
+                    # Pillar 7: record this outcome BEFORE state is cleared,
+                    # so the next evaluation's edge classification reflects
+                    # it. Only when entry_price is actually known - a
+                    # position with no locally-tracked entry (e.g. imported
+                    # from the exchange, or opened before this migration)
+                    # has no real pnl to report; recording a fabricated
+                    # value would corrupt StrategyEdgeManager's statistics.
+                    entry_price_known = state.get("entry_price")
+                    if entry_price_known is not None:
+                        pnl_per_unit = current_price - entry_price_known
+                        reward_risk_realized = (
+                            (pnl_per_unit / initial_risk_per_unit) if initial_risk_per_unit > 0 else None
+                        )
+                        edge_manager.record_trade_outcome(
+                            bot.id, "volatility_breakout",
+                            pnl=pnl_per_unit, win=(pnl_per_unit > 0),
+                            reward_risk_realized=reward_risk_realized,
+                            holding_seconds=holding_seconds, at=self.clock.now(),
                         )
 
-                        # Clear state
-                        state["trailing_stop"] = None
-                        state["highest_price"] = None
-                        state["entry_price"] = None
-                        state["entry_atr"] = None
-                        state["bars_since_entry"] = 0
-                        state["compression_active"] = False
-                        state["compression_bars"] = 0
-                        self._volatility_breakout_states[bot.id] = state
-
-                        return TradeSignal(
-                            action="sell",
-                            amount=sell_amount,
-                            order_type="market",
-                            reason=f"Volatility Breakout: Failed breakout (bar {state['bars_since_entry']}/{failed_breakout_bars})",
-                        )
-
-                # === TRAILING STOP: MONOTONIC TIGHTENING (FIXED BUG) ===
-                # Track highest_price explicitly
-                # Trailing stop can ONLY move upward (risk never expands)
-
-                # Initialize highest_price if needed
-                if state["highest_price"] is None:
-                    state["highest_price"] = current_price
-
-                # Update highest_price if new high
-                if current_price > state["highest_price"]:
-                    state["highest_price"] = current_price
-                    # Recompute trailing stop using LOCKED entry_atr
-                    state["trailing_stop"] = state["highest_price"] - (entry_atr_locked * atr_stop_mult)
-                    logger.debug(
-                        f"Bot {bot.id}: Volatility Breakout trailing stop updated - "
-                        f"New high ${state['highest_price']:.2f}, Stop ${state['trailing_stop']:.2f}"
+                    proposal = _single_evidence_proposal(
+                        direction=Direction.SELL,
+                        execution_intent=ExecutionIntent.CLOSE_POSITION,
+                        evidence_name=evidence_name,
+                        evidence_value=1.0,
+                        evidence_reason=reason_text,
+                        threshold=1.0,
+                        suggested_position_size=pos.amount * current_price,
                     )
 
-                # Initialize trailing stop if not set (legacy positions)
-                if state["trailing_stop"] is None:
-                    state["trailing_stop"] = current_price - (entry_atr_locked * atr_stop_mult)
-
-                # === EXIT CONDITION 2: Trailing Stop Hit ===
-                if current_price <= state["trailing_stop"]:
-                    sell_amount = pos.amount * current_price
-                    # Captured before state is cleared below - same crash
-                    # class as the "hold" branch's stop_str a few lines down
-                    # (formatting a field that was just reset to None).
-                    trailing_stop_hit = state["trailing_stop"]
-
-                    logger.info(
-                        f"Bot {bot.id}: Volatility Breakout EXIT (trailing stop) - "
-                        f"Price ${current_price:.2f} <= Stop ${trailing_stop_hit:.2f}, "
-                        f"Entry ATR (locked): ${entry_atr_locked:.4f}"
-                    )
+                    logger.info(f"Bot {bot.id}: Volatility Breakout EXIT ({evidence_name}) - {reason_text}")
 
                     # Clear state
                     state["trailing_stop"] = None
                     state["highest_price"] = None
                     state["entry_price"] = None
                     state["entry_atr"] = None
+                    state["entry_stop_multiplier"] = None
+                    state["entry_time"] = None
+                    state["take_profit_price"] = None
                     state["bars_since_entry"] = 0
                     state["compression_active"] = False
                     state["compression_bars"] = 0
                     self._volatility_breakout_states[bot.id] = state
 
-                    return TradeSignal(
-                        action="sell",
-                        amount=sell_amount,
-                        order_type="market",
-                        reason=f"Volatility Breakout: Trailing stop (${trailing_stop_hit:.2f})",
+                    return StandaloneAdapter.to_trade_signal(proposal)
+
+                # No exit this tick — maintain the monotonic trailing stop
+                # using the LOCKED entry ATR/multiplier (risk never expands).
+                if state["highest_price"] is None:
+                    state["highest_price"] = current_price
+                if current_price > state["highest_price"]:
+                    state["highest_price"] = current_price
+                    state["trailing_stop"] = (
+                        state["highest_price"] - (entry_atr_locked * entry_stop_mult_locked)
                     )
+                    logger.debug(
+                        f"Bot {bot.id}: Volatility Breakout trailing stop updated - "
+                        f"New high ${state['highest_price']:.2f}, Stop ${state['trailing_stop']:.2f}"
+                    )
+                if state["trailing_stop"] is None:
+                    state["trailing_stop"] = current_price - (entry_atr_locked * entry_stop_mult_locked)
 
             # Update state and hold.
-            # Same f-string format-spec crash class as trend_following/mean
-            # reversion: a conditional in the spec raises on every hold tick.
             self._volatility_breakout_states[bot.id] = state
 
-            stop_str = (
-                f"${state['trailing_stop']:.2f}"
-                if state["trailing_stop"] is not None else "N/A"
+            hold_proposal = _single_evidence_proposal(
+                direction=Direction.HOLD,
+                execution_intent=ExecutionIntent.HOLD_POSITION,
+                evidence_name="Position intact",
+                evidence_value=1.0,
+                evidence_reason=(
+                    "no exit condition (failed breakout, take-profit, trailing "
+                    "stop, time-stop) triggered this cycle"
+                ),
+                threshold=1.0,
+                assumptions=(
+                    "breakout level remains valid until price closes back "
+                    "inside the range or the locked trailing stop is hit",
+                ),
             )
+            # Route through the Standalone Adapter like every other branch
+            # ("must not bypass any shared component") - HOLD_POSITION
+            # always translates to None (no order), but the ACTION decision
+            # still comes from the adapter, never a shortcut around it. The
+            # richer, human-readable reason below is purely a UI/diagnostics
+            # enrichment layered on top, mechanically derived from the same
+            # proposal, never a substitute for the adapter's decision.
+            adapter_signal = StandaloneAdapter.to_trade_signal(hold_proposal)
+            if adapter_signal is not None:
+                return adapter_signal
+            reason_text = "; ".join(hold_proposal.reasons_for) or "Volatility Breakout: holding position"
+            stop_str = f"${state['trailing_stop']:.2f}" if state["trailing_stop"] is not None else "N/A"
             return TradeSignal(
-                action="hold",
-                amount=0,
-                reason=f"Volatility Breakout: Holding position, stop at {stop_str}"
+                action="hold", amount=0,
+                reason=f"Volatility Breakout: Holding position, stop at {stop_str} ({reason_text})",
             )
-
-        # === ENTRY LOGIC (RARE) ===
-        # The volatility "regime" veto was REMOVED as a hard entry gate here.
-        # Two bugs made it pathological: (1) it ran BEFORE compression tracking
-        # and early-returned, so a regime-blocked bot never accumulated a single
-        # compression bar; (2) it demanded 'volatility_expanding' at the very
-        # instant the compression check demands LOW volatility - a contradiction
-        # that meant the strategy could never enter. The compression-then-
-        # breakout sequence already encodes the volatility thesis (compression =
-        # low vol, a close above the upper band = the expansion), so the separate
-        # volatility veto was redundant. volatility_regime_name is kept for logs.
 
         # === COMPRESSION DETECTION (BAR-BASED) - ALWAYS TRACKED ===
-        # Must run regardless of regime/cooldown, or compression_bars can never
-        # reach min_compression_bars.
+        # Must run regardless of suitability/cooldown, or compression_bars
+        # can never reach min_compression_bars.
         is_compressed = False
         percentile_value = None
 
@@ -3756,22 +3942,30 @@ class TradingEngine:
         elif compression_method == "atr_average":
             # Use ATR below its rolling average
             if len(state["atr_history"]) >= 20:
-                avg_atr = sum(state["atr_history"][-20:]) / 20
-                is_compressed = atr <= (avg_atr * atr_threshold_mult)
+                atr_avg_20 = sum(state["atr_history"][-20:]) / 20
+                is_compressed = atr <= (atr_avg_20 * atr_threshold_mult)
 
-        # Track compression duration (BAR-BASED)
+        # Track compression duration (BAR-BASED), and the tightest bb_width
+        # seen this episode (Evidence: "Compression tightness" below).
         if bar_completed:
             if is_compressed:
                 if not state["compression_active"]:
                     state["compression_active"] = True
                     state["compression_start"] = self.clock.now().isoformat()
                     state["compression_bars"] = 1
+                    state["compression_min_width"] = bb_width
                     logger.info(
                         f"Bot {bot.id}: Volatility Breakout compression STARTED - "
                         f"Method: {compression_method}, BB width: {bb_width:.4f}"
                     )
                 else:
                     state["compression_bars"] += 1
+                    # .get(): a legacy/partially-seeded state dict (e.g. a
+                    # pre-migration persisted state, or a test seeding only
+                    # the original keys) may not have this key yet.
+                    _cur_min_width = state.get("compression_min_width")
+                    if _cur_min_width is None or bb_width < _cur_min_width:
+                        state["compression_min_width"] = bb_width
             else:
                 # Compression ended
                 if state["compression_active"]:
@@ -3782,6 +3976,7 @@ class TradingEngine:
                     state["compression_active"] = False
                     state["compression_start"] = None
                     state["compression_bars"] = 0
+                    state["compression_min_width"] = None
 
         # Latch a "breakout armed" flag once compression has persisted long
         # enough. It MUST survive the expansion that follows: a genuine breakout
@@ -3789,39 +3984,32 @@ class TradingEngine:
         # NOT compressed, which would otherwise reset compression on the very bar
         # we want to act on (so the strategy could never fire). Arming decouples
         # "we were compressed" from "now we break out". It disarms on entry or if
-        # price falls back to the mean (the setup has gone stale).
-        if state["compression_active"] and state["compression_bars"] >= min_compression_bars:
+        # price falls back to the mean (the setup has gone stale). The bars/width
+        # AT THE MOMENT OF ARMING are captured (LOCKED) here because
+        # compression_bars/compression_min_width reset to 0/None on the very
+        # breakout bar itself (it is, by definition, no longer "compressed") -
+        # without capturing them, the Evidence Items below would read a
+        # transient 0 instead of the real compression episode's statistics.
+        if (
+            state["compression_active"]
+            and state["compression_bars"] >= min_compression_bars
+            and not state.get("breakout_armed")
+        ):
             state["breakout_armed"] = True
+            state["armed_compression_bars"] = state["compression_bars"]
+            state["armed_compression_min_width"] = state.get("compression_min_width")
         if state.get("breakout_armed") and last_bar_close < sma:
             state["breakout_armed"] = False
+            state["armed_compression_bars"] = None
+            state["armed_compression_min_width"] = None
         compression_satisfied = bool(state.get("breakout_armed"))
 
-        # A confirmed breakout = armed by prior compression AND a bar close above
-        # the upper band. This is the only behavioural entry gate now (+ cooldown).
-        is_breakout = compression_satisfied and last_bar_close > upper_band
-
-        # PRODUCTION DIAGNOSIS (once per completed bar): why this (rare) strategy
-        # is/ isn't entering - compression progress, arming, and the breakout gap.
-        if bar_completed:
-            upper_gap_pct = (
-                (last_bar_close - upper_band) / upper_band * 100 if upper_band > 0 else 0.0
-            )
-            logger.info(
-                f"Bot {bot.id}: VB no-trade diag - close=${last_bar_close:.2f} "
-                f"upper=${upper_band:.2f} gap_to_breakout={upper_gap_pct:+.3f}% "
-                f"width={bb_width:.5f} compressed={is_compressed} "
-                f"comp_bars={state['compression_bars']}/{min_compression_bars} "
-                f"armed={bool(state.get('breakout_armed'))} regime={volatility_regime_name} "
-                f"bars={len(state['bars'])}"
-            )
-
-        # --- Structured decision explanation: entry gates (observe-only) -----
-        # The exact compression + breakout math. This implementation uses NO
-        # volume data, so no volume-confirmation check is reported (never faked).
-        exp = self._explain(bot.id)
         upper_gap = last_bar_close - upper_band
         upper_gap_pct = (upper_gap / upper_band * 100) if upper_band > 0 else 0.0
         compression_ratio = (bb_width / percentile_value) if percentile_value else None
+
+        # --- Structured decision explanation: entry-side state (observe-only) --
+        exp = self._explain(bot.id)
         exp.update({
             "current_price": current_price,
             "bar_close": last_bar_close,
@@ -3834,23 +4022,31 @@ class TradingEngine:
             "is_compressed": is_compressed,
             "compression_bars": state.get("compression_bars", 0),
             "min_compression_bars": min_compression_bars,
-            "breakout_armed": bool(state.get("breakout_armed")),
+            "breakout_armed": compression_satisfied,
             "atr": atr,
+            "atr_percentile": atr_percentile,
+            "effective_stop_multiplier": atr_stop_mult,
             "breakout_threshold": upper_band,
             "breakout_distance": upper_gap,
             "breakout_gap_pct": upper_gap_pct,
-            "regime": volatility_regime_name,
+            "regime_tags": suitability.regime_tags,
+            "market_suitable": suitability.is_suitable,
             "has_position": False,
         })
+        exp.metric("edge_status_category", edge_status.category.value)
         exp.check(
             "Compression armed", state.get("compression_bars", 0),
             f">= {min_compression_bars} bars compressed", compression_satisfied,
         )
         exp.check(
-            "Breakout above upper band", last_bar_close, f"> {upper_band:.2f}",
-            last_bar_close > upper_band, detail=f"{upper_gap_pct:+.3f}% vs band",
+            "Market suitability", suitability.is_suitable, "must be True",
+            suitability.is_suitable, detail=suitability.reason,
         )
-        # Current state + next-trade preview (from values already computed above).
+        exp.check(
+            "Strategy edge not disqualified", edge_status.category.value,
+            f"!= {EdgeCategory.C.value}", edge_status.category != EdgeCategory.C,
+            detail=edge_status.reason,
+        )
         if not compression_satisfied:
             _need_bars = max(0, min_compression_bars - state.get("compression_bars", 0))
             exp.state("WAITING_COMPRESSION").next_trade(
@@ -3867,135 +4063,319 @@ class TradingEngine:
                 status=(f"needs +{abs(upper_gap):.2f} to break out" if upper_gap < 0
                         else "breakout level reached"),
             )
-        # ---------------------------------------------------------------------
+        # -------------------------------------------------------------------
 
-        # Cooldown only gates an ACTUAL breakout entry (sparse trading) - it no
-        # longer blocks compression tracking.
-        if is_breakout and state["last_breakout_attempt"] is not None:
+        # === PRECONDITION 1: compression must be armed before evidence can
+        # be meaningfully collected at all - there is no setup to score. ===
+        if not compression_satisfied:
+            self._volatility_breakout_states[bot.id] = state
+            proposal = _single_evidence_proposal(
+                direction=Direction.NO_TRADE, execution_intent=ExecutionIntent.NO_ACTION,
+                evidence_name="Compression armed", evidence_value=0.0,
+                evidence_reason=(
+                    f"only {state.get('compression_bars', 0)}/{min_compression_bars} "
+                    "compressed bars accumulated - no mature setup to evaluate yet"
+                ),
+                threshold=1.0,
+            )
+            adapter_signal = StandaloneAdapter.to_trade_signal(proposal)
+            if adapter_signal is not None:
+                return adapter_signal
+            reason_text = "; ".join(proposal.reasons_against) or "watching for compression"
+            if state["compression_active"]:
+                return TradeSignal(
+                    action="hold", amount=0,
+                    reason=(
+                        f"Volatility Breakout: Compression building "
+                        f"({state['compression_bars']}/{min_compression_bars} bars) ({reason_text})"
+                    ),
+                )
+            return TradeSignal(
+                action="hold", amount=0,
+                reason=f"Volatility Breakout: Watching for compression (BB width: {bb_width:.4f}) ({reason_text})",
+            )
+
+        # === PRECONDITION 2: PILLAR 2 HARD GATE - refuse unsuitable markets,
+        # even with a fully armed, mature compression setup. ===
+        if not suitability.is_suitable:
+            self._volatility_breakout_states[bot.id] = state
+            proposal = _single_evidence_proposal(
+                direction=Direction.NO_TRADE, execution_intent=ExecutionIntent.NO_ACTION,
+                evidence_name="Market suitability", evidence_value=0.0,
+                evidence_reason=suitability.reason, threshold=1.0,
+            )
+            adapter_signal = StandaloneAdapter.to_trade_signal(proposal)
+            if adapter_signal is not None:
+                return adapter_signal
+            reason_text = "; ".join(proposal.reasons_against) or suitability.reason
+            return TradeSignal(
+                action="hold", amount=0,
+                reason=f"Volatility Breakout: Compression armed but regime unsuitable ({reason_text})",
+            )
+
+        # === PILLAR 3: EVIDENCE COLLECTION ===
+        # Compression armed AND market suitable - a real setup exists.
+        # Evidence is collected and scored regardless of whether price has
+        # technically crossed the upper band yet; "Breakout magnitude" is
+        # simply negative/small until it does, so the score naturally fails
+        # to clear threshold rather than needing a separate boolean gate.
+        armed_bars = state.get("armed_compression_bars") or state.get("compression_bars", 0)
+        armed_min_width = state.get("armed_compression_min_width")
+
+        def _volatility_expansion_ratio() -> float:
+            hist = state["atr_history"]
+            if len(hist) < 14:
+                return 1.0
+            recent7 = hist[-7:]
+            older7 = hist[-14:-7]
+            older_avg = sum(older7) / 7
+            recent_avg = sum(recent7) / 7
+            return (recent_avg / older_avg) if older_avg > 0 else 1.0
+
+        expansion_ratio = _volatility_expansion_ratio()
+
+        evidence_items = [
+            EvidenceItem(
+                name="Breakout magnitude",
+                measurement=lambda d: (last_bar_close - upper_band) / atr if atr > 0 else 0.0,
+                normalization=lambda r: max(-1.0, min(1.0, r / 1.0)),
+                weight=30.0,
+                reason=(
+                    "Theory (liquidity-vacuum/stop-run): a genuine breakout is "
+                    "already a meaningful fraction of the measured range (ATR) "
+                    "beyond the compression boundary, not a marginal tick above "
+                    "it - larger magnitude is stronger evidence the move has "
+                    "actually started, not noise around the band."
+                ),
+            ),
+            EvidenceItem(
+                name="Compression maturity",
+                measurement=lambda d: (armed_bars / min_compression_bars) if min_compression_bars > 0 else 0.0,
+                normalization=lambda r: max(-1.0, min(1.0, (r - 1.0) * 2.0)),
+                weight=25.0,
+                reason=(
+                    "Theory: the longer price coils before breaking out, the "
+                    "more resting stop and breakout orders concentrate just "
+                    "beyond the range, and the stronger the eventual move tends "
+                    "to be once it releases."
+                ),
+            ),
+            EvidenceItem(
+                name="Compression tightness",
+                measurement=lambda d: (
+                    (1.0 - (armed_min_width / percentile_value))
+                    if (armed_min_width is not None and percentile_value) else 0.0
+                ),
+                normalization=lambda r: max(-1.0, min(1.0, r / 0.5)),
+                weight=25.0,
+                reason=(
+                    "Theory: a tighter compression (BB width well below the "
+                    "historical compression threshold) implies a smaller, more "
+                    "concentrated order-book vacuum and therefore a more convex "
+                    "expected move once it releases."
+                ),
+            ),
+            EvidenceItem(
+                name="Volatility expansion strength",
+                measurement=lambda d: expansion_ratio - 1.0,
+                normalization=lambda r: max(-1.0, min(1.0, r / 0.3)),
+                weight=20.0,
+                reason=(
+                    "Theory: the compression-then-breakout thesis requires "
+                    "volatility to actually be expanding, not merely that price "
+                    "crossed a static band level - a faster rate of ATR "
+                    "expansion is stronger, independent confirmation beyond the "
+                    "pass/fail Market Suitability Gate."
+                ),
+            ),
+        ]
+
+        # === PILLAR 3: EVIDENCE-BASED DECISION SCORE ===
+        decision_score = DecisionScoreEngine().score(
+            "volatility_breakout", evidence_items, {}, threshold=decision_score_threshold,
+        )
+        edge_manager.record_decision_score(bot.id, "volatility_breakout", decision_score.total)
+
+        exp.metric("decision_score_total", decision_score.total)
+        exp.metric("decision_score_threshold", decision_score_threshold)
+        exp.check(
+            "Decision Score clears threshold", decision_score.total,
+            f">= {decision_score_threshold:.1f}", decision_score.approved,
+        )
+
+        reasons_for, reasons_against = derive_reasons(decision_score)
+        assumptions = (
+            f"breakout level (BB upper ${upper_band:.2f}) not invalidated by a "
+            f"close back inside the range within {failed_breakout_bars} bars",
+            "current volatility regime remains 'expanding' per the bar-based "
+            "direction detector",
+            f"compression episode ({armed_bars} bars) is not itself falsified "
+            "by price falling back below the mean before a breakout confirms",
+        )
+
+        blocking_reasons = []
+        if not decision_score.approved:
+            blocking_reasons.append(
+                f"Decision Score {decision_score.total:.1f} < threshold {decision_score_threshold:.1f}"
+            )
+        if edge_status.category == EdgeCategory.C:
+            blocking_reasons.append(
+                f"Strategy Edge Management: Category C - {edge_status.reason}"
+            )
+        cooldown_remaining_hours = 0.0
+        if state["last_breakout_attempt"] is not None:
             last_attempt = datetime.fromisoformat(state["last_breakout_attempt"])
             hours_since = (self.clock.now() - last_attempt).total_seconds() / 3600
             if hours_since < cooldown_hours:
-                self._volatility_breakout_states[bot.id] = state
-                return TradeSignal(
-                    action="hold",
-                    amount=0,
-                    reason=f"Volatility Breakout: Cooldown ({cooldown_hours - hours_since:.1f}h remaining)"
-                )
+                cooldown_remaining_hours = cooldown_hours - hours_since
+                blocking_reasons.append(f"cooldown active ({cooldown_remaining_hours:.1f}h remaining)")
 
-        # === BREAKOUT ENTRY CONDITION (LONG-ONLY, UPPER BAND) ===
-        if is_breakout:
-            # Volatility-adjusted position sizing: risk a fixed % of capital; the
-            # ATR-based stop distance gives the COIN count, converted to a quote
-            # notional. BUGFIX: the * current_price conversion was missing (same
-            # unit bug as trend_following), producing sub-$1 orders or, on ATR
-            # collapse, a blow-up silently capped at the balance.
-            risk_amount = bot.current_balance * risk_percent
+        if blocking_reasons:
+            self._volatility_breakout_states[bot.id] = state
+            generated_at = self.clock.now()
+            proposal = StrategyProposal(
+                strategy_id="volatility_breakout", bot_id=bot.id, generated_at=generated_at,
+                direction=Direction.NO_TRADE, execution_intent=ExecutionIntent.NO_ACTION,
+                validity=ProposalValidity(
+                    generated_at=generated_at,
+                    valid_until=generated_at + timedelta(seconds=_validity_interval_seconds),
+                ),
+                decision_score=decision_score, market_suitability=suitability, edge_status=edge_status,
+                assumptions=assumptions, reasons_for=reasons_for, reasons_against=reasons_against,
+                suggested_risk_budget_pct=risk_percent,
+                adaptive_parameters_used={"atr_stop_multiplier": atr_stop_mult},
+                explanation=exp.to_dict(),
+            )
+            adapter_signal = StandaloneAdapter.to_trade_signal(proposal)
+            if adapter_signal is not None:
+                return adapter_signal
+            reason_text = "; ".join(blocking_reasons)
+            logger.debug(f"Bot {bot.id}: VB no-trade - {reason_text} (score={decision_score.total:.1f})")
+            return TradeSignal(
+                action="hold", amount=0,
+                reason=f"Volatility Breakout: {reason_text} (score {decision_score.total:.1f}/{decision_score_threshold:.1f})",
+            )
 
-            if atr > 0:
-                stop_distance = atr * atr_stop_mult            # USD per coin
-                position_coins = risk_amount / stop_distance   # base coins
-                position_size = position_coins * current_price  # quote USD notional
+        # === PILLAR 5: DECISION-SCORE-WEIGHTED POSITION SIZING ===
+        # A marginal-score trade (just above threshold) sizes toward 0.5x;
+        # a maximal-score trade sizes toward 1.5x. Deterministic and
+        # reproducible per Pillar 5's own requirement - not a separate,
+        # unaccountable scaling knob. (add-unified-position-sizing will
+        # eventually consolidate this into a shared cross-strategy
+        # function per that change's revised design.md; this is this
+        # strategy's own certification-phase implementation until then.)
+        score_range = max(100.0 - decision_score_threshold, 1e-9)
+        score_margin = max(0.0, min(1.0, (decision_score.total - decision_score_threshold) / score_range))
+        size_multiplier = 0.5 + score_margin
+        exp.metric("decision_score_size_multiplier", size_multiplier)
+
+        # Volatility-adjusted, Decision-Score-weighted position sizing: risk a
+        # %-of-capital, scaled by size_multiplier; the ATR-based stop distance
+        # (now the LIVE adaptively-resolved multiplier) gives the coin count.
+        risk_amount = bot.current_balance * risk_percent * size_multiplier
+
+        if atr > 0:
+            stop_distance = atr * atr_stop_mult             # USD per coin
+            position_coins = risk_amount / stop_distance    # base coins
+            position_size = position_coins * current_price  # quote USD notional
+        else:
+            position_size = risk_amount
+
+        # Cap at available balance less execution cost buffer (fee + spread)
+        # so the simulated exchange cannot reject for insufficient funds.
+        buy_amount = min(position_size, bot.current_balance * _BUY_BALANCE_FRACTION)
+
+        # Floor to the executable minimum (a sub-minimum buy is rejected by
+        # the engine every loop); HOLD if the balance cannot afford it.
+        if buy_amount < MIN_ORDER_USD:
+            if bot.current_balance >= MIN_ORDER_USD:
+                buy_amount = MIN_ORDER_USD
             else:
-                position_size = risk_amount
-
-            # Cap at available balance less execution cost buffer (fee + spread)
-            # so the simulated exchange cannot reject for insufficient funds.
-            buy_amount = min(position_size, bot.current_balance * _BUY_BALANCE_FRACTION)
-
-            # Floor to the executable minimum (a sub-minimum buy is rejected by
-            # the engine every loop); HOLD if the balance cannot afford it.
-            if buy_amount < MIN_ORDER_USD:
-                if bot.current_balance >= MIN_ORDER_USD:
-                    buy_amount = MIN_ORDER_USD
-                else:
-                    self._volatility_breakout_states[bot.id] = state
-                    return TradeSignal(
-                        action="hold",
-                        amount=0,
-                        reason=(
-                            f"Volatility Breakout: balance ${bot.current_balance:.2f} "
-                            f"below ${MIN_ORDER_USD:.0f} minimum order"
-                        ),
-                    )
-
-            # Calculate BB width percentile for logging
-            percentile_rank = "N/A"
-            if len(state["bb_width_history"]) >= 20:
-                sorted_widths = sorted(state["bb_width_history"])
-                rank = sorted_widths.index(min(sorted_widths, key=lambda x: abs(x - bb_width)))
-                percentile_rank = f"{int((rank / len(sorted_widths)) * 100)}th"
-
-            # Viability pre-check before state mutation: expected move = how far the
-            # price has already broken above the upper band (the measured breakout
-            # magnitude). A breakout is expected to continue at least this distance,
-            # making it the most conservative honest estimate available without
-            # inventing a price target. upper_gap is already computed above.
-            _vb_expected_move = upper_gap / current_price if current_price > 0 else 0.0
-            _fee_raw_vb = getattr(bot, 'exchange_fee', 0.1)
-            _vb_fee_pct = (
-                float(_fee_raw_vb) if isinstance(_fee_raw_vb, (int, float)) else 0.1
-            ) / 100.0
-            _vb_min_move = 2.0 * _vb_fee_pct + _VIABILITY_SAFETY_MARGIN_PCT
-            if _vb_expected_move < _vb_min_move:
                 self._volatility_breakout_states[bot.id] = state
                 return TradeSignal(
-                    action="hold",
-                    amount=0,
+                    action="hold", amount=0,
                     reason=(
-                        f"Volatility Breakout: breakout {_vb_expected_move * 100:.3f}% < "
-                        f"fee threshold {_vb_min_move * 100:.3f}% "
-                        f"(exchange_fee={_vb_fee_pct * 100:.2f}%)"
+                        f"Volatility Breakout: balance ${bot.current_balance:.2f} "
+                        f"below ${MIN_ORDER_USD:.0f} minimum order"
                     ),
                 )
 
-            logger.info(
-                f"Bot {bot.id}: Volatility Breakout ENTRY - "
-                f"{state['compression_bars']} bars compression (BB width {percentile_rank} percentile), "
-                f"Bar close ${last_bar_close:.2f} > BB upper ${upper_band:.2f}, "
-                f"Entry ATR locked at ${atr:.4f}, Position: ${buy_amount:.2f}"
-            )
-
-            # Initialize state with LOCKED entry_atr (risk never expands)
-            state["trailing_stop"] = current_price - (atr * atr_stop_mult)
-            state["highest_price"] = current_price
-            state["entry_price"] = current_price
-            state["entry_atr"] = atr  # LOCKED - trailing stop distance will always use this
-            state["bars_since_entry"] = 0
-            state["breakout_armed"] = False  # consumed this setup
-            state["last_breakout_attempt"] = self.clock.now().isoformat()
-
+        # Viability pre-check: expected move = how far price has already
+        # broken above the upper band (the measured breakout magnitude). A
+        # breakout is expected to continue at least this distance, making it
+        # the most conservative honest estimate available without inventing
+        # a price target.
+        _vb_expected_move = upper_gap / current_price if current_price > 0 else 0.0
+        _fee_raw_vb = getattr(bot, 'exchange_fee', 0.1)
+        _vb_fee_pct = (
+            float(_fee_raw_vb) if isinstance(_fee_raw_vb, (int, float)) else 0.1
+        ) / 100.0
+        _vb_min_move = 2.0 * _vb_fee_pct + _VIABILITY_SAFETY_MARGIN_PCT
+        exp.check(
+            "Fee viability", _vb_expected_move, f">= {_vb_min_move:.5f}",
+            _vb_expected_move >= _vb_min_move,
+        )
+        if _vb_expected_move < _vb_min_move:
             self._volatility_breakout_states[bot.id] = state
-
             return TradeSignal(
-                action="buy",
-                amount=buy_amount,
-                order_type="market",
-                reason=f"Volatility Breakout: {state['compression_bars']} bars compression, breakout confirmed",
-                expected_move_pct=_vb_expected_move,
+                action="hold", amount=0,
+                reason=(
+                    f"Volatility Breakout: breakout {_vb_expected_move * 100:.3f}% < "
+                    f"fee threshold {_vb_min_move * 100:.3f}% "
+                    f"(exchange_fee={_vb_fee_pct * 100:.2f}%)"
+                ),
             )
 
-        # Update state and hold (EXPLAINABLE REASONS)
+        # === PILLAR 10: STRATEGYPROPOSAL ===
+        generated_at = self.clock.now()
+        proposal = StrategyProposal(
+            strategy_id="volatility_breakout", bot_id=bot.id, generated_at=generated_at,
+            direction=Direction.BUY, execution_intent=ExecutionIntent.OPEN_POSITION,
+            validity=ProposalValidity(
+                generated_at=generated_at,
+                valid_until=generated_at + timedelta(seconds=_validity_interval_seconds),
+            ),
+            decision_score=decision_score, market_suitability=suitability, edge_status=edge_status,
+            assumptions=assumptions, reasons_for=reasons_for, reasons_against=reasons_against,
+            suggested_position_size=buy_amount, suggested_risk_budget_pct=risk_percent * size_multiplier,
+            expected_holding_horizon="short",
+            adaptive_parameters_used={
+                "atr_stop_multiplier": atr_stop_mult,
+                "decision_score_size_multiplier": size_multiplier,
+            },
+            explanation=exp.to_dict(),
+        )
+
+        logger.info(
+            f"Bot {bot.id}: Volatility Breakout ENTRY - "
+            f"Decision Score {decision_score.total:.1f}/{decision_score_threshold:.1f}, "
+            f"{armed_bars} bars compression, Bar close ${last_bar_close:.2f} > BB upper ${upper_band:.2f}, "
+            f"Entry ATR locked at ${atr:.4f} x {atr_stop_mult:.2f}, Position: ${buy_amount:.2f}"
+        )
+
+        # === PILLAR 10: STANDALONE ADAPTER -> existing execution pipeline ===
+        # Lock entry state (risk never expands mid-trade) - including the
+        # LIVE-resolved adaptive stop multiplier and a reward:risk take-
+        # profit target (closes the audit's Pillar 6 "no take-profit" gap).
+        entry_stop_distance = atr * atr_stop_mult
+        state["trailing_stop"] = current_price - entry_stop_distance
+        state["take_profit_price"] = current_price + (entry_stop_distance * take_profit_rr_multiple)
+        state["highest_price"] = current_price
+        state["entry_price"] = current_price
+        state["entry_atr"] = atr
+        state["entry_stop_multiplier"] = atr_stop_mult
+        state["entry_time"] = self.clock.now().isoformat()
+        state["bars_since_entry"] = 0
+        state["breakout_armed"] = False  # consumed this setup
+        state["armed_compression_bars"] = None
+        state["armed_compression_min_width"] = None
+        state["last_breakout_attempt"] = self.clock.now().isoformat()
+
         self._volatility_breakout_states[bot.id] = state
 
-        # Provide clear feedback on why not entering
-        if compression_satisfied:
-            return TradeSignal(
-                action="hold",
-                amount=0,
-                reason=f"Volatility Breakout: Compression satisfied ({state['compression_bars']} bars), waiting for breakout > ${upper_band:.2f}"
-            )
-        elif state["compression_active"]:
-            return TradeSignal(
-                action="hold",
-                amount=0,
-                reason=f"Volatility Breakout: Compression building ({state['compression_bars']}/{min_compression_bars} bars)"
-            )
-        else:
-            return TradeSignal(
-                action="hold",
-                amount=0,
-                reason=f"Volatility Breakout: Watching for compression (BB width: {bb_width:.4f})"
-            )
+        return StandaloneAdapter.to_trade_signal(
+            proposal, expected_move_pct=_vb_expected_move,
+        )
 
     # Note: TWAP and VWAP strategy methods removed.
     # TWAP/VWAP are execution algorithms, not alpha strategies.

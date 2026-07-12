@@ -426,11 +426,22 @@ class TestVolatilityBreakoutDefaults:
                 "compression_active": False,  # just ended on the breakout bar
                 "compression_bars": 0,
                 "compression_start": None,
-                "breakout_armed": True,       # previously armed by 5 compression bars
+                "compression_min_width": None,
+                "breakout_armed": True,       # previously armed by 8 compression bars
+                # Captured at the moment of arming (add-strategy-decision-
+                # framework Phase 1) - the Evidence-Based Decision Score
+                # reads THESE, not the (already-reset-to-0) live
+                # compression_bars/compression_min_width, since the
+                # breakout bar itself is no longer "compressed".
+                "armed_compression_bars": 8,
+                "armed_compression_min_width": 0.0002,
                 "entry_price": None,
                 "entry_atr": None,
+                "entry_stop_multiplier": None,
+                "entry_time": None,
                 "highest_price": None,
                 "trailing_stop": None,
+                "take_profit_price": None,
                 "bars_since_entry": 0,
                 "last_breakout_attempt": None,
             }

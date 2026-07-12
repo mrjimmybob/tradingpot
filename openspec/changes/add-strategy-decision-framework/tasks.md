@@ -173,34 +173,56 @@ Phase 0 is infrastructure only, wired to zero strategies until Phase 1).
 
 ## Phase 1 — volatility_breakout (smallest lift on Pillar 2; already computes what it needs)
 
+**Status: ✓ Complete (9/9), Under review** (see `audits/volatility_breakout.md`'s
+Certification Checklist — implementation and testing done; the doc's own
+"Under review" status is pending human sign-off, not outstanding agent
+work). Migrated in `backend/app/services/trading_engine.py`
+(`_strategy_volatility_breakout`, now wired through
+`MarketSuitabilityGate`, `AdaptiveParameterResolver`, `DecisionScoreEngine`,
+`StrategyEdgeManager`, `StrategyProposal`, and `StandaloneAdapter` — the
+full decision flow, no shortcuts, no duplicated framework logic). 21 new
+tests (`backend/tests/test_volatility_breakout_framework_migration.py`,
+8 classes covering Evidence Generation, Decision Score, Market Suitability,
+Edge Management, Proposal Generation, Standalone Adapter Compatibility,
+Historical Replay, and Regressions); `test_strategy_activity.py`'s
+`TestVolatilityBreakoutDefaults` fixture updated for the new state keys.
+Full suite: 1152/1152 passing, zero regressions. Before/after backtest run
+across bull (2023-10-01–2023-11-15), bear (2022-11-01–2022-12-15), and
+chop (2024-04-01–2024-05-15) windows — see `audits/volatility_breakout.md`'s
+Backtesting section for full results, methodology, and an honest
+discussion of what a 0%-observed-win-rate small sample can and can't tell
+us. That section also documents a pre-existing, out-of-scope backtest-
+engine trade-counting bug discovered (not introduced, not fixed) while
+running these.
+
 See `audits/volatility_breakout.md`. Gaps: P1, P3, P4 (beyond stop), P6
 (no take-profit/time-exit), P7, P9; P2 computed-but-unenforced; P8
 sizing/viability gap; P5 needs a Decision Score input.
 
-- [ ] 1.1 Author theory (P1) and performance expectations (P9) in
+- [x] 1.1 Author theory (P1) and performance expectations (P9) in
       `audits/volatility_breakout.md`.
-- [ ] 1.2 Wire the ALREADY-COMPUTED `regime_allows_entry` into the actual
+- [x] 1.2 Wire the ALREADY-COMPUTED `regime_allows_entry` into the actual
       entry decision (`is_breakout`) - this is the one-line-conceptually
       but behavior-changing fix the earlier `fix-regime-detection-
       consistency` change deferred. Backtest before/after across bull/
       bear/chop, matching that change's own verification pattern.
-- [ ] 1.3 Replace the boolean `is_breakout` gate with a `DecisionScoreEngine`
+- [x] 1.3 Replace the boolean `is_breakout` gate with a `DecisionScoreEngine`
       call (Phase 0.2), defining Evidence Items (breakout magnitude,
       compression duration, and any other measurable factors the
       finalized theory doc (1.1) identifies) with documented Measurement/
       Normalization/Weight for each.
-- [ ] 1.4 Add a take-profit and/or time-based exit to close the Pillar 6
+- [x] 1.4 Add a take-profit and/or time-based exit to close the Pillar 6
       gap (currently only failed-breakout + trailing stop).
-- [ ] 1.5 Wire `StrategyEdgeManager` (Phase 0.5) before entry; define this
+- [x] 1.5 Wire `StrategyEdgeManager` (Phase 0.5) before entry; define this
       strategy's specific Category A/B/C signal thresholds (e.g. what
       volatility-percentile range counts as Category A mismatch for a
       breakout strategy specifically).
-- [ ] 1.6 Wire Decision-Score-weighted sizing (Phase 0.7's revised shared
+- [x] 1.6 Wire Decision-Score-weighted sizing (Phase 0.7's revised shared
       sizer) in place of the flat risk_percent formula.
-- [ ] 1.7 Close Pillar 8 gaps: add `.check()`/`.metric()` for sizing and
+- [x] 1.7 Close Pillar 8 gaps: add `.check()`/`.metric()` for sizing and
       the fee-viability gate; verify the Evidence Report renders correctly
       for a real trade.
-- [ ] 1.8 Migrate this strategy's return type from `TradeSignal` to
+- [x] 1.8 Migrate this strategy's return type from `TradeSignal` to
       `StrategyProposal` (Phase 0.10), including this strategy's specific
       `execution_intent` mapping (breakout entry -> OPEN_POSITION, failed-
       breakout/trailing-stop exit -> CLOSE_POSITION), a `validity.
@@ -210,7 +232,7 @@ sizing/viability gap; P5 needs a Decision Score input.
       Standalone Adapter (Phase 0.11) is behavior-identical to the
       pre-migration `TradeSignal` path for a fixed set of historical
       scenarios.
-- [ ] 1.9 Certification review against the full checklist; before/after
+- [x] 1.9 Certification review against the full checklist; before/after
       backtest comparison recorded in the audit doc.
 
 ## Phase 2 — trend_following (highest-urgency zero-suitability strategy)
