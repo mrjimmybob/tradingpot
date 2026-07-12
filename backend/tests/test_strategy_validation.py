@@ -213,6 +213,12 @@ async def test_trend_following_emits_executable_buy_on_100_dollar_account():
             "short_period": 3, "long_period": 5, "atr_period": 3,
             "atr_multiplier": 2.0, "risk_percent": 1.0,
             "entry_confirmation_loops": 1, "cooldown_seconds": 0,
+            # Isolate the sizing path from the Decision Framework's regime
+            # (Pillar 2) and Decision-Score (Pillar 3) gates - both covered
+            # in test_trend_following_framework_migration.py. This test only
+            # asserts the executable-BUY *sizing* invariant.
+            "bar_interval_seconds": 0, "allowed_regimes": ["all"],
+            "decision_score_threshold": 0.0,
         },
     )
     # Steady uptrend: price > EMA(long) and EMA(short) > EMA(long).
@@ -241,6 +247,12 @@ async def test_trend_following_floors_subminimum_size_when_affordable():
             "short_period": 3, "long_period": 5, "atr_period": 3,
             "atr_multiplier": 2.0, "risk_percent": 0.3,  # 0.3% of $60 = $0.18
             "entry_confirmation_loops": 1, "cooldown_seconds": 0,
+            # Isolate the sub-minimum-floor sizing path from the regime/score
+            # gates (covered in test_trend_following_framework_migration.py);
+            # bar_interval_seconds=0 lets the volatile series form real bars so
+            # the large bar-ATR drives the tiny-coin-count -> floor path.
+            "bar_interval_seconds": 0, "allowed_regimes": ["all"],
+            "decision_score_threshold": 0.0,
         },
     )
     # Large, volatile up-moves -> big ATR -> tiny coin count -> sub-$10 notional.

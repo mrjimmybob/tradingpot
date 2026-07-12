@@ -126,6 +126,13 @@ def _normalize_trend_state(state: dict) -> dict:
         "exit_confirmation_count": 0,
         "tf_bars": [],
         "tf_current_bar": None,
+        # Added by the Strategy Decision Framework migration (Phase 2). All
+        # backfilled here so a state dict persisted before this migration
+        # (no framework keys) restores cleanly with safe defaults.
+        "tf_atr_history": [],          # rolling bar-ATR history for the adaptive resolver
+        "entry_price": None,           # LOCKED at entry - edge-management P&L attribution
+        "entry_stop_multiplier": None, # LOCKED adaptive ATR multiplier at entry
+        "regime_state": None,          # persisted bar-based regime (MarketSuitabilityGate)
     }
     for key, val in defaults.items():
         if key not in state:
@@ -2866,41 +2873,115 @@ class TradingEngine:
         params: dict,
         session: AsyncSession,
     ) -> Optional[TradeSignal]:
-        """Trend Following (time-series momentum) strategy - Institutional Grade.
+        """Trend Following (time-series momentum) strategy.
 
-        Conservative long-only momentum strategy using EMA crossover and ATR-based stops.
-        Hardened with noise-resistant entry/exit confirmation, locked entry ATR (prevents
-        risk expansion), and re-entry cooldown (prevents churn).
+        Migrated to the Strategy Decision Framework
+        (add-strategy-decision-framework, Phase 2 - see this change's
+        design.md/tasks.md, and audits/trend_following.md for the full
+        Strategy Audit Document). Complete decision flow:
 
-        Entry: price > EMA(long) AND EMA(short) > EMA(long), confirmed over N loops
-        Exit: price < EMA(long) (confirmed) OR trailing stop hit (immediate)
-        Trailing stop distance is LOCKED at entry ATR to ensure risk never increases.
+            Market Data
+                -> Market Suitability Gate (shared MarketSuitabilityGate -
+                   a HARD gate; refuses new entries in an unsuitable regime.
+                   The audit's most acute finding was that a STANDALONE
+                   trend_following bot had ZERO internal regime awareness -
+                   this gate is built from scratch here; Pillar 2)
+                -> Adaptive Parameter Resolver (shared
+                   AdaptiveParameterResolver - the ATR stop multiplier is
+                   resolved from the current ATR percentile every cycle,
+                   then LOCKED at entry; Pillar 4)
+                -> Evidence Collection (trend strength, price participation,
+                   confirmation persistence, volatility-normalized trend -
+                   all deterministic, all traced to the Theory section of
+                   the Strategy Audit Document; Pillar 3)
+                -> Evidence-Based Decision Score (shared DecisionScoreEngine),
+                   replacing the pre-migration boolean EMA-cross +
+                   confirmation-count gate
+                -> Strategy Edge Management (shared StrategyEdgeManager -
+                   refuses new entries once classified Category C; never
+                   force-closes an existing position; Pillar 7)
+                -> StrategyProposal (shared, immutable; Pillar 10)
+                -> Standalone Adapter (shared StandaloneAdapter - the ONLY
+                   place a StrategyProposal becomes the TradeSignal this
+                   function returns)
+                -> existing execution pipeline (UNCHANGED)
+
+        THEORY (Pillar 1 - see the Strategy Audit Document for the full
+        write-up): exploits the documented time-series-momentum anomaly.
+        Established trends persist longer than an efficient market would
+        allow because information diffuses gradually, trend-following flows
+        (CTAs, momentum funds) reinforce the move, and behavioral
+        herding/disposition effects delay full repricing. Long-only; enters
+        only WITH a confirmed up-trend (fast EMA above slow EMA AND price
+        above slow EMA), never counter-trend.
+
+        Entry: an Evidence-Based Decision Score over the up-trend evidence
+        clears its threshold, the regime is suitable, edge health is not
+        Category C, and re-entry cooldown has elapsed.
+        Exit: price < EMA(long) (confirmed over N loops) OR trailing stop hit
+        (immediate). Trailing stop distance is LOCKED at entry ATR x the
+        LOCKED adaptive multiplier, so risk never increases mid-trade.
 
         Parameters:
             short_period: EMA short period (default: 50)
-            long_period: EMA long period (default: 200)
-            atr_period: ATR period (default: 14)
-            atr_multiplier: ATR multiplier for stop loss (default: 2.0)
+            long_period: EMA long period (default: 100)
+            atr_period: ATR period in bars (default: 14)
+            atr_multiplier: BASE ATR stop-loss multiplier (default: 2.0) -
+                ADAPTIVE (Pillar 4): resolved every cycle via
+                AdaptiveParameterResolver.atr_percentile_scaled_multiplier
+                against current-bar-ATR-vs-its-own-20-bar-average, then
+                LOCKED at entry (risk never expands mid-trade).
+            min_atr_multiplier / max_atr_multiplier: bounds for the adaptive
+                resolution above (default: 1.0 / 4.0).
             risk_percent: Percent of capital to risk per trade (default: 1.0)
-            entry_confirmation_loops: Consecutive loops required for entry (default: 3)
-            exit_confirmation_loops: Consecutive loops required for exit (default: 2)
-            cooldown_seconds: Seconds to wait after exit before re-entry (default: 300)
+            entry_confirmation_loops: Consecutive loops the base up-trend
+                condition must persist to reach full "confirmation
+                persistence" Evidence (default: 3) - FIXED (Pillar 4): a
+                debounce count against noise, not a volatility-derived value.
+            exit_confirmation_loops: Consecutive loops required for a
+                trend-break exit (default: 2) - FIXED (Pillar 4).
+            cooldown_seconds: Seconds to wait after exit before re-entry
+                (default: 300) - FIXED (Pillar 4): an anti-churn debounce.
+            bar_interval_seconds: Time per bar for regime/ATR aggregation
+                (default: 60).
+            allowed_regimes: Regimes this strategy is suitable in (default:
+                ["trend_up", "volatility_expanding"]) - now a HARD gate
+                (Pillar 2) via the shared MarketSuitabilityGate, matching
+                _get_strategy_capabilities()'s own declaration for Auto
+                dispatch (both route through the SAME regime-tag convention).
+            decision_score_threshold: minimum Evidence-Based Decision Score
+                (0-100) required to enter (default: 40.0) - an initial,
+                certification-pending value; see the Strategy Audit
+                Document's before/after backtest comparison.
         """
         short_period = params.get("short_period", 50)
         long_period = params.get("long_period", 100)
         atr_period = params.get("atr_period", 14)
-        atr_multiplier = params.get("atr_multiplier", 2.0)
+        atr_mult_base = params.get("atr_multiplier", 2.0)
+        min_atr_mult = params.get("min_atr_multiplier", 1.0)
+        max_atr_mult = params.get("max_atr_multiplier", 4.0)
         risk_percent = params.get("risk_percent", 1.0) / 100
         entry_confirmation_loops = params.get("entry_confirmation_loops", 3)
         exit_confirmation_loops = params.get("exit_confirmation_loops", 2)
         cooldown_seconds = params.get("cooldown_seconds", 300)  # 5 minutes default
+        bar_interval_seconds = params.get("bar_interval_seconds", 60)
+        allowed_regimes = params.get("allowed_regimes", ["trend_up", "volatility_expanding"])
+        decision_score_threshold = params.get("decision_score_threshold", 40.0)
+        # ProposalValidity requires a strictly positive window; some test
+        # harnesses set bar_interval_seconds=0 ("close a bar every call").
+        _validity_interval_seconds = max(bar_interval_seconds, 1)
 
         # Normalize persisted state before any early-return so missing keys added
         # after state was first saved (e.g. tf_bars) are backfilled on every tick,
         # including the warmup ticks that return before reaching the trading logic.
         if not hasattr(self, "_trend_states"):
             self._trend_states = {}
+        if not hasattr(self, "_trend_following_edge_manager"):
+            # Pillar 7: one shared, continuous tracker for this strategy,
+            # keyed internally by (bot_id, strategy) - see edge_management.py.
+            self._trend_following_edge_manager = StrategyEdgeManager()
         state = _normalize_trend_state(self._trend_states.get(bot.id, {}))
+        edge_manager = self._trend_following_edge_manager
 
         # Get price history
         price_history = self._get_price_history(bot.id)
@@ -2951,7 +3032,6 @@ class TradingEngine:
         # |price[i] − price[i-1]| at 1 Hz → ATR ≈ $1-3 on BTC, placing stops
         # well inside the fee hurdle (guaranteed loss on every trade).
         # 60-second bar H-L ranges (~$50-200 on BTC) reflect actual volatility.
-        bar_interval_seconds = params.get("bar_interval_seconds", 60)
         _now = self.clock.now()
         if state.get("tf_current_bar") is None:
             state["tf_current_bar"] = {
@@ -2962,7 +3042,8 @@ class TradingEngine:
         _cb["high"] = max(_cb["high"], current_price)
         _cb["low"] = min(_cb["low"], current_price)
         _cb["close"] = current_price
-        if (_now - _cb["start_ts"]).total_seconds() >= bar_interval_seconds:
+        bar_completed = (_now - _cb["start_ts"]).total_seconds() >= bar_interval_seconds
+        if bar_completed:
             state["tf_bars"].append(dict(_cb))
             state["tf_bars"] = state["tf_bars"][-100:]
             state["tf_current_bar"] = {
@@ -2978,6 +3059,13 @@ class TradingEngine:
 
         tf_bars = state.get("tf_bars", [])
         bar_atr = _calc_bar_atr(tf_bars, atr_period)
+
+        # Track per-bar ATR history (only when a bar completes) so the
+        # adaptive stop-multiplier resolver (Pillar 4) has a current-vs-
+        # recent-average ATR ratio to scale by.
+        if bar_completed and bar_atr > 0:
+            state["tf_atr_history"].append(bar_atr)
+            state["tf_atr_history"] = state["tf_atr_history"][-100:]
 
         # Fee-coverage floor: when bar ATR is zero (not enough bars collected yet),
         # use a stop distance that at minimum covers the round-trip fee + safety.
@@ -2997,317 +3085,620 @@ class TradingEngine:
             f"ATR: ${atr:.2f}"
         )
 
-        # --- Structured decision explanation (observe-only) -----------------
-        # The exact EMA/ATR/confirmation math behind entry & exit. This is a
-        # pure EMA-cross + ATR-trailing-stop trend follower: it uses NO ADX and
-        # NO pullback metric, so neither is reported (we never invent a check).
-        exp = self._explain(bot.id)
-        ema_sep = ema_short - ema_long
-        ema_sep_pct = (ema_sep / ema_long * 100) if ema_long else 0.0
-        price_vs_long_pct = ((current_price - ema_long) / ema_long * 100) if ema_long else 0.0
-        tf_cd_remaining = 0
-        if state.get("last_exit_time") is not None:
-            tf_cd_remaining = max(
-                0,
-                int(cooldown_seconds - (self.clock.now() - state["last_exit_time"]).total_seconds()),
+        # === PILLAR 2: MARKET SUITABILITY GATE (shared, HARD-enforced) ===
+        # Built from scratch here - the audit's most acute finding was that a
+        # STANDALONE trend_following bot had ZERO internal regime awareness.
+        # Uses the same bar-based direction detector and regime-tag convention
+        # _strategy_auto / _is_strategy_eligible use, so this gate and Auto
+        # dispatch can never disagree about what "trend_up" means. Enforced as
+        # a hard NO_TRADE on entries below (never on exits).
+        current_regime = self._detect_market_regime_bar_based(
+            state.get("tf_bars", []), state.get("regime_state")
+        )
+        state["regime_state"] = current_regime
+        suitability = MarketSuitabilityGate().evaluate(current_regime, allowed_regimes)
+
+        # === PILLAR 4: ADAPTIVE PARAMETER RESOLVER ===
+        # Stop multiplier scales with current bar-ATR relative to its own
+        # 20-bar average - wider when volatility is currently elevated,
+        # tighter when calm. Resolved every cycle; LOCKED at entry so an open
+        # position's risk never expands mid-trade.
+        recent_atr_window = state.get("tf_atr_history", [])[-20:]
+        avg_atr = (sum(recent_atr_window) / len(recent_atr_window)) if recent_atr_window else bar_atr
+        atr_percentile = (bar_atr / avg_atr) if avg_atr > 0 else 1.0
+        resolved_stop = AdaptiveParameterResolver.atr_percentile_scaled_multiplier(
+            name="atr_multiplier",
+            atr_percentile=atr_percentile,
+            base_multiplier=atr_mult_base,
+            min_multiplier=min_atr_mult,
+            max_multiplier=max_atr_mult,
+        )
+        atr_stop_mult = resolved_stop.value
+
+        # === PILLAR 7: STRATEGY EDGE MANAGEMENT ===
+        # regime_outside_suitable_range comes from the Pillar 2 gate above.
+        # parameter_mismatch_evidence is cited only when bar-ATR has drifted
+        # far from the window the resolver's BASE multiplier implicitly
+        # assumes "normal" - a citation for a future Category B response,
+        # never a free-text guess.
+        parameter_mismatch_evidence = None
+        if atr_percentile > 1.5 or atr_percentile < 0.6:
+            parameter_mismatch_evidence = (
+                f"bar-ATR percentile {atr_percentile:.2f}x its 20-bar average - "
+                f"atr_multiplier base {atr_mult_base} may be miscalibrated for "
+                "sustained current volatility (the live value is already "
+                "adaptively resolved; sustained drift outside [0.6, 1.5] is "
+                "evidence the BASE itself may need certification-phase "
+                "recalibration)"
             )
-        exp.update({
-            "current_price": current_price,
-            "ema_fast": ema_short,
-            "ema_slow": ema_long,
-            "ema_distance": ema_sep,
-            "ema_distance_pct": ema_sep_pct,
-            "price_vs_slow_ema_pct": price_vs_long_pct,
-            "trend_strength_pct": ema_sep_pct,
-            "atr": atr,
-            "entry_confirmation_count": state.get("entry_confirmation_count", 0),
-            "exit_confirmation_count": state.get("exit_confirmation_count", 0),
-            "entry_threshold_loops": entry_confirmation_loops,
-            "exit_threshold_loops": exit_confirmation_loops,
-            "cooldown_seconds": cooldown_seconds,
-            "cooldown_remaining_s": tf_cd_remaining,
-            "trailing_stop": state.get("trailing_stop"),
-            "highest_price": state.get("highest_price"),
-            "has_position": has_position,
-        })
-        if not has_position:
-            _entry_cond = current_price > ema_long and ema_short > ema_long
-            _proj_conf = (state.get("entry_confirmation_count", 0) + 1) if _entry_cond else 0
-            exp.check("Cooldown", f"{tf_cd_remaining} sec remaining", f">= {cooldown_seconds} sec elapsed", tf_cd_remaining == 0)
-            exp.check("Price above slow EMA", current_price, f"> {ema_long:.2f}", current_price > ema_long, detail=f"{price_vs_long_pct:+.3f}%")
-            exp.check("EMA crossover (fast>slow)", ema_short, f"> {ema_long:.2f}", ema_short > ema_long, detail=f"sep {ema_sep:+.2f} ({ema_sep_pct:+.3f}%)")
-            exp.check("Entry confirmation", _proj_conf, f">= {entry_confirmation_loops} loops", _proj_conf >= entry_confirmation_loops)
-            if tf_cd_remaining > 0:
-                exp.state("COOLDOWN").next_trade(
-                    current=tf_cd_remaining, current_label="Cooldown remaining (s)",
-                    target=0, target_label="Ready", distance=tf_cd_remaining,
-                    status=f"{tf_cd_remaining}s until cooldown clears",
-                )
-            elif _entry_cond:
-                _need = max(0, entry_confirmation_loops - _proj_conf)
-                exp.state("WAITING_CONFIRMATION").next_trade(
-                    current=_proj_conf, current_label="Confirmations",
-                    target=entry_confirmation_loops, target_label="Required",
-                    distance=_need, status=f"{_need} more confirmation loop(s)",
-                )
-            else:
-                exp.state("WAITING_CROSSOVER").next_trade(
-                    current=ema_short, current_label="EMA Fast",
-                    target=ema_long, target_label="EMA Slow", distance=ema_sep,
-                    trigger="cross above zero",
-                    status=(f"{abs(ema_sep):.2f} points away from crossover"
-                            if ema_sep <= 0 else "EMA crossed — needs price above slow EMA"),
-                )
-        else:
+        edge_status = edge_manager.evaluate(
+            bot.id, "trend_following",
+            regime_outside_suitable_range=not suitability.is_suitable,
+            parameter_mismatch_evidence=parameter_mismatch_evidence,
+            now=self.clock.now(),
+        )
+
+        logger.debug(
+            f"Bot {bot.id}: Trend Following - Price: ${current_price:.2f}, "
+            f"EMA({short_period}): ${ema_short:.2f}, EMA({long_period}): ${ema_long:.2f}, "
+            f"ATR: ${atr:.2f}, Suitable: {suitability.is_suitable} "
+            f"({suitability.reason}), Edge: {edge_status.category.value}"
+        )
+
+        def _single_evidence_proposal(
+            *, direction: "Direction", execution_intent: "ExecutionIntent",
+            evidence_name: str, evidence_value: float, evidence_reason: str,
+            threshold: float, suggested_position_size: Optional[float] = None,
+            assumptions: tuple = (),
+        ) -> StrategyProposal:
+            """Shared helper for every branch that isn't the full multi-
+            factor entry evaluation: exits, holds, and suitability/cooldown/
+            edge-blocked no-trades. Each is a single, deterministic,
+            already-decided condition - a single Evidence Item correctly
+            represents that, per Pillar 3 (nothing subjective, it just isn't
+            MULTI-factor)."""
+            item = EvidenceItem(
+                name=evidence_name,
+                measurement=lambda d: evidence_value,
+                normalization=lambda r: r,
+                weight=100.0,
+                reason=evidence_reason,
+            )
+            score = DecisionScoreEngine().score(
+                "trend_following", [item], {}, threshold=threshold,
+            )
+            reasons_for, reasons_against = derive_reasons(score)
+            generated_at = self.clock.now()
+            return StrategyProposal(
+                strategy_id="trend_following",
+                bot_id=bot.id,
+                generated_at=generated_at,
+                direction=direction,
+                execution_intent=execution_intent,
+                validity=ProposalValidity(
+                    generated_at=generated_at,
+                    valid_until=generated_at + timedelta(seconds=_validity_interval_seconds),
+                ),
+                decision_score=score,
+                market_suitability=suitability,
+                edge_status=edge_status,
+                assumptions=assumptions,
+                reasons_for=reasons_for,
+                reasons_against=reasons_against,
+                suggested_position_size=suggested_position_size,
+                suggested_risk_budget_pct=risk_percent,
+                explanation=self._explain(bot.id).to_dict(),
+            )
+
+        # === PILLAR 6: CONTINUOUS TRADE MANAGEMENT (position open) ===
+        if has_position:
+            pos = positions[0]
+            _exp = self._explain(bot.id)
+            # CRITICAL: use LOCKED entry values (risk never expands mid-trade).
+            # Fallbacks cover legacy positions from before this migration.
+            entry_atr_locked = state.get("entry_atr") or atr
+            entry_stop_mult_locked = state.get("entry_stop_multiplier") or atr_stop_mult
+            entry_price_known = state.get("entry_price")
+            entry_time = state.get("entry_time")
+            holding_seconds = (
+                (self.clock.now() - entry_time).total_seconds()
+                if isinstance(entry_time, datetime) else 0.0
+            )
+            initial_risk_per_unit = entry_atr_locked * entry_stop_mult_locked
+
+            # Maintain the monotonic trailing stop using the LOCKED entry ATR x
+            # LOCKED adaptive multiplier (risk never expands).
+            if state["highest_price"] is None or current_price > state["highest_price"]:
+                state["highest_price"] = current_price
+                state["trailing_stop"] = current_price - (entry_atr_locked * entry_stop_mult_locked)
+                state["exit_confirmation_count"] = 0  # reset trend-break confirm on new high
+
             _ts = state.get("trailing_stop")
+            trailing_stop_hit = _ts is not None and current_price <= _ts
+            trend_break = current_price < ema_long
+            _proj_exit = (state.get("exit_confirmation_count", 0) + 1) if trend_break else 0
+
+            _exp.update({
+                "current_price": current_price,
+                "ema_fast": ema_short,
+                "ema_slow": ema_long,
+                "ema_distance": ema_short - ema_long,
+                "atr": atr,
+                "atr_percentile": atr_percentile,
+                "trailing_stop": _ts,
+                "highest_price": state.get("highest_price"),
+                "holding_seconds": holding_seconds,
+                "exit_confirmation_count": state.get("exit_confirmation_count", 0),
+                "exit_threshold_loops": exit_confirmation_loops,
+                "regime_tags": suitability.regime_tags,
+                "market_suitable": suitability.is_suitable,
+                "has_position": True,
+            })
+            _exp.metric("edge_status_category", edge_status.category.value)
             if _ts is not None:
-                exp.check("Trailing stop hit", current_price, f"<= {_ts:.2f}", current_price <= _ts)
-            _exit_cond = current_price < ema_long
-            _proj_exit = (state.get("exit_confirmation_count", 0) + 1) if _exit_cond else 0
-            exp.check(
+                _exp.check("Trailing stop hit", current_price, f"<= {_ts:.2f}", trailing_stop_hit)
+            _exp.check(
                 "Trend break (price < slow EMA)", current_price, f"< {ema_long:.2f}",
-                _exit_cond, detail=f"confirm {_proj_exit}/{exit_confirmation_loops}",
+                trend_break, detail=f"confirm {_proj_exit}/{exit_confirmation_loops}",
             )
-            exp.state("LONG_OPEN").next_trade(
+            _exp.state("LONG_OPEN").next_trade(
                 current=current_price, current_label="Current price",
                 target=(_ts if _ts is not None else ema_long),
                 target_label=("Trailing stop" if _ts is not None else "Slow EMA (exit)"),
                 distance=(current_price - _ts) if _ts is not None else (current_price - ema_long),
-                status=("holding — exits on trailing stop or confirmed trend break"),
+                status="holding — exits on trailing stop or confirmed trend break",
             )
-        # ---------------------------------------------------------------------
 
-        # Trading logic
-        if not has_position:
-            # No position - look for entry signal
+            def _record_exit_outcome() -> None:
+                # Pillar 7: record the outcome BEFORE state is cleared. Only
+                # when entry_price is actually known - a position with no
+                # locally-tracked entry (imported, or opened pre-migration)
+                # has no real P&L; a fabricated value would corrupt the
+                # StrategyEdgeManager's statistics.
+                if entry_price_known is None:
+                    return
+                pnl_per_unit = current_price - entry_price_known
+                reward_risk_realized = (
+                    (pnl_per_unit / initial_risk_per_unit) if initial_risk_per_unit > 0 else None
+                )
+                edge_manager.record_trade_outcome(
+                    bot.id, "trend_following",
+                    pnl=pnl_per_unit, win=(pnl_per_unit > 0),
+                    reward_risk_realized=reward_risk_realized,
+                    holding_seconds=holding_seconds, at=self.clock.now(),
+                )
 
-            # Check re-entry cooldown (anti-churn protection)
-            if state["last_exit_time"] is not None:
-                time_since_exit = (self.clock.now() - state["last_exit_time"]).total_seconds()
-                if time_since_exit < cooldown_seconds:
-                    remaining = int(cooldown_seconds - time_since_exit)
-                    return TradeSignal(
-                        action="hold",
-                        amount=0,
-                        reason=f"Trend Following: Re-entry cooldown active ({remaining}s remaining)"
-                    )
-
-            # Entry conditions: price > EMA(long) AND EMA(short) > EMA(long)
-            entry_conditions_met = current_price > ema_long and ema_short > ema_long
-
-            if entry_conditions_met:
-                # Entry hysteresis: require consecutive confirmations (noise defense)
-                state["entry_confirmation_count"] = state.get("entry_confirmation_count", 0) + 1
+            def _reset_position_state() -> None:
+                # Clear position keys but PRESERVE bar/regime history
+                # (tf_bars, tf_atr_history, tf_current_bar, regime_state) so
+                # the Pillar 2 regime gate does not have to re-warm from zero
+                # after every exit. Mirrors volatility_breakout's exit reset.
+                state["trailing_stop"] = None
+                state["highest_price"] = None
+                state["entry_atr"] = None
+                state["entry_stop_multiplier"] = None
+                state["entry_price"] = None
+                state["entry_time"] = None
+                state["last_exit_time"] = self.clock.now()
+                state["entry_confirmation_count"] = 0
+                state["exit_confirmation_count"] = 0
                 self._trend_states[bot.id] = state
 
-                if state["entry_confirmation_count"] < entry_confirmation_loops:
-                    return TradeSignal(
-                        action="hold",
-                        amount=0,
-                        reason=f"Trend Following: Entry confirmation {state['entry_confirmation_count']}/{entry_confirmation_loops}"
+            # Exit 1: trailing stop hit (hard stop - no confirmation needed).
+            if trailing_stop_hit:
+                logger.info(
+                    f"Bot {bot.id}: Trend Following EXIT (trailing stop) - "
+                    f"Price ${current_price:.2f} <= Stop ${_ts:.2f}, "
+                    f"Entry ATR: ${entry_atr_locked:.4f} x {entry_stop_mult_locked:.2f}"
+                )
+                _record_exit_outcome()
+                proposal = _single_evidence_proposal(
+                    direction=Direction.SELL,
+                    execution_intent=ExecutionIntent.CLOSE_POSITION,
+                    evidence_name="Trailing stop hit",
+                    evidence_value=1.0,
+                    evidence_reason=(
+                        f"Price ${current_price:.2f} <= locked trailing stop ${_ts:.2f} "
+                        "— risk control exit"
+                    ),
+                    threshold=1.0,
+                    suggested_position_size=pos.amount * current_price,
+                )
+                _reset_position_state()
+                return StandaloneAdapter.to_trade_signal(proposal)
+
+            # Exit 2: price below EMA(long) - trend break (requires confirmation).
+            if trend_break:
+                state["exit_confirmation_count"] = state.get("exit_confirmation_count", 0) + 1
+                self._trend_states[bot.id] = state
+                if state["exit_confirmation_count"] < exit_confirmation_loops:
+                    hold_proposal = _single_evidence_proposal(
+                        direction=Direction.HOLD,
+                        execution_intent=ExecutionIntent.HOLD_POSITION,
+                        evidence_name="Trend-break confirmation building",
+                        evidence_value=1.0,
+                        evidence_reason=(
+                            f"price < slow EMA for "
+                            f"{state['exit_confirmation_count']}/{exit_confirmation_loops} "
+                            "loops — not yet a confirmed trend break"
+                        ),
+                        threshold=1.0,
                     )
-
-                # Confirmed entry - proceed.
-                # Volatility-adjusted position sizing: risk a fixed % of capital;
-                # the ATR-based stop distance determines how many COINS that risk
-                # buys, which we convert to a quote-notional order.
-                #
-                # BUGFIX: the conversion to notional (* current_price) was
-                # missing, so position_size was a coin count used as if it were
-                # USD. On a high-priced asset that produced sub-$1 "orders"
-                # (rejected as < $10 minimum), and when ATR collapsed toward 0 it
-                # blew up and was silently capped at the whole balance.
-                risk_amount = bot.current_balance * risk_percent
-
-                if atr > 0:
-                    stop_distance = atr * atr_multiplier           # USD per coin
-                    position_coins = risk_amount / stop_distance   # base coins
-                    position_size = position_coins * current_price  # quote USD notional
-                else:
-                    # ATR unavailable (flat/illiquid): risk the nominal amount
-                    # rather than dividing by ~0.
-                    position_size = risk_amount
-
-                # Never deploy more than the available balance, less the
-                # execution cost buffer (fee + spread) so the simulated exchange
-                # cannot reject the order for insufficient funds.
-                buy_amount = min(position_size, bot.current_balance * _BUY_BALANCE_FRACTION)
-
-                # Minimum-order floor: a risk-based size below the exchange
-                # minimum cannot execute. Floor to the minimum when the balance
-                # can afford it; otherwise HOLD with a clear reason instead of
-                # emitting a doomed sub-minimum order that the engine rejects
-                # every loop (which presents as a stuck bot).
-                if buy_amount < MIN_ORDER_USD:
-                    if bot.current_balance >= MIN_ORDER_USD:
-                        buy_amount = MIN_ORDER_USD
-                    else:
-                        return TradeSignal(
-                            action="hold",
-                            amount=0,
-                            reason=(
-                                f"Trend Following: balance ${bot.current_balance:.2f} "
-                                f"below ${MIN_ORDER_USD:.0f} minimum order"
-                            ),
-                        )
+                    adapter_signal = StandaloneAdapter.to_trade_signal(hold_proposal)
+                    if adapter_signal is not None:
+                        return adapter_signal
+                    return TradeSignal(
+                        action="hold", amount=0,
+                        reason=(
+                            f"Trend Following: Exit confirmation "
+                            f"{state['exit_confirmation_count']}/{exit_confirmation_loops} (price < EMA)"
+                        ),
+                    )
 
                 logger.info(
-                    f"Bot {bot.id}: Trend Following ENTRY - "
-                    f"Price ${current_price:.2f} > EMA({long_period}) ${ema_long:.2f}, "
-                    f"EMA({short_period}) ${ema_short:.2f} > EMA({long_period}), "
-                    f"Entry ATR: ${atr:.4f}, Position: ${buy_amount:.2f}"
+                    f"Bot {bot.id}: Trend Following EXIT (trend break confirmed) - "
+                    f"Price ${current_price:.2f} < EMA({long_period}) ${ema_long:.2f}, "
+                    f"Confirmed over {exit_confirmation_loops} loops"
                 )
-
-                # Initialize state with LOCKED entry_atr (risk must never increase)
-                trailing_stop_price = current_price - (atr * atr_multiplier)
-                self._trend_states[bot.id] = {
-                    "trailing_stop": trailing_stop_price,
-                    "highest_price": current_price,
-                    "entry_atr": atr,  # LOCKED - trailing stop distance will always use this
-                    "entry_time": self.clock.now(),
-                    "last_exit_time": None,
-                    "entry_confirmation_count": 0,
-                    "exit_confirmation_count": 0,
-                }
-
-                return TradeSignal(
-                    action="buy",
-                    amount=buy_amount,
-                    order_type="market",
-                    reason=f"Trend Following: Bullish trend confirmed ({entry_confirmation_loops} loops)",
-                    expected_move_pct=(
-                        (atr * atr_multiplier) / current_price if current_price > 0 else None
+                _record_exit_outcome()
+                proposal = _single_evidence_proposal(
+                    direction=Direction.SELL,
+                    execution_intent=ExecutionIntent.CLOSE_POSITION,
+                    evidence_name="Confirmed trend break",
+                    evidence_value=1.0,
+                    evidence_reason=(
+                        f"Price ${current_price:.2f} < slow EMA ${ema_long:.2f}, confirmed "
+                        f"over {exit_confirmation_loops} loops — the trend thesis has broken"
                     ),
+                    threshold=1.0,
+                    suggested_position_size=pos.amount * current_price,
                 )
-            else:
-                # Entry conditions not met - reset confirmation counter
-                state["entry_confirmation_count"] = 0
-                self._trend_states[bot.id] = state
+                _reset_position_state()
+                return StandaloneAdapter.to_trade_signal(proposal)
 
-            # Check entry conditions and provide feedback
-            if current_price <= ema_long:
-                return TradeSignal(
-                    action="hold",
-                    amount=0,
-                    reason=f"Trend Following: Price ${current_price:.2f} below EMA({long_period}) ${ema_long:.2f}"
-                )
-            elif ema_short <= ema_long:
-                return TradeSignal(
-                    action="hold",
-                    amount=0,
-                    reason=f"Trend Following: Waiting for EMA crossover (short ${ema_short:.2f} <= long ${ema_long:.2f})"
-                )
-            else:
-                return TradeSignal(
-                    action="hold",
-                    amount=0,
-                    reason="Trend Following: Waiting for entry conditions"
-                )
+            # No exit this tick - price still above slow EMA: reset the
+            # trend-break confirmation counter and hold.
+            state["exit_confirmation_count"] = 0
+            self._trend_states[bot.id] = state
 
-        else:
-            # Have position - manage exit
-            for pos in positions:
-                # CRITICAL: Use LOCKED entry_atr for trailing stop distance (risk must never increase)
-                # state.get("entry_atr", atr) is NOT a working fallback: the
-                # normalizer always pre-populates this key (as None), so the
-                # default arg never fires and a legacy/state-mismatched
-                # position crashes downstream on `None * atr_multiplier`.
-                entry_atr_locked = state.get("entry_atr") or atr  # Fallback to current ATR for legacy positions
-
-                # Update trailing stop if price made new high
-                # Trailing stop distance is ALWAYS based on entry_atr, not current ATR
-                if state["highest_price"] is None or current_price > state["highest_price"]:
-                    state["highest_price"] = current_price
-                    state["trailing_stop"] = current_price - (entry_atr_locked * atr_multiplier)
-                    state["exit_confirmation_count"] = 0  # Reset exit confirmation on new high
-                    self._trend_states[bot.id] = state
-
-                # Exit condition 1: Trailing stop hit (hard stop - no confirmation needed)
-                if state["trailing_stop"] is not None and current_price <= state["trailing_stop"]:
-                    sell_amount = pos.amount * current_price
-
-                    logger.info(
-                        f"Bot {bot.id}: Trend Following EXIT (trailing stop) - "
-                        f"Price ${current_price:.2f} <= Stop ${state['trailing_stop']:.2f}, "
-                        f"Entry ATR: ${entry_atr_locked:.4f}"
-                    )
-
-                    # Set last_exit_time for cooldown, reset state
-                    self._trend_states[bot.id] = {
-                        "trailing_stop": None,
-                        "highest_price": None,
-                        "entry_atr": None,
-                        "entry_time": None,
-                        "last_exit_time": self.clock.now(),
-                        "entry_confirmation_count": 0,
-                        "exit_confirmation_count": 0,
-                    }
-
-                    return TradeSignal(
-                        action="sell",
-                        amount=sell_amount,
-                        order_type="market",
-                        reason=f"Trend Following: Exit on trailing stop (${state['trailing_stop']:.2f})",
-                    )
-
-                # Exit condition 2: Price below EMA(long) - trend break (requires confirmation)
-                if current_price < ema_long:
-                    # Exit confirmation: require consecutive loops (anti-whipsaw)
-                    state["exit_confirmation_count"] = state.get("exit_confirmation_count", 0) + 1
-                    self._trend_states[bot.id] = state
-
-                    if state["exit_confirmation_count"] < exit_confirmation_loops:
-                        return TradeSignal(
-                            action="hold",
-                            amount=0,
-                            reason=f"Trend Following: Exit confirmation {state['exit_confirmation_count']}/{exit_confirmation_loops} (price < EMA)"
-                        )
-
-                    # Confirmed exit
-                    sell_amount = pos.amount * current_price
-
-                    logger.info(
-                        f"Bot {bot.id}: Trend Following EXIT (trend break confirmed) - "
-                        f"Price ${current_price:.2f} < EMA({long_period}) ${ema_long:.2f}, "
-                        f"Confirmed over {exit_confirmation_loops} loops"
-                    )
-
-                    # Set last_exit_time for cooldown, reset state
-                    self._trend_states[bot.id] = {
-                        "trailing_stop": None,
-                        "highest_price": None,
-                        "entry_atr": None,
-                        "entry_time": None,
-                        "last_exit_time": self.clock.now(),
-                        "entry_confirmation_count": 0,
-                        "exit_confirmation_count": 0,
-                    }
-
-                    return TradeSignal(
-                        action="sell",
-                        amount=sell_amount,
-                        order_type="market",
-                        reason=f"Trend Following: Exit on confirmed trend break (price < EMA({long_period}))",
-                    )
-                else:
-                    # Price still above EMA(long) - reset exit confirmation
-                    state["exit_confirmation_count"] = 0
-                    self._trend_states[bot.id] = state
-
-            # Hold position - trend still valid.
-            # A conditional inside an f-string format spec ({x:.2f if ...}) is a
-            # ValueError ("Invalid format specifier"), raised on EVERY hold tick
-            # once a position is open -> the failure breaker pauses the bot.
-            # Format the optional stop outside the f-string.
+            hold_proposal = _single_evidence_proposal(
+                direction=Direction.HOLD,
+                execution_intent=ExecutionIntent.HOLD_POSITION,
+                evidence_name="Trend intact",
+                evidence_value=1.0,
+                evidence_reason=(
+                    "price above the slow EMA and trailing stop not hit — the "
+                    "up-trend thesis still holds"
+                ),
+                threshold=1.0,
+                assumptions=(
+                    "trend direction unchanged: price remains above the slow "
+                    "EMA and the locked trailing stop is not hit",
+                ),
+            )
+            adapter_signal = StandaloneAdapter.to_trade_signal(hold_proposal)
+            if adapter_signal is not None:
+                return adapter_signal
+            # A conditional inside an f-string format spec is a ValueError
+            # ("Invalid format specifier"); format the optional stop outside it.
             stop_str = (
                 f"${state['trailing_stop']:.2f}"
                 if state["trailing_stop"] is not None else "N/A"
             )
+            reason_text = "; ".join(hold_proposal.reasons_for) or "trend still valid"
             return TradeSignal(
-                action="hold",
-                amount=0,
-                reason=f"Trend Following: Holding position, stop at {stop_str}"
+                action="hold", amount=0,
+                reason=f"Trend Following: Holding position, stop at {stop_str} ({reason_text})",
             )
+
+        # === ENTRY SIDE (no position) ===
+        exp = self._explain(bot.id)
+
+        # Re-entry cooldown (anti-churn) - computed as a blocking reason below,
+        # not a separate early return, so the Evidence/edge diagnostics are
+        # still produced every cycle.
+        cooldown_remaining = 0
+        if state.get("last_exit_time") is not None:
+            elapsed = (self.clock.now() - state["last_exit_time"]).total_seconds()
+            if elapsed < cooldown_seconds:
+                cooldown_remaining = int(cooldown_seconds - elapsed)
+
+        # Base up-trend condition drives the confirmation-persistence counter
+        # (folded into the Decision Score below as an Evidence Item, replacing
+        # the pre-migration hard N-loop gate).
+        base_trend_ok = current_price > ema_long and ema_short > ema_long
+        if base_trend_ok:
+            state["entry_confirmation_count"] = state.get("entry_confirmation_count", 0) + 1
+        else:
+            state["entry_confirmation_count"] = 0
+        confirmation_count = state["entry_confirmation_count"]
+
+        # === PILLAR 3: EVIDENCE COLLECTION ===
+        trend_strength_frac = (ema_short - ema_long) / ema_long if ema_long else 0.0
+        price_participation_frac = (current_price - ema_long) / ema_long if ema_long else 0.0
+        confirmation_ratio = (
+            confirmation_count / entry_confirmation_loops if entry_confirmation_loops > 0 else 0.0
+        )
+        trend_atr_units = (ema_short - ema_long) / atr if atr > 0 else 0.0
+
+        evidence_items = [
+            EvidenceItem(
+                name="Trend strength",
+                measurement=lambda d: trend_strength_frac,
+                normalization=lambda r: max(-1.0, min(1.0, r / 0.02)),
+                weight=35.0,
+                reason=(
+                    "Theory (time-series momentum): the core signal is the fast "
+                    "EMA leading the slow EMA. A larger separation (as a fraction "
+                    "of the slow EMA) is a more established trend, which the "
+                    "momentum anomaly says is more likely to persist; a negative "
+                    "separation is counter-trend and correctly scores against entry."
+                ),
+            ),
+            EvidenceItem(
+                name="Price participation",
+                measurement=lambda d: price_participation_frac,
+                normalization=lambda r: max(-1.0, min(1.0, r / 0.02)),
+                weight=25.0,
+                reason=(
+                    "Theory: price itself must participate in the trend, not just "
+                    "the smoothed EMAs. Price above the slow EMA confirms the "
+                    "up-trend is current; price below it (even with EMAs still "
+                    "ordered up) is early evidence the move is fading."
+                ),
+            ),
+            EvidenceItem(
+                name="Confirmation persistence",
+                measurement=lambda d: confirmation_ratio,
+                normalization=lambda r: max(-1.0, min(1.0, r)),
+                weight=20.0,
+                reason=(
+                    "Theory: a momentum signal that persists across consecutive "
+                    "bars is less likely to be noise than a single-bar flicker. "
+                    "This is the noise defense the pre-migration confirmation-loop "
+                    "gate provided, now expressed as measurable evidence rather "
+                    "than a hard boolean count."
+                ),
+            ),
+            EvidenceItem(
+                name="Volatility-normalized trend",
+                measurement=lambda d: trend_atr_units,
+                normalization=lambda r: max(-1.0, min(1.0, r / 1.0)),
+                weight=20.0,
+                reason=(
+                    "Theory: the EMA separation must be meaningful relative to "
+                    "current noise, not just relative to price level. Measuring "
+                    "separation in ATR units confirms the trend stands out above "
+                    "the bar-to-bar volatility, independent of the percentage "
+                    "measure above."
+                ),
+            ),
+        ]
+
+        # === PILLAR 3: EVIDENCE-BASED DECISION SCORE ===
+        decision_score = DecisionScoreEngine().score(
+            "trend_following", evidence_items, {}, threshold=decision_score_threshold,
+        )
+        edge_manager.record_decision_score(bot.id, "trend_following", decision_score.total)
+        reasons_for, reasons_against = derive_reasons(decision_score)
+        assumptions = (
+            "trend direction unchanged: fast EMA remains above slow EMA "
+            "(EMA ordering not reversed)",
+            "price remains above the slow EMA (participation in the trend holds)",
+            "current market regime remains within the strategy's allowed set",
+        )
+
+        # --- Structured decision explanation (observe-only) ---
+        exp.update({
+            "current_price": current_price,
+            "ema_fast": ema_short,
+            "ema_slow": ema_long,
+            "ema_distance": ema_short - ema_long,
+            "ema_distance_pct": trend_strength_frac * 100,
+            "price_vs_slow_ema_pct": price_participation_frac * 100,
+            "atr": atr,
+            "atr_percentile": atr_percentile,
+            "effective_stop_multiplier": atr_stop_mult,
+            "entry_confirmation_count": confirmation_count,
+            "entry_threshold_loops": entry_confirmation_loops,
+            "cooldown_seconds": cooldown_seconds,
+            "cooldown_remaining_s": cooldown_remaining,
+            "regime_tags": suitability.regime_tags,
+            "market_suitable": suitability.is_suitable,
+            "has_position": False,
+        })
+        exp.metric("edge_status_category", edge_status.category.value)
+        exp.metric("decision_score_total", decision_score.total)
+        exp.metric("decision_score_threshold", decision_score_threshold)
+        exp.check(
+            "Cooldown", f"{cooldown_remaining} sec remaining",
+            f">= {cooldown_seconds} sec elapsed", cooldown_remaining == 0,
+        )
+        exp.check(
+            "Market suitability", suitability.is_suitable, "must be True",
+            suitability.is_suitable, detail=suitability.reason,
+        )
+        exp.check(
+            "Decision Score clears threshold", decision_score.total,
+            f">= {decision_score_threshold:.1f}", decision_score.approved,
+        )
+        exp.check(
+            "Strategy edge not disqualified", edge_status.category.value,
+            f"!= {EdgeCategory.C.value}", edge_status.category != EdgeCategory.C,
+            detail=edge_status.reason,
+        )
+
+        # === PILLAR 2/3/7 GATES: any blocking reason -> NO_TRADE ===
+        blocking_reasons = []
+        if not suitability.is_suitable:
+            blocking_reasons.append(f"regime unsuitable ({suitability.reason})")
+        if not decision_score.approved:
+            blocking_reasons.append(
+                f"Decision Score {decision_score.total:.1f} < threshold {decision_score_threshold:.1f}"
+            )
+        if edge_status.category == EdgeCategory.C:
+            blocking_reasons.append(f"Strategy Edge Management: Category C - {edge_status.reason}")
+        if cooldown_remaining > 0:
+            blocking_reasons.append(f"re-entry cooldown active ({cooldown_remaining}s remaining)")
+
+        if blocking_reasons:
+            if base_trend_ok and decision_score.approved and suitability.is_suitable:
+                exp.state("WAITING_COOLDOWN")
+            elif base_trend_ok:
+                exp.state("WAITING_CONFIRMATION").next_trade(
+                    current=confirmation_count, current_label="Confirmations",
+                    target=entry_confirmation_loops, target_label="Required",
+                    distance=max(0, entry_confirmation_loops - confirmation_count),
+                    status=f"score {decision_score.total:.1f}/{decision_score_threshold:.1f}",
+                )
+            else:
+                exp.state("WAITING_TREND").next_trade(
+                    current=ema_short, current_label="EMA Fast", target=ema_long,
+                    target_label="EMA Slow", distance=ema_short - ema_long,
+                    status="waiting for an up-trend (fast EMA above slow EMA, price above slow EMA)",
+                )
+            self._trend_states[bot.id] = state
+            generated_at = self.clock.now()
+            proposal = StrategyProposal(
+                strategy_id="trend_following", bot_id=bot.id, generated_at=generated_at,
+                direction=Direction.NO_TRADE, execution_intent=ExecutionIntent.NO_ACTION,
+                validity=ProposalValidity(
+                    generated_at=generated_at,
+                    valid_until=generated_at + timedelta(seconds=_validity_interval_seconds),
+                ),
+                decision_score=decision_score, market_suitability=suitability, edge_status=edge_status,
+                assumptions=assumptions, reasons_for=reasons_for, reasons_against=reasons_against,
+                suggested_risk_budget_pct=risk_percent,
+                adaptive_parameters_used={"atr_multiplier": atr_stop_mult},
+                explanation=exp.to_dict(),
+            )
+            adapter_signal = StandaloneAdapter.to_trade_signal(proposal)
+            if adapter_signal is not None:
+                return adapter_signal
+            reason_text = "; ".join(blocking_reasons)
+            return TradeSignal(
+                action="hold", amount=0,
+                reason=f"Trend Following: {reason_text} (score {decision_score.total:.1f}/{decision_score_threshold:.1f})",
+            )
+
+        # === PILLAR 5: DECISION-SCORE-WEIGHTED POSITION SIZING ===
+        # A marginal-score trade (just above threshold) sizes toward 0.5x; a
+        # maximal-score trade toward 1.5x. Deterministic and reproducible -
+        # not a separate, unaccountable scaling knob. (add-unified-position-
+        # sizing will consolidate this into a shared cross-strategy function;
+        # this is this strategy's certification-phase implementation until then.)
+        score_range = max(100.0 - decision_score_threshold, 1e-9)
+        score_margin = max(0.0, min(1.0, (decision_score.total - decision_score_threshold) / score_range))
+        size_multiplier = 0.5 + score_margin
+        exp.metric("decision_score_size_multiplier", size_multiplier)
+
+        risk_amount = bot.current_balance * risk_percent * size_multiplier
+        if atr > 0:
+            stop_distance = atr * atr_stop_mult             # USD per coin (LOCKED-at-entry multiplier)
+            position_coins = risk_amount / stop_distance    # base coins
+            position_size = position_coins * current_price  # quote USD notional
+        else:
+            position_size = risk_amount
+
+        buy_amount = min(position_size, bot.current_balance * _BUY_BALANCE_FRACTION)
+
+        # Pillar 8: sizing is a decision point - surface it as a check.
+        if buy_amount < MIN_ORDER_USD:
+            if bot.current_balance >= MIN_ORDER_USD:
+                buy_amount = MIN_ORDER_USD
+            else:
+                exp.check(
+                    "Position size >= min order", buy_amount, f">= {MIN_ORDER_USD:.0f}", False,
+                )
+                self._trend_states[bot.id] = state
+                return TradeSignal(
+                    action="hold", amount=0,
+                    reason=(
+                        f"Trend Following: balance ${bot.current_balance:.2f} "
+                        f"below ${MIN_ORDER_USD:.0f} minimum order"
+                    ),
+                )
+        exp.check("Position size >= min order", buy_amount, f">= {MIN_ORDER_USD:.0f}", True)
+
+        # Pillar 8: fee-viability gate as an explicit check. Expected move is
+        # the locked stop distance as a fraction of price (the pre-migration
+        # expected_move_pct convention); by construction of the ATR fee-floor
+        # this clears the fee hurdle, but it is now surfaced, not implicit.
+        _tf_expected_move = (atr * atr_stop_mult) / current_price if current_price > 0 else 0.0
+        _fee_raw_tf2 = getattr(bot, 'exchange_fee', 0.1)
+        _tf_fee_pct = (
+            float(_fee_raw_tf2) if isinstance(_fee_raw_tf2, (int, float)) else 0.1
+        ) / 100.0
+        _tf_min_move = 2.0 * _tf_fee_pct + _VIABILITY_SAFETY_MARGIN_PCT
+        exp.check(
+            "Fee viability", _tf_expected_move, f">= {_tf_min_move:.5f}",
+            _tf_expected_move >= _tf_min_move,
+        )
+        if _tf_expected_move < _tf_min_move:
+            self._trend_states[bot.id] = state
+            return TradeSignal(
+                action="hold", amount=0,
+                reason=(
+                    f"Trend Following: stop distance {_tf_expected_move * 100:.3f}% < "
+                    f"fee threshold {_tf_min_move * 100:.3f}% (exchange_fee={_tf_fee_pct * 100:.2f}%)"
+                ),
+            )
+
+        # Pillar 8: initial stop placement is a decision point - surface it.
+        entry_stop_distance = atr * atr_stop_mult
+        trailing_stop_price = current_price - entry_stop_distance
+        exp.check(
+            "Initial stop below entry", trailing_stop_price, f"< {current_price:.2f}",
+            trailing_stop_price < current_price,
+        )
+        exp.state("ENTRY_ARMED")
+
+        # === PILLAR 10: STRATEGYPROPOSAL ===
+        generated_at = self.clock.now()
+        proposal = StrategyProposal(
+            strategy_id="trend_following", bot_id=bot.id, generated_at=generated_at,
+            direction=Direction.BUY, execution_intent=ExecutionIntent.OPEN_POSITION,
+            validity=ProposalValidity(
+                generated_at=generated_at,
+                valid_until=generated_at + timedelta(seconds=_validity_interval_seconds),
+            ),
+            decision_score=decision_score, market_suitability=suitability, edge_status=edge_status,
+            assumptions=assumptions, reasons_for=reasons_for, reasons_against=reasons_against,
+            suggested_position_size=buy_amount, suggested_risk_budget_pct=risk_percent * size_multiplier,
+            expected_holding_horizon="long",
+            adaptive_parameters_used={
+                "atr_multiplier": atr_stop_mult,
+                "decision_score_size_multiplier": size_multiplier,
+            },
+            explanation=exp.to_dict(),
+        )
+
+        logger.info(
+            f"Bot {bot.id}: Trend Following ENTRY - "
+            f"Decision Score {decision_score.total:.1f}/{decision_score_threshold:.1f}, "
+            f"Price ${current_price:.2f} > EMA({long_period}) ${ema_long:.2f}, "
+            f"EMA({short_period}) ${ema_short:.2f} > EMA({long_period}), "
+            f"Entry ATR locked ${atr:.4f} x {atr_stop_mult:.2f}, Position: ${buy_amount:.2f}"
+        )
+
+        # Lock entry state (risk never expands mid-trade) - including the
+        # LIVE-resolved adaptive stop multiplier. entry_time stays a datetime
+        # (JSON-roundtrip-safe via _to_jsonable, and the state-persistence
+        # regression suite asserts datetime fidelity for this key).
+        state["trailing_stop"] = trailing_stop_price
+        state["highest_price"] = current_price
+        state["entry_price"] = current_price
+        state["entry_atr"] = atr
+        state["entry_stop_multiplier"] = atr_stop_mult
+        state["entry_time"] = self.clock.now()
+        state["last_exit_time"] = None
+        state["entry_confirmation_count"] = 0
+        state["exit_confirmation_count"] = 0
+        self._trend_states[bot.id] = state
+
+        return StandaloneAdapter.to_trade_signal(
+            proposal, expected_move_pct=_tf_expected_move,
+        )
 
     async def _strategy_volatility_breakout(
         self,

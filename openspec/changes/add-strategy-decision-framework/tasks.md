@@ -237,26 +237,45 @@ sizing/viability gap; P5 needs a Decision Score input.
 
 ## Phase 2 — trend_following (highest-urgency zero-suitability strategy)
 
+**Status: ✓ Complete (9/9), Under review** (see `audits/trend_following.md`'s
+Certification Checklist — implementation and testing done; the doc's own
+"Under review" status is pending human sign-off). Migrated in
+`backend/app/services/trading_engine.py` (`_strategy_trend_following`, now
+wired through `MarketSuitabilityGate`, `AdaptiveParameterResolver`,
+`DecisionScoreEngine`, `StrategyEdgeManager`, `StrategyProposal`, and
+`StandaloneAdapter` — the full decision flow, no shortcuts, no duplicated
+framework logic). 16 new tests
+(`backend/tests/test_trend_following_framework_migration.py`, 7 classes
+covering Evidence Generation, Decision Score, Market Suitability, Edge
+Management, Proposal Generation, Standalone Adapter Compatibility, and Exit
+Paths/Regressions); `test_strategy_validation.py`'s two trend_following
+sizing tests and `test_trade_viability.py`'s `_TF_PARAMS` updated to isolate
+the sizing/ATR-viability path from the new Pillar 2/3 gates (permissive
+`allowed_regimes=["all"]` + `decision_score_threshold=0.0`, mirroring
+mean_reversion's `regime_filter_enabled: False` convention). Full suite:
+1169/1169 passing, zero regressions. Before/after backtest run across bull/
+bear/chop windows — see `audits/trend_following.md`'s Backtesting section.
+
 See `audits/trend_following.md`. Gaps: P1, P2 (zero, build from scratch),
 P3, P4 (beyond stop), P7, P9; P8 sizing/stop gap; P5 needs a Decision
 Score input; fix the `long_period` docstring/code mismatch (2842 says 200,
 code uses 100) while touching this strategy.
 
-- [ ] 2.1 Author theory (P1) and performance expectations (P9).
-- [ ] 2.2 Build and wire a `MarketSuitabilityGate` (Phase 0.1) - this
+- [x] 2.1 Author theory (P1) and performance expectations (P9).
+- [x] 2.2 Build and wire a `MarketSuitabilityGate` (Phase 0.1) - this
       strategy has no internal regime awareness at all today.
-- [ ] 2.3 Replace the dual EMA-cross-plus-confirmation-count entry with a
+- [x] 2.3 Replace the dual EMA-cross-plus-confirmation-count entry with a
       `DecisionScoreEngine` call, defining Evidence Items for trend
       maturity/strength, confirmation strength, and any other measurable
       factors from the theory doc, each with documented Measurement/
       Normalization/Weight.
-- [ ] 2.4 Fix the `long_period` docstring/code mismatch.
-- [ ] 2.5 Wire `StrategyEdgeManager` before entry; define this strategy's
+- [x] 2.4 Fix the `long_period` docstring/code mismatch.
+- [x] 2.5 Wire `StrategyEdgeManager` before entry; define this strategy's
       specific Category A/B/C signal thresholds.
-- [ ] 2.6 Wire Decision-Score-weighted sizing.
-- [ ] 2.7 Close Pillar 8 gaps: sizing calculation and initial stop
+- [x] 2.6 Wire Decision-Score-weighted sizing.
+- [x] 2.7 Close Pillar 8 gaps: sizing calculation and initial stop
       placement need `.check()` calls; verify the Evidence Report.
-- [ ] 2.8 Migrate this strategy's return type from `TradeSignal` to
+- [x] 2.8 Migrate this strategy's return type from `TradeSignal` to
       `StrategyProposal`, including this strategy's `execution_intent`
       mapping (trend-confirmed entry -> OPEN_POSITION, EMA-cross-against-
       trend exit -> CLOSE_POSITION), a `validity.valid_until` matching its
@@ -264,7 +283,7 @@ code uses 100) while touching this strategy.
       "trend direction unchanged, EMA ordering not reversed"); verify
       standalone execution via the Standalone Adapter is behavior-identical
       to the pre-migration path.
-- [ ] 2.9 Certification review; before/after backtest comparison.
+- [x] 2.9 Certification review; before/after backtest comparison.
 
 ## Phase 3 — dip_recovery (zero suitability, but best overall foundation)
 

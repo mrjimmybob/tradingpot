@@ -107,6 +107,15 @@ _TF_PARAMS = {
     # bar_interval_seconds=0 ensures every call closes the in-progress bar so
     # we can test bar-count boundaries without real-time waiting.
     "bar_interval_seconds": 0,
+    # These tests isolate the ATR fee-viability/sizing logic from the Strategy
+    # Decision Framework's Pillar 2 (regime) and Pillar 3 (Decision Score)
+    # gates, which have their own dedicated coverage in
+    # test_trend_following_framework_migration.py. allowed_regimes=["all"]
+    # makes the suitability gate always pass; threshold 0.0 makes any positive
+    # up-trend evidence sufficient - so the ATR/viability path under test is
+    # reached regardless of the synthetic fixtures' regime character.
+    "allowed_regimes": ["all"],
+    "decision_score_threshold": 0.0,
 }
 
 
