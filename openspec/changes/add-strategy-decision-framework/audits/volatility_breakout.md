@@ -357,10 +357,22 @@ bar's fill price) rather than the engine's `amount=0`/`None` "close
 everything" sentinel — a decision-to-fill price gap of even a fraction of
 a cent leaves float dust in the portfolio ledger that the DB-position side
 doesn't see, permanently breaking closed-trade accounting for that ledger.
-This is a **pre-existing bug in the shared backtest engine**, reproduced
+This was a **pre-existing bug in the shared backtest engine**, reproduced
 identically on the pre-migration code (this phase did not introduce it,
 and did not fix it — out of scope per this phase's Architecture Freeze;
 flagged here as a candidate follow-up for whoever owns `app/backtesting/`).
+
+**RESOLVED (pre-Phase-2 infrastructure review)**: fixed in
+`backend/app/backtesting/engine.py::_apply_signal` — the sell path now
+resolves the exit's base quantity against the DECISION price (the price
+the strategy saw and multiplied by), mirroring production's
+`_execute_trade` STEP 2.5, instead of dividing the exit notional by the
+fill price. Full-position exits now settle to zero and record their closed
+round-trip exactly. Regression test:
+`tests/test_backtesting_engine.py::TestFullCloseAccounting::
+test_full_close_records_trade_when_fill_price_rises`. The round-trip counts
+in the table below were captured under the buggy accounting and are left
+as the honest historical record of this run; they are not re-derived here.
 Ending balance, return %, and total fees ARE reliable regardless (cash/
 equity update on every fill, independent of the closed-trade list) — the
 table below uses those, plus the bull window's traced round-trip count
@@ -526,4 +538,5 @@ review alone — see the Backtesting section above for full detail):
     performance measurable by the tooling that reports on it — this is a
     latent gap in that tooling, out of this phase's scope
     (`backend/app/backtesting/`, not `strategy_framework/`) but worth a
-    follow-up change.
+    follow-up change. **RESOLVED in the pre-Phase-2 infrastructure review**
+    — see the Backtesting section's "RESOLVED" note above.

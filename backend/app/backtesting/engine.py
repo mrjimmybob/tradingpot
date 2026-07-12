@@ -227,7 +227,7 @@ class BacktestEngine:
                         fill_candle = candles[i + 1]  # first access, decision already made
                         await self._apply_signal(
                             engine, session, bot, portfolio, strategy,
-                            signal, fill_candle,
+                            signal, fill_candle, decision_candle.close,
                         )
                         await session.flush()
 
@@ -273,6 +273,7 @@ class BacktestEngine:
         strategy: str,
         signal,
         fill_candle: Candle,
+        decision_price: Optional[float] = None,
     ) -> None:
         if signal.action == "buy":
             # Strategies compute a concrete USD notional for every buy signal
@@ -308,9 +309,24 @@ class BacktestEngine:
         else:  # sell
             if not portfolio.has_position:
                 return
+            # Resolve the sell's base quantity against the DECISION price, not
+            # the fill price - mirroring production's _execute_trade STEP 2.5
+            # (``sell_base = min(signal.amount / current_price, position_amount)``
+            # where current_price is the price the strategy saw). Strategies
+            # encode a full-position exit as ``pos.amount * current_price`` (a
+            # quote notional at the decision price); dividing that back by the
+            # *fill* candle's open - a different, later price under strict
+            # no-lookahead - yields base != position on any price move, so a
+            # full close under-sells and leaves float dust above apply_sell's
+            # close threshold, permanently breaking closed-trade accounting
+            # (the round trip is never recorded). Dividing by the same decision
+            # price the strategy multiplied by recovers the position exactly,
+            # and the ``min`` clamp settles any float overshoot - identical to
+            # production. The fill still executes at fill_candle.open below.
+            conversion_price = decision_price if decision_price else fill_candle.open
             amount_base = (
                 portfolio.base_amount if not signal.amount or signal.amount <= 0
-                else min(signal.amount / fill_candle.open, portfolio.base_amount)
+                else min(signal.amount / conversion_price, portfolio.base_amount)
             )
             if amount_base <= 0:
                 return

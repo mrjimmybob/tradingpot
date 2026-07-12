@@ -113,6 +113,94 @@ class TestReplayCorrectness:
         assert portfolio.entry_price != decision_candle.close
 
 
+class TestFullCloseAccounting:
+    """A full-position exit encoded as a quote notional at the decision price
+    (``pos.amount * current_price`` - how every strategy sizes its exits) must
+    record exactly one closed round-trip and leave zero residual, even when the
+    fill price (next candle's open) has moved away from the decision price.
+
+    Regression for the trade-undercount bug found while backtesting Phase 1
+    (see audits/volatility_breakout.md Backtesting section): the engine used to
+    divide the exit notional by the *fill* price rather than the *decision*
+    price, so on any up-tick the position under-sold and left float dust above
+    apply_sell's close threshold - the round trip was never recorded.
+    """
+
+    @pytest.mark.asyncio
+    async def test_full_close_records_trade_when_fill_price_rises(self):
+        from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
+        from sqlalchemy.orm import sessionmaker
+
+        from app.models import Base, Bot, BotStatus
+        from app.backtesting.candle import Candle
+        from app.backtesting.portfolio import BacktestPortfolio
+        from app.services.trading_engine import TradingEngine, TradeSignal
+
+        def _candle(price):
+            return Candle(
+                timestamp=1704067200000, datetime="d", symbol="TESTUSD",
+                open=price, high=price * 1.001, low=price * 0.999, close=price,
+                base_volume=1.0, quote_volume=price, trade_count=1,
+            )
+
+        db_engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+        async with db_engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
+        async_session = sessionmaker(db_engine, class_=AsyncSession, expire_on_commit=False)
+
+        try:
+            async with async_session() as session:
+                bot = Bot(
+                    name="backtest", trading_pair="TEST/USD", strategy="mean_reversion",
+                    strategy_params={}, budget=10_000.0, current_balance=10_000.0,
+                    is_dry_run=True, status=BotStatus.RUNNING,
+                )
+                session.add(bot)
+                await session.flush()
+
+                engine = TradingEngine()
+                portfolio = BacktestPortfolio(10_000.0)
+                backtest_engine = BacktestEngine(
+                    data_provider=CsvHistoricalDataProvider(),
+                    execution_model=BacktestExecutionModel(fee_pct=0.0),
+                )
+
+                # Open a position: spend $1000 filling at price 100 -> 10 base.
+                await backtest_engine._apply_signal(
+                    engine, session, bot, portfolio, "mean_reversion",
+                    TradeSignal(action="buy", amount=1000.0, reason="entry"),
+                    _candle(100.0), decision_price=100.0,
+                )
+                await session.flush()
+                assert portfolio.base_amount == pytest.approx(10.0, rel=1e-9)
+
+                # Full exit: the strategy saw a decision price of 110 and sized
+                # the sell as base*110 = 1100. The fill (next open) is 121, a
+                # strict up-move from the decision price - the exact condition
+                # that used to leave dust.
+                decision_price = 110.0
+                sell_notional = portfolio.base_amount * decision_price
+                fill = _candle(121.0)
+                assert fill.open > decision_price
+                await backtest_engine._apply_signal(
+                    engine, session, bot, portfolio, "mean_reversion",
+                    TradeSignal(action="sell", amount=sell_notional, reason="exit"),
+                    fill, decision_price=decision_price,
+                )
+                await session.flush()
+
+                # The position is fully closed on both ledgers, and the round
+                # trip is recorded exactly once.
+                assert portfolio.base_amount <= 1e-12
+                assert not portfolio.has_position
+                assert len(portfolio.trades) == 1
+                trade = portfolio.trades[0]
+                assert trade.entry_price == pytest.approx(100.0, rel=1e-9)
+                assert trade.exit_price == pytest.approx(121.0, rel=1e-9)
+        finally:
+            await db_engine.dispose()
+
+
 class TestFeesReduceReturns:
     @pytest.mark.asyncio
     async def test_fees_reduce_ending_balance(self):
