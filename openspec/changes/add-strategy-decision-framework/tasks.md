@@ -287,23 +287,38 @@ code uses 100) while touching this strategy.
 
 ## Phase 3 — dip_recovery (zero suitability, but best overall foundation)
 
+**Status: ✓ Complete (8/8), Under review** (see `audits/dip_recovery.md`'s
+Certification Checklist). Migrated across all four methods
+(`_strategy_dip_recovery`, `_dip_recovery_manage_setup`,
+`_dip_recovery_manage_exit`, `_dip_recovery_exit_signal`), now wired through
+`MarketSuitabilityGate` (via the price-only `_detect_market_regime` — see the
+audit's Pillar 2 for the documented rationale and the `volatility_expanding`
+consequence), `DecisionScoreEngine`, `StrategyEdgeManager`, Decision-Score-
+weighted sizing, `StrategyProposal`, and `StandaloneAdapter`. The pre-migration
+"never buy on the way down" safety preconditions are PRESERVED as hard gates.
+16 new tests (`backend/tests/test_dip_recovery_framework_migration.py`);
+`test_dip_recovery_strategy.py`'s BUY-reason assertion updated for the Pillar-10
+mechanically-derived reason (25 of 26 unchanged). Full suite: 1185/1185
+passing, zero regressions. Before/after backtest across bull/bear/chop — see
+`audits/dip_recovery.md`'s Backtesting section.
+
 See `audits/dip_recovery.md`. Gaps: P1, P2 (zero, build from scratch), P7,
 P9; P3 partial (score computed but unused - wire it in); P8 emergency-stop
 and sizing gaps; P5 needs a Decision Score input.
 
-- [ ] 3.1 Author theory (P1) and performance expectations (P9).
-- [ ] 3.2 Build and wire a `MarketSuitabilityGate`.
-- [ ] 3.3 Migrate the ALREADY-COMPUTED `opportunity_score` into a real
+- [x] 3.1 Author theory (P1) and performance expectations (P9).
+- [x] 3.2 Build and wire a `MarketSuitabilityGate`.
+- [x] 3.3 Migrate the ALREADY-COMPUTED `opportunity_score` into a real
       `DecisionScoreEngine` call feeding `entry_ready`, formalizing its
       inputs as documented Evidence Items instead of discarding the score
       as diagnostics-only (same pattern as Phase 1.2/1.3, smaller lift
       than Phase 2 since the scoring infrastructure already exists here).
-- [ ] 3.4 Wire `StrategyEdgeManager` before entry; define this strategy's
+- [x] 3.4 Wire `StrategyEdgeManager` before entry; define this strategy's
       specific Category A/B/C signal thresholds.
-- [ ] 3.5 Wire Decision-Score-weighted sizing.
-- [ ] 3.6 Close Pillar 8 gaps: add the missing "Emergency stop hit"
+- [x] 3.5 Wire Decision-Score-weighted sizing.
+- [x] 3.6 Close Pillar 8 gaps: add the missing "Emergency stop hit"
       `.check()` and sizing/viability checks; verify the Evidence Report.
-- [ ] 3.7 Migrate this strategy's return type from `TradeSignal` to
+- [x] 3.7 Migrate this strategy's return type from `TradeSignal` to
       `StrategyProposal`, including this strategy's `execution_intent`
       mapping (recovery-confirmed entry -> OPEN_POSITION, take-profit/
       trailing-stop/emergency-stop/time-exit -> CLOSE_POSITION), a
@@ -312,7 +327,7 @@ and sizing gaps; P5 needs a Decision Score input.
       recovery threshold not reversed"); verify standalone execution via
       the Standalone Adapter is behavior-identical to the pre-migration
       path.
-- [ ] 3.8 Certification review; before/after backtest comparison.
+- [x] 3.8 Certification review; before/after backtest comparison.
 
 ## Phase 4 — mean_reversion (P2/P6 already solid; needs P3/P5/P7 built)
 

@@ -118,7 +118,11 @@ class TestDeclineThenRecoveryBuys:
 
         buys = [s for s in signals if s.action == "buy"]
         assert buys, "A confirmed reversal after a significant decline must produce a BUY"
-        assert "reversal confirmed" in buys[0].reason.lower() or "Reversal confirmed" in buys[0].reason
+        # Post Phase-3 migration the reason is mechanically derived from the
+        # Decision Score's Evidence Items (Pillar 10 - never free-authored), so
+        # the BUY carries the score/threshold instead of a hand-written phrase.
+        assert buys[0].score is not None and buys[0].threshold is not None
+        assert buys[0].score >= buys[0].threshold
 
         state = engine._dip_recovery_states[bot.id]
         assert state["state"] == _DipRecoveryState.LONG_OPEN

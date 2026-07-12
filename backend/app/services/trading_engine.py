@@ -4918,6 +4918,77 @@ class TradingEngine:
         positions = await self._get_bot_positions(bot.id, session)
         has_position = len(positions) > 0
 
+        # === STRATEGY DECISION FRAMEWORK (Phase 3 migration) ===
+        # Pillar 2 rationale (documented, not silently assumed - see the audit's
+        # Pillar 2 section): dip_recovery is TICK-driven (it keeps a tick price
+        # history and an ATR *proxy*, never OHLC bars), so it uses the price-only
+        # `_detect_market_regime` - the documented variant for tick strategies -
+        # NOT `_detect_market_regime_bar_based`. Consequence, recorded here and in
+        # the audit: the price-only detector emits no `volatility_direction`, so
+        # the `volatility_expanding` tag NEVER matches in this standalone path
+        # (Auto Mode's bar-based path still evaluates it). `trend_down` and
+        # `volatility_high` fully cover this strategy's setups (a sharp dip is a
+        # high-volatility, declining regime), so nothing is silently lost.
+        if not hasattr(self, "_dip_recovery_edge_manager"):
+            self._dip_recovery_edge_manager = StrategyEdgeManager()
+        edge_manager = self._dip_recovery_edge_manager
+        allowed_regimes = params.get(
+            "allowed_regimes", ["trend_down", "volatility_high", "volatility_expanding"]
+        )
+        decision_score_threshold = params.get("decision_score_threshold", 40.0)
+        bar_interval_seconds = params.get("bar_interval_seconds", 60)
+        _validity_interval_seconds = max(bar_interval_seconds, 1)
+        current_regime = self._detect_market_regime(price_history, None)
+        suitability = MarketSuitabilityGate().evaluate(current_regime, allowed_regimes)
+        # Category B ("parameter mismatch") is never cited for this strategy:
+        # its entry thresholds are ALREADY ATR-adaptive (Pillar 4, "best of the
+        # six"), so there is no single fixed base-multiplier the Edge Manager
+        # could point at as miscalibrated. Degradation therefore classifies as
+        # Category A (regime unsuitable) or Category C (edge gone) only -
+        # documented in the audit's Pillar 7 section.
+        edge_status = edge_manager.evaluate(
+            bot.id, "dip_recovery",
+            regime_outside_suitable_range=not suitability.is_suitable,
+            parameter_mismatch_evidence=None,
+            now=now,
+        )
+
+        def mk_proposal(
+            *, direction: "Direction", execution_intent: "ExecutionIntent",
+            evidence_name: str, evidence_value: float, evidence_reason: str,
+            threshold: float = 1.0, suggested_position_size: Optional[float] = None,
+            assumptions: tuple = (),
+        ) -> StrategyProposal:
+            """Single-evidence proposal for every already-decided branch
+            (tracking/waiting/cooldown holds, exits, no-trades). The full
+            multi-factor entry proposal is built inline in the setup handler."""
+            item = EvidenceItem(
+                name=evidence_name, measurement=lambda d: evidence_value,
+                normalization=lambda r: r, weight=100.0, reason=evidence_reason,
+            )
+            score = DecisionScoreEngine().score("dip_recovery", [item], {}, threshold=threshold)
+            reasons_for, reasons_against = derive_reasons(score)
+            gen = self.clock.now()
+            return StrategyProposal(
+                strategy_id="dip_recovery", bot_id=bot.id, generated_at=gen,
+                direction=direction, execution_intent=execution_intent,
+                validity=ProposalValidity(
+                    generated_at=gen,
+                    valid_until=gen + timedelta(seconds=_validity_interval_seconds),
+                ),
+                decision_score=score, market_suitability=suitability, edge_status=edge_status,
+                assumptions=assumptions, reasons_for=reasons_for, reasons_against=reasons_against,
+                suggested_position_size=suggested_position_size, suggested_risk_budget_pct=risk_percent,
+                explanation=self._explain(bot.id).to_dict(),
+            )
+
+        def hold_via(proposal: StrategyProposal, reason: str) -> TradeSignal:
+            """Route a HOLD/NO_TRADE proposal through the Standalone Adapter
+            (which yields no order) but preserve the existing rich, human-
+            readable hold reason for diagnostics/tests."""
+            sig = StandaloneAdapter.to_trade_signal(proposal)
+            return sig if sig is not None else TradeSignal(action="hold", amount=0, reason=reason)
+
         if not has_position and state["state"] == _DipRecoveryState.LONG_OPEN:
             # Defensive: persisted state says a position is open but none
             # exists (closed outside this strategy's knowledge, or a crash
@@ -4934,6 +5005,7 @@ class TradingEngine:
                 bot, state, positions, current_price, atr, now,
                 take_profit_atr_mult, trailing_atr_mult, emergency_atr_mult,
                 max_duration_min, cooldown_seconds, loss_cooldown_seconds, exp,
+                mk_proposal, edge_manager,
             )
 
         # === COOLDOWN ===
@@ -4953,9 +5025,13 @@ class TradingEngine:
                     status=f"{remaining:.0f}s until monitoring resumes",
                 )
                 self._dip_recovery_states[bot.id] = state
-                return TradeSignal(
-                    action="hold", amount=0,
-                    reason=f"Dip Recovery: Cooldown active ({remaining:.0f}s remaining)"
+                return hold_via(
+                    mk_proposal(
+                        direction=Direction.NO_TRADE, execution_intent=ExecutionIntent.NO_ACTION,
+                        evidence_name="Cooldown elapsed", evidence_value=0.0,
+                        evidence_reason=f"{remaining:.0f}s of post-exit cooldown remain before monitoring resumes",
+                    ),
+                    f"Dip Recovery: Cooldown active ({remaining:.0f}s remaining)",
                 )
             # Cooldown elapsed - fall through to IDLE this same tick.
             state["state"] = _DipRecoveryState.IDLE
@@ -5005,12 +5081,19 @@ class TradingEngine:
                     target=drop_threshold, target_label="Drop threshold (%)",
                     distance=0.0, status="drop confirmed - tracking bottom for a reversal",
                 )
-                return TradeSignal(
-                    action="hold", amount=0,
-                    reason=(
+                return hold_via(
+                    mk_proposal(
+                        direction=Direction.NO_TRADE, execution_intent=ExecutionIntent.NO_ACTION,
+                        evidence_name="Significant decline", evidence_value=1.0,
+                        evidence_reason=(
+                            f"decline {abs(drawdown_percent):.2f}% >= adaptive drop threshold "
+                            f"{drop_threshold:.2f}% - arming reversal tracking (no entry yet)"
+                        ),
+                    ),
+                    (
                         f"Dip Recovery: Significant decline detected "
                         f"({abs(drawdown_percent):.2f}% >= {drop_threshold:.2f}%) - tracking bottom"
-                    )
+                    ),
                 )
 
             needed = max(0.0, drop_threshold - abs(drawdown_percent))
@@ -5020,12 +5103,19 @@ class TradingEngine:
                 status=f"{needed:.2f}% further decline needed to arm monitoring",
             )
             self._dip_recovery_states[bot.id] = state
-            return TradeSignal(
-                action="hold", amount=0,
-                reason=(
+            return hold_via(
+                mk_proposal(
+                    direction=Direction.NO_TRADE, execution_intent=ExecutionIntent.NO_ACTION,
+                    evidence_name="Significant decline", evidence_value=0.0,
+                    evidence_reason=(
+                        f"drawdown {abs(drawdown_percent):.2f}% < adaptive drop threshold "
+                        f"{drop_threshold:.2f}% - no dip setup to evaluate"
+                    ),
+                ),
+                (
                     f"Dip Recovery: No significant decline "
                     f"({abs(drawdown_percent):.2f}% < {drop_threshold:.2f}%)"
-                )
+                ),
             )
 
         # === TRACKING_DROP / WAITING_REVERSAL ===
@@ -5034,7 +5124,8 @@ class TradingEngine:
             recovery_threshold, require_ema_slope, ema_slope_period,
             require_no_new_low, min_ticks_no_new_low, setup_expiry_min,
             risk_percent, take_profit_atr_mult, trailing_atr_mult, emergency_atr_mult,
-            exp,
+            exp, mk_proposal, hold_via, suitability, edge_status, edge_manager,
+            decision_score_threshold,
         )
 
     def _dip_recovery_manage_setup(
@@ -5058,12 +5149,22 @@ class TradingEngine:
         trailing_atr_mult: float,
         emergency_atr_mult: float,
         exp: ExplanationBuilder,
+        mk_proposal,
+        hold_via,
+        suitability,
+        edge_status,
+        edge_manager,
+        decision_score_threshold: float,
     ) -> TradeSignal:
         """Handle TRACKING_DROP / WAITING_REVERSAL: track the bottom, then
         confirm and arm a BUY once price has genuinely reversed off it.
 
-        Never buys on the way down - only once recovery_percent clears the
-        adaptive threshold AND every enabled confirmation filter passes.
+        Migrated to the Strategy Decision Framework (Phase 3). The pre-migration
+        "never buy on the way down" safety preconditions (a bounce has started,
+        recovery cleared its adaptive threshold, and every enabled confirmation
+        filter passed) are PRESERVED as hard gates; on top of them the migration
+        adds the Pillar 2 suitability gate, a Pillar 3 Decision Score over the
+        formerly-diagnostic-only opportunity signals, and the Pillar 7 edge gate.
         """
         reference_high = state.get("reference_high")
         tracking_started_at = state.get("tracking_started_at")
@@ -5077,12 +5178,19 @@ class TradingEngine:
             exp.state(_DipRecoveryState.IDLE).check(
                 "Setup expiry", f"{elapsed_minutes:.1f} min", f"< {setup_expiry_min} min", False,
             )
-            return TradeSignal(
-                action="hold", amount=0,
-                reason=(
+            return hold_via(
+                mk_proposal(
+                    direction=Direction.NO_TRADE, execution_intent=ExecutionIntent.NO_ACTION,
+                    evidence_name="Setup still valid", evidence_value=0.0,
+                    evidence_reason=(
+                        f"tracked dip setup expired after {elapsed_minutes:.1f} min without a "
+                        "confirmed reversal - abandoned, back to IDLE"
+                    ),
+                ),
+                (
                     f"Dip Recovery: Setup expired after {elapsed_minutes:.1f} min "
                     "without a confirmed reversal - back to IDLE"
-                )
+                ),
             )
 
         # Invalidation: price fully round-tripped past the original high
@@ -5090,12 +5198,19 @@ class TradingEngine:
         if reference_high and current_price >= reference_high:
             self._dip_recovery_states[bot.id] = self._dip_recovery_default_state()
             exp.state(_DipRecoveryState.IDLE)
-            return TradeSignal(
-                action="hold", amount=0,
-                reason=(
+            return hold_via(
+                mk_proposal(
+                    direction=Direction.NO_TRADE, execution_intent=ExecutionIntent.NO_ACTION,
+                    evidence_name="Dip still valid", evidence_value=0.0,
+                    evidence_reason=(
+                        "price recovered past the original reference high without a confirmed "
+                        "entry - no longer a dip, resetting"
+                    ),
+                ),
+                (
                     "Dip Recovery: Price recovered past the original reference high "
                     "without confirmation - resetting"
-                )
+                ),
             )
 
         lowest_price = state.get("lowest_price", current_price)
@@ -5123,9 +5238,16 @@ class TradingEngine:
                 "recovery_threshold_percent": recovery_threshold,
             })
             exp.check("New low tracking", current_price, f"<= {lowest_price:.4f}", True)
-            return TradeSignal(
-                action="hold", amount=0,
-                reason=f"Dip Recovery: Still declining, tracking bottom (${lowest_price:.4f})"
+            return hold_via(
+                mk_proposal(
+                    direction=Direction.NO_TRADE, execution_intent=ExecutionIntent.NO_ACTION,
+                    evidence_name="Reversal started", evidence_value=0.0,
+                    evidence_reason=(
+                        f"price still at/below the tracked low ${lowest_price:.4f} - the "
+                        "market is still falling, never buy on the way down"
+                    ),
+                ),
+                f"Dip Recovery: Still declining, tracking bottom (${lowest_price:.4f})",
             )
 
         # Price has bounced off the low - evaluate reversal confirmation.
@@ -5138,7 +5260,12 @@ class TradingEngine:
         )
 
         recovery_ok = recovery_percent >= recovery_threshold
-        entry_ready = recovery_ok and ema_ok and no_new_low_ok
+        # SAFETY PRECONDITIONS (preserved from pre-migration, unchanged): a real
+        # reversal must be underway before ANY entry is considered. These are the
+        # "never buy on the way down" guarantee and remain HARD gates - the
+        # Decision Score below evaluates the QUALITY of a confirmed setup, it does
+        # not override these safety filters.
+        preconditions_met = recovery_ok and ema_ok and no_new_low_ok
 
         decline_ratio = (
             abs((reference_high - lowest_price) / reference_high * 100.0) / atr_percent
@@ -5154,7 +5281,10 @@ class TradingEngine:
             "ticks_since_new_low": state["ticks_since_new_low"],
             "ema_slope_positive": ema_slope_positive,
             "opportunity_score": opportunity_score * 10.0,
+            "regime_tags": suitability.regime_tags,
+            "market_suitable": suitability.is_suitable,
         })
+        exp.metric("edge_status_category", edge_status.category.value)
         exp.check(
             "Recovery from bottom", f"{recovery_percent:.3f}%",
             f">= {recovery_threshold:.3f}%", recovery_ok,
@@ -5167,7 +5297,7 @@ class TradingEngine:
                 f">= {min_ticks_no_new_low} ticks", no_new_low_ok,
             )
 
-        if not entry_ready:
+        if not preconditions_met:
             state["state"] = _DipRecoveryState.WAITING_REVERSAL
             self._dip_recovery_states[bot.id] = state
             needed = max(0.0, recovery_threshold - recovery_percent)
@@ -5176,18 +5306,135 @@ class TradingEngine:
                 target=recovery_threshold, target_label="Required (%)", distance=needed,
                 status="waiting for full reversal confirmation",
             )
-            return TradeSignal(
-                action="hold", amount=0,
-                reason=(
+            return hold_via(
+                mk_proposal(
+                    direction=Direction.NO_TRADE, execution_intent=ExecutionIntent.NO_ACTION,
+                    evidence_name="Reversal confirmed", evidence_value=0.0,
+                    evidence_reason=(
+                        f"reversal not yet fully confirmed (recovery {recovery_percent:.2f}% / "
+                        f"{recovery_threshold:.2f}% required, EMA slope / no-new-low filters)"
+                    ),
+                ),
+                (
                     f"Dip Recovery: Reversal forming ({recovery_percent:.2f}%/"
                     f"{recovery_threshold:.2f}% required) - awaiting confirmation"
-                )
+                ),
+            )
+
+        # === PILLAR 3: EVIDENCE-BASED DECISION SCORE ===
+        # The formerly diagnostic-only opportunity signals (decline depth and
+        # recovery strength, both ATR-normalized) plus the two confirmation
+        # filters, formalized as documented Evidence Items feeding the actual
+        # entry decision (Task 3.3).
+        _ticks_since_low = float(state["ticks_since_new_low"])
+        _no_low_ratio = (
+            min(_ticks_since_low / min_ticks_no_new_low, 1.5)
+            if min_ticks_no_new_low > 0 else 1.0
+        )
+        evidence_items = [
+            EvidenceItem(
+                name="Decline depth",
+                measurement=lambda d: decline_ratio,
+                normalization=lambda r: max(-1.0, min(1.0, r / 2.5)),
+                weight=35.0,
+                reason=(
+                    "Theory (overreaction mean-reversion): the deeper the panic decline "
+                    "relative to this pair's own ATR, the more likely it overshot fair value "
+                    "and the larger the mean-reversion bounce being captured."
+                ),
+            ),
+            EvidenceItem(
+                name="Recovery strength",
+                measurement=lambda d: recovery_ratio,
+                normalization=lambda r: max(-1.0, min(1.0, r / 1.0)),
+                weight=30.0,
+                reason=(
+                    "Theory: a reversal that has already retraced a meaningful fraction of an "
+                    "ATR off the low is stronger evidence the bottom is in than a marginal tick "
+                    "up - this is the 'confirmed reversal, not a falling knife' core of the thesis."
+                ),
+            ),
+            EvidenceItem(
+                name="Reversal momentum (EMA slope)",
+                measurement=lambda d: 1.0 if ema_slope_positive else 0.0,
+                normalization=lambda r: max(-1.0, min(1.0, r)),
+                weight=20.0,
+                reason=(
+                    "Theory: a rising short EMA confirms the bounce has momentum behind it, "
+                    "not just a single mean-reverting tick that will resume falling."
+                ),
+            ),
+            EvidenceItem(
+                name="Base stability (no new low)",
+                measurement=lambda d: _no_low_ratio,
+                normalization=lambda r: max(-1.0, min(1.0, r)),
+                weight=15.0,
+                reason=(
+                    "Theory: the longer price holds without printing a new low, the more the "
+                    "sellers are exhausted and the safer the reversal entry."
+                ),
+            ),
+        ]
+        decision_score = DecisionScoreEngine().score(
+            "dip_recovery", evidence_items, {}, threshold=decision_score_threshold,
+        )
+        edge_manager.record_decision_score(bot.id, "dip_recovery", decision_score.total)
+        reasons_for, reasons_against = derive_reasons(decision_score)
+        assumptions = (
+            "no new low since entry: the tracked bottom is not undercut",
+            "the confirmed reversal is not reversed (price does not fall back below the "
+            "recovery threshold off the low)",
+            "current market regime remains within the strategy's allowed set",
+        )
+        exp.metric("decision_score_total", decision_score.total)
+        exp.metric("decision_score_threshold", decision_score_threshold)
+        exp.check(
+            "Decision Score clears threshold", decision_score.total,
+            f">= {decision_score_threshold:.1f}", decision_score.approved,
+        )
+        exp.check(
+            "Market suitability", suitability.is_suitable, "must be True",
+            suitability.is_suitable, detail=suitability.reason,
+        )
+        exp.check(
+            "Strategy edge not disqualified", edge_status.category.value,
+            f"!= {EdgeCategory.C.value}", edge_status.category != EdgeCategory.C,
+            detail=edge_status.reason,
+        )
+
+        blocking_reasons = []
+        if not suitability.is_suitable:
+            blocking_reasons.append(f"regime unsuitable ({suitability.reason})")
+        if not decision_score.approved:
+            blocking_reasons.append(
+                f"Decision Score {decision_score.total:.1f} < threshold {decision_score_threshold:.1f}"
+            )
+        if edge_status.category == EdgeCategory.C:
+            blocking_reasons.append(f"Strategy Edge Management: Category C - {edge_status.reason}")
+
+        if blocking_reasons:
+            state["state"] = _DipRecoveryState.WAITING_REVERSAL
+            self._dip_recovery_states[bot.id] = state
+            reason_text = "; ".join(blocking_reasons)
+            return hold_via(
+                mk_proposal(
+                    direction=Direction.NO_TRADE, execution_intent=ExecutionIntent.NO_ACTION,
+                    evidence_name="Framework gates", evidence_value=0.0,
+                    evidence_reason=reason_text, assumptions=assumptions,
+                ),
+                f"Dip Recovery: reversal confirmed but {reason_text}",
             )
 
         # === ENTRY ARMED -> BUY ===
         exp.state(_DipRecoveryState.ENTRY_ARMED)
 
-        risk_amount = bot.current_balance * risk_percent
+        # === PILLAR 5: DECISION-SCORE-WEIGHTED POSITION SIZING ===
+        score_range = max(100.0 - decision_score_threshold, 1e-9)
+        score_margin = max(0.0, min(1.0, (decision_score.total - decision_score_threshold) / score_range))
+        size_multiplier = 0.5 + score_margin
+        exp.metric("decision_score_size_multiplier", size_multiplier)
+
+        risk_amount = bot.current_balance * risk_percent * size_multiplier
         trailing_distance = atr * trailing_atr_mult
         if trailing_distance > 0:
             position_coins = risk_amount / trailing_distance
@@ -5200,14 +5447,24 @@ class TradingEngine:
             if bot.current_balance >= MIN_ORDER_USD:
                 buy_amount = MIN_ORDER_USD
             else:
+                # Pillar 8: sizing is a decision point - surface it.
+                exp.check("Position size >= min order", buy_amount, f">= {MIN_ORDER_USD:.0f}", False)
                 self._dip_recovery_states[bot.id] = state
-                return TradeSignal(
-                    action="hold", amount=0,
-                    reason=(
+                return hold_via(
+                    mk_proposal(
+                        direction=Direction.NO_TRADE, execution_intent=ExecutionIntent.NO_ACTION,
+                        evidence_name="Order size", evidence_value=0.0,
+                        evidence_reason=(
+                            f"balance ${bot.current_balance:.2f} below ${MIN_ORDER_USD:.0f} "
+                            "minimum order - cannot enter"
+                        ),
+                    ),
+                    (
                         f"Dip Recovery: balance ${bot.current_balance:.2f} below "
                         f"${MIN_ORDER_USD:.0f} minimum order"
                     ),
                 )
+        exp.check("Position size >= min order", buy_amount, f">= {MIN_ORDER_USD:.0f}", True)
 
         # Viability pre-check before state mutation: expected move = distance from
         # entry to the strategy's take-profit target (atr × take_profit_atr_mult).
@@ -5219,12 +5476,22 @@ class TradingEngine:
             float(_fee_raw_dr) if isinstance(_fee_raw_dr, (int, float)) else 0.1
         ) / 100.0
         _dr_min_move = 2.0 * _dr_fee_pct + _VIABILITY_SAFETY_MARGIN_PCT
+        exp.check(
+            "Fee viability", _dr_expected_move, f">= {_dr_min_move:.5f}",
+            _dr_expected_move >= _dr_min_move,
+        )
         if _dr_expected_move < _dr_min_move:
             self._dip_recovery_states[bot.id] = state
-            return TradeSignal(
-                action="hold",
-                amount=0,
-                reason=(
+            return hold_via(
+                mk_proposal(
+                    direction=Direction.NO_TRADE, execution_intent=ExecutionIntent.NO_ACTION,
+                    evidence_name="Fee viability", evidence_value=0.0,
+                    evidence_reason=(
+                        f"take-profit target {_dr_expected_move * 100:.3f}% < fee threshold "
+                        f"{_dr_min_move * 100:.3f}% - the trade cannot clear round-trip costs"
+                    ),
+                ),
+                (
                     f"Dip Recovery: take-profit {_dr_expected_move * 100:.3f}% < "
                     f"fee threshold {_dr_min_move * 100:.3f}% "
                     f"(exchange_fee={_dr_fee_pct * 100:.2f}%)"
@@ -5246,6 +5513,7 @@ class TradingEngine:
 
         logger.info(
             f"Bot {bot.id}: Dip Recovery ENTRY - Price ${entry_price:.4f}, "
+            f"Decision Score {decision_score.total:.1f}/{decision_score_threshold:.1f}, "
             f"recovery {recovery_percent:.2f}% (required {recovery_threshold:.2f}%), "
             f"ATR ${atr:.4f}, Position ${buy_amount:.2f}"
         )
@@ -5256,15 +5524,34 @@ class TradingEngine:
         # (a last-resort net beyond the trailing stop, not the intended risk).
         _dr_expected_risk = (atr * trailing_atr_mult) / current_price if current_price > 0 else 0.0
 
-        return TradeSignal(
-            action="buy", amount=buy_amount, order_type="market",
-            reason=(
-                f"Dip Recovery: Reversal confirmed ({recovery_percent:.2f}% >= "
-                f"{recovery_threshold:.2f}%) after decline - entering"
+        # === PILLAR 10: STRATEGYPROPOSAL -> STANDALONE ADAPTER ===
+        gen = self.clock.now()
+        proposal = StrategyProposal(
+            strategy_id="dip_recovery", bot_id=bot.id, generated_at=gen,
+            direction=Direction.BUY, execution_intent=ExecutionIntent.OPEN_POSITION,
+            validity=ProposalValidity(
+                generated_at=gen,
+                valid_until=gen + timedelta(seconds=self._dip_recovery_validity_seconds(bot)),
             ),
-            expected_move_pct=_dr_expected_move,
-            expected_risk_pct=_dr_expected_risk,
+            decision_score=decision_score, market_suitability=suitability, edge_status=edge_status,
+            assumptions=assumptions, reasons_for=reasons_for, reasons_against=reasons_against,
+            suggested_position_size=buy_amount,
+            suggested_risk_budget_pct=risk_percent * size_multiplier,
+            expected_holding_horizon="medium",
+            adaptive_parameters_used={"decision_score_size_multiplier": size_multiplier},
+            explanation=exp.to_dict(),
         )
+        return StandaloneAdapter.to_trade_signal(
+            proposal, expected_move_pct=_dr_expected_move, expected_risk_pct=_dr_expected_risk,
+        )
+
+    def _dip_recovery_validity_seconds(self, bot) -> int:
+        """Proposal validity window for a Dip Recovery proposal - tied to this
+        strategy's per-tick evaluation cadence (its `bar_interval_seconds`
+        param, default 60), floored at 1s so ProposalValidity never gets a
+        zero-duration window from a test harness's bar_interval_seconds=0."""
+        params = getattr(bot, "strategy_params", None) or {}
+        return max(int(params.get("bar_interval_seconds", 60)), 1)
 
     def _dip_recovery_exit_signal(
         self,
@@ -5276,13 +5563,14 @@ class TradingEngine:
         reason: str,
         cooldown_secs: float,
         now: datetime,
+        mk_proposal,
     ) -> TradeSignal:
-        """Build the SELL signal for a Dip Recovery exit and reset state to
-        COOLDOWN. Single source of truth for the cooldown-reset behaviour so
-        every exit path (take-profit, trailing stop, emergency stop, max
-        duration) resets state identically.
+        """Build the SELL StrategyProposal for a Dip Recovery exit and reset
+        state to COOLDOWN. Single source of truth for the cooldown-reset
+        behaviour so every exit path (take-profit, trailing stop, emergency
+        stop, max duration) resets state identically. Pillar 10: the proposal
+        is routed through the Standalone Adapter, never returned directly.
         """
-        sell_amount = pos.amount * current_price
         is_loss = current_price < entry_price
         self._dip_recovery_states[bot.id] = {
             **self._dip_recovery_default_state(),
@@ -5294,10 +5582,16 @@ class TradingEngine:
             f"Bot {bot.id}: Dip Recovery EXIT ({reason}) - Price ${current_price:.4f}, "
             f"Entry ${entry_price:.4f}, PnL {unrealized_pnl_pct:+.2f}%"
         )
-        return TradeSignal(
-            action="sell", amount=sell_amount, order_type="market",
-            reason=f"Dip Recovery: Exit ({reason}), PnL {unrealized_pnl_pct:+.2f}%",
+        proposal = mk_proposal(
+            direction=Direction.SELL, execution_intent=ExecutionIntent.CLOSE_POSITION,
+            evidence_name=f"Exit: {reason}", evidence_value=1.0,
+            evidence_reason=(
+                f"Dip Recovery {reason} exit at ${current_price:.4f} "
+                f"(entry ${entry_price:.4f}, PnL {unrealized_pnl_pct:+.2f}%)"
+            ),
+            suggested_position_size=pos.amount * current_price,
         )
+        return StandaloneAdapter.to_trade_signal(proposal)
 
     def _dip_recovery_manage_exit(
         self,
@@ -5314,12 +5608,22 @@ class TradingEngine:
         cooldown_seconds: float,
         loss_cooldown_seconds: float,
         exp: ExplanationBuilder,
+        mk_proposal,
+        edge_manager,
     ) -> TradeSignal:
         """Manage an open Dip Recovery position: take-profit, monotonic
         trailing stop, emergency stop, and max-duration exits, each routed
         through a loss-aware cooldown (see _dip_recovery_exit_signal).
+
+        Migrated (Phase 3): exits record their outcome with the StrategyEdge
+        Manager (Pillar 7) and are emitted as StrategyProposals via the
+        Standalone Adapter (Pillar 10); the emergency-stop check is now surfaced
+        to diagnostics (Pillar 8 gap the audit found). Trade-management logic
+        (the four exits, monotonic trailing stop, loss-aware cooldown) is
+        otherwise unchanged.
         """
         entry_price = state.get("entry_price")
+        entry_price_known = entry_price is not None
         entry_atr_locked = state.get("entry_atr") or atr  # fallback for legacy/corrupted state
         entry_time = state.get("entry_time") or now
         if entry_price is None:
@@ -5363,6 +5667,12 @@ class TradingEngine:
         })
         exp.check("Take profit hit", current_price, f">= {take_profit:.4f}", current_price >= take_profit)
         exp.check("Trailing stop hit", current_price, f"<= {trailing_stop:.4f}", current_price <= trailing_stop)
+        # Pillar 8 gap the audit found: the emergency stop was computed and used
+        # to trigger sells but never surfaced as a diagnostic check.
+        exp.check(
+            "Emergency stop hit", current_price, f"<= {emergency_stop:.4f}",
+            current_price <= emergency_stop,
+        )
         exp.check(
             "Max duration", f"{duration_minutes:.1f} min",
             f"< {max_duration_min} min", duration_minutes < max_duration_min,
@@ -5375,31 +5685,68 @@ class TradingEngine:
             status="holding - exits on take-profit, trailing stop, emergency stop, or max duration",
         )
 
+        def _record_exit_outcome() -> None:
+            # Pillar 7: record the outcome BEFORE state is cleared. Only when a
+            # real entry price is known - a defensively-adopted entry has no
+            # true P&L and recording a fabricated value would corrupt the
+            # StrategyEdgeManager's statistics.
+            if not entry_price_known:
+                return
+            initial_risk_per_unit = entry_atr_locked * trailing_atr_mult
+            pnl_per_unit = current_price - entry_price
+            reward_risk_realized = (
+                (pnl_per_unit / initial_risk_per_unit) if initial_risk_per_unit > 0 else None
+            )
+            edge_manager.record_trade_outcome(
+                bot.id, "dip_recovery",
+                pnl=pnl_per_unit, win=(pnl_per_unit > 0),
+                reward_risk_realized=reward_risk_realized,
+                holding_seconds=duration_minutes * 60.0, at=now,
+            )
+
         for pos in positions:
             if current_price >= take_profit:
+                _record_exit_outcome()
                 return self._dip_recovery_exit_signal(
                     bot, pos, current_price, entry_price, unrealized_pnl_pct,
-                    "take profit", cooldown_seconds, now,
+                    "take profit", cooldown_seconds, now, mk_proposal,
                 )
             if current_price <= trailing_stop:
                 cd = loss_cooldown_seconds if current_price < entry_price else cooldown_seconds
+                _record_exit_outcome()
                 return self._dip_recovery_exit_signal(
                     bot, pos, current_price, entry_price, unrealized_pnl_pct,
-                    "trailing stop", cd, now,
+                    "trailing stop", cd, now, mk_proposal,
                 )
             if current_price <= emergency_stop:
+                _record_exit_outcome()
                 return self._dip_recovery_exit_signal(
                     bot, pos, current_price, entry_price, unrealized_pnl_pct,
-                    "emergency stop", loss_cooldown_seconds, now,
+                    "emergency stop", loss_cooldown_seconds, now, mk_proposal,
                 )
             if duration_minutes >= max_duration_min:
                 cd = loss_cooldown_seconds if unrealized_pnl_pct < 0 else cooldown_seconds
+                _record_exit_outcome()
                 return self._dip_recovery_exit_signal(
                     bot, pos, current_price, entry_price, unrealized_pnl_pct,
-                    "max duration", cd, now,
+                    "max duration", cd, now, mk_proposal,
                 )
 
         self._dip_recovery_states[bot.id] = state
+        hold_proposal = mk_proposal(
+            direction=Direction.HOLD, execution_intent=ExecutionIntent.HOLD_POSITION,
+            evidence_name="Position intact", evidence_value=1.0,
+            evidence_reason=(
+                "no exit condition (take-profit, trailing stop, emergency stop, max "
+                "duration) triggered this cycle"
+            ),
+            assumptions=(
+                "no new low since entry and the confirmed reversal is not reversed",
+            ),
+        )
+        adapter_signal = StandaloneAdapter.to_trade_signal(hold_proposal)
+        if adapter_signal is not None:
+            return adapter_signal
         return TradeSignal(
             action="hold", amount=0,
             reason=(
