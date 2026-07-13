@@ -2150,35 +2150,57 @@ class TradingEngine:
         params: dict,
         session: AsyncSession,
     ) -> Optional[TradeSignal]:
-        """Mean Reversion strategy - Institutional Grade.
+        """Mean Reversion strategy.
 
-        ANTI-TREND, BOUNDED-RISK, REGIME-AWARE strategy designed for range-bound markets.
-        Takes quick profits on mean reversion, exits aggressively when wrong.
+        Migrated to the Strategy Decision Framework
+        (add-strategy-decision-framework, Phase 4 - see this change's
+        design.md/tasks.md and audits/mean_reversion.md). ANTI-TREND,
+        BOUNDED-RISK, REGIME-AWARE strategy for range-bound markets. Its
+        Pillar 2 (regime suitability) and Pillar 6 (four-way exit management)
+        were already the reference implementation among the six; Phase 4 adds
+        the Evidence-Based Decision Score (Pillar 3), Decision-Score-weighted
+        sizing (Pillar 5), Strategy Edge Management (Pillar 7), the missing
+        Pillar 8 checks, and the StrategyProposal/Standalone-Adapter interface
+        (Pillar 10), without changing the regime or exit logic.
+
+        THEORY (Pillar 1): exploits short-horizon overreaction in a
+        range-bound market. When price is pushed to a statistical extreme (a
+        lower Bollinger Band = ~2 std below a rolling mean) by transient
+        order-flow imbalance rather than new information, liquidity providers
+        and value buyers step in and price tends to revert toward the mean.
+        The edge exists only while the market is genuinely ranging (no trend);
+        a trend turns "cheap" into "cheaper", so the regime gate and the
+        trend-flip force-exit are the core risk control, not an add-on.
 
         NOT designed to hold through trends. Regime gating force-exits on trend flips.
 
-        Uses bar-aggregated Bollinger Bands with hard stop (locked entry_atr) and
-        time stop (max_hold_bars) to bound downside risk.
-
         CRITICAL: All logic operates on AGGREGATED PSEUDO-BARS, not tick data.
         Bar interval defines time granularity (default: 60 seconds per bar).
-
-        Regime-aware: Only allowed in trend_flat and volatility_high regimes.
-        Force-exits immediately if regime flips to trend_up or trend_down.
 
         This is a DEFENSIVE STATISTICAL STRATEGY, not a conviction trade.
 
         Parameters:
             bar_interval_seconds: Time per bar for aggregation (default: 60)
             bollinger_period: Bollinger Band period in bars (default: 20)
-            bollinger_std: Standard deviation multiplier (default: 2.0)
+            bollinger_std: Standard deviation multiplier (default: 1.8) -
+                FIXED (Pillar 4): this DEFINES what "a statistical extreme"
+                means for the strategy; changing it changes the strategy's
+                identity, not how it adapts to conditions. (Docstring/code
+                mismatch fixed - both now read 1.8.)
             atr_period: ATR period for hard stop (default: 14)
             atr_stop_multiplier: ATR stop multiplier (default: 2.0)
             max_hold_bars: Maximum bars to hold position (time stop, default: 10)
             order_size_percent: Percent of balance per order (default: 20)
             exit_at_mean: Exit at mean vs upper band (default: True)
-            regime_filter_enabled: Enable regime gating (default: True)
+            regime_filter_enabled: Enable regime gating (default: True). Kept
+                (unlike volatility_breakout's removal) as a TEST-isolation
+                affordance; Pillar 2 is enforced by default and remains this
+                strategy's reference-implementation hard gate.
             cooldown_seconds: Seconds between trades (default: 300)
+            decision_score_threshold: minimum Evidence-Based Decision Score
+                (0-100) to enter (default: 40.0) - certification-pending.
+            allowed_regimes: regimes suitable for entry (default:
+                ["trend_flat", "volatility_high"]).
         """
         # Get parameters
         bar_interval_seconds = params.get("bar_interval_seconds", 60)
@@ -2191,6 +2213,11 @@ class TradingEngine:
         exit_at_mean = params.get("exit_at_mean", True)
         regime_filter_enabled = params.get("regime_filter_enabled", True)
         cooldown_seconds = params.get("cooldown_seconds", 300)
+        decision_score_threshold = params.get("decision_score_threshold", 40.0)
+        _validity_interval_seconds = max(bar_interval_seconds, 1)
+        if not hasattr(self, "_mean_reversion_edge_manager"):
+            self._mean_reversion_edge_manager = StrategyEdgeManager()
+        edge_manager = self._mean_reversion_edge_manager
 
         # === BAR AGGREGATION SYSTEM ===
         # Aggregate tick prices into fixed-time bars (OHLC)
@@ -2311,50 +2338,81 @@ class TradingEngine:
         )
         atr = calculate_atr_from_bars(state["bars"], atr_period)
 
-        # === REGIME GATING (MANDATORY FOR MEAN REVERSION) ===
-        # Mean reversion only allowed in: trend_flat, volatility_high
-        # Force-exit immediately if regime flips to trend_up or trend_down
-        allowed_regimes = ["trend_flat", "volatility_high"]
-
-        regime_allows_entry = True
-        force_exit_regime = False
-        regime_name = "regime_filter_disabled"
-
-        if regime_filter_enabled:
-            # Detect regime from THIS strategy's own completed bar closes. The
-            # shared tick price-history buffer (_get_price_history) is only
-            # populated by trend_following, so a standalone
-            # mean-reversion bot fed it an empty series -> _detect_market_regime
-            # returned the neutral 'flat/medium' default forever. That silently
-            # disabled BOTH the regime entry gate AND the trend force-exit
-            # (mean reversion would happily enter and hold through a downtrend).
-            # By here we already have >= period bars (checked above), so the
-            # detector has enough data.
-            bar_closes = [b["close"] for b in state["bars"]] + [current_price]
-            current_regime = self._detect_market_regime(bar_closes, None)
-            trend_state = current_regime.get("trend_state", "flat")
-            volatility_state = current_regime.get("volatility_state", "medium")
-
-            # Map to regime names
-            trend_regime = f"trend_{trend_state}"
-            volatility_regime = f"volatility_{volatility_state}" if volatility_state == "high" else None
-
-            # Check if allowed
-            regime_allows_entry = (trend_regime in allowed_regimes or
-                                   (volatility_regime and volatility_regime in allowed_regimes))
-
-            # Force exit if trending (mean reversion not suitable)
-            force_exit_regime = trend_state in ["up", "down"]
-            regime_name = f"{trend_regime}, vol={volatility_state}"
-
-            logger.info(
-                f"Bot {bot.id}: Mean Reversion regime - {regime_name}, "
-                f"Entry allowed: {regime_allows_entry}, Force exit: {force_exit_regime}"
-            )
+        # === PILLAR 2: MARKET SUITABILITY (the reference implementation, now
+        # routed through the shared MarketSuitabilityGate) ===
+        # Mean reversion is suitable only in trend_flat / volatility_high;
+        # a trending market force-exits (Pillar 6). Detect from THIS strategy's
+        # own completed bar closes (the shared tick buffer is trend_following's;
+        # a standalone MR bot would otherwise see the neutral default forever).
+        # By here we already have >= period bars, so the detector has data. Uses
+        # the price-only _detect_market_regime (bar CLOSES, no volatility_
+        # direction) - which is sufficient here because this strategy's
+        # allowed_regimes reference only LEVEL/trend tags (trend_flat,
+        # volatility_high), never a *direction* tag, so nothing is lost.
+        allowed_regimes = params.get("allowed_regimes", ["trend_flat", "volatility_high"])
+        bar_closes = [b["close"] for b in state["bars"]] + [current_price]
+        current_regime = self._detect_market_regime(bar_closes, None)
+        trend_state = current_regime.get("trend_state", "flat")
+        volatility_state = current_regime.get("volatility_state", "medium")
+        regime_name = f"trend_{trend_state}, vol={volatility_state}"
+        # regime_filter_enabled (kept for test isolation) maps to allowed=["all"]
+        # when disabled, so `suitability` is always a real MarketSuitabilityResult
+        # for the proposal, and Pillar 2 is enforced by default.
+        suitability = MarketSuitabilityGate().evaluate(
+            current_regime, allowed_regimes if regime_filter_enabled else ["all"],
+        )
+        regime_allows_entry = suitability.is_suitable
+        force_exit_regime = regime_filter_enabled and trend_state in ["up", "down"]
 
         # Get current positions
         positions = await self._get_bot_positions(bot.id, session)
         has_position = len(positions) > 0
+
+        # === PILLAR 7: STRATEGY EDGE MANAGEMENT ===
+        # Category A = regime unsuitable. Category B ("parameter mismatch") is
+        # never cited for this strategy: this phase makes no parameter adaptive
+        # (bollinger_std/period and the ATR stop multiplier are FIXED by design
+        # - Pillar 4), so there is no adaptive base to point at as miscalibrated;
+        # degradation classifies as A (regime) or C (edge gone) only. Documented
+        # in the audit's Pillar 7 section.
+        edge_status = edge_manager.evaluate(
+            bot.id, "mean_reversion",
+            regime_outside_suitable_range=not suitability.is_suitable,
+            parameter_mismatch_evidence=None,
+            now=now,
+        )
+
+        def _single_evidence_proposal(
+            *, direction: "Direction", execution_intent: "ExecutionIntent",
+            evidence_name: str, evidence_value: float, evidence_reason: str,
+            threshold: float = 1.0, suggested_position_size: Optional[float] = None,
+            assumptions: tuple = (),
+        ) -> StrategyProposal:
+            """Single-evidence proposal for every already-decided branch
+            (exits, holds, no-trades)."""
+            item = EvidenceItem(
+                name=evidence_name, measurement=lambda d: evidence_value,
+                normalization=lambda r: r, weight=100.0, reason=evidence_reason,
+            )
+            score = DecisionScoreEngine().score("mean_reversion", [item], {}, threshold=threshold)
+            reasons_for, reasons_against = derive_reasons(score)
+            gen = self.clock.now()
+            return StrategyProposal(
+                strategy_id="mean_reversion", bot_id=bot.id, generated_at=gen,
+                direction=direction, execution_intent=execution_intent,
+                validity=ProposalValidity(
+                    generated_at=gen,
+                    valid_until=gen + timedelta(seconds=_validity_interval_seconds),
+                ),
+                decision_score=score, market_suitability=suitability, edge_status=edge_status,
+                assumptions=assumptions, reasons_for=reasons_for, reasons_against=reasons_against,
+                suggested_position_size=suggested_position_size, suggested_risk_budget_pct=order_size_percent,
+                explanation=self._explain(bot.id).to_dict(),
+            )
+
+        def _emit_hold(proposal: StrategyProposal, reason: str) -> TradeSignal:
+            sig = StandaloneAdapter.to_trade_signal(proposal)
+            return sig if sig is not None else TradeSignal(action="hold", amount=0, reason=reason)
 
         # Get last completed bar close for logic
         last_bar_close = state["bars"][-1]["close"] if state["bars"] else current_price
@@ -2466,165 +2524,117 @@ class TradingEngine:
             )
         # ---------------------------------------------------------------------
 
-        # === POSITION EXIT LOGIC (BOUNDED RISK) ===
-        # Exits: Mean reached | Hard stop | Time stop | Regime flip
+        # === POSITION EXIT LOGIC (BOUNDED RISK) - Pillar 6, unchanged logic;
+        # now emits SELL/CLOSE_POSITION proposals and records edge outcomes ===
+        # Exits: Regime flip | Mean reached | Hard stop | Time stop
         if has_position:
-            for pos in positions:
-                # Increment bars_since_entry only when bar completes
-                if bar_completed and state["entry_price"] is not None:
-                    state["bars_since_entry"] += 1
+            pos = positions[0]
+            # Increment bars_since_entry only when bar completes
+            if bar_completed and state["entry_price"] is not None:
+                state["bars_since_entry"] += 1
 
-                # CRITICAL: Use LOCKED entry_atr (risk never expands)
-                # state.get("entry_atr", atr) is NOT a working fallback: the
-                # normalizer always pre-populates this key (as None), so the
-                # default arg never fires and a legacy/state-mismatched
-                # position crashes downstream on `None * atr_multiplier`.
-                entry_atr_locked = state.get("entry_atr") or atr  # Fallback for legacy positions
-                hard_stop = state.get("hard_stop", None)
+            # CRITICAL: LOCKED entry_atr (risk never expands); fallback for legacy.
+            entry_atr_locked = state.get("entry_atr") or atr
+            hard_stop = state.get("hard_stop", None)
+            exit_label = "mean" if exit_at_mean else "upper band"
+            # LOCKED target (never recomputed live - see the prior implementation's
+            # note on why a live sma silently decays the take-profit into a
+            # breakeven-or-worse exit). Legacy fallback once.
+            target_price = state.get("target_price")
+            if target_price is None:
+                target_price = sma if exit_at_mean else upper_band
 
-                # === EXIT CONDITION 1: Regime Flip (FORCE EXIT) ===
-                # If market starts trending, mean reversion is wrong - exit immediately
-                if force_exit_regime:
-                    sell_amount = pos.amount * current_price
-
-                    logger.info(
-                        f"Bot {bot.id}: Mean Reversion EXIT (regime flip) - "
-                        f"Regime: {regime_name}, Mean reversion not suitable for trends"
+            def _mr_exit(*, evidence_name: str, evidence_reason: str) -> TradeSignal:
+                # Pillar 7: record outcome BEFORE clearing state (only with a real
+                # entry price - a fabricated value would corrupt the statistics).
+                ep = state.get("entry_price")
+                if ep is not None:
+                    initial_risk = entry_atr_locked * atr_stop_mult
+                    pnl_per_unit = current_price - ep
+                    rr = (pnl_per_unit / initial_risk) if initial_risk > 0 else None
+                    edge_manager.record_trade_outcome(
+                        bot.id, "mean_reversion",
+                        pnl=pnl_per_unit, win=(pnl_per_unit > 0), reward_risk_realized=rr,
+                        holding_seconds=state.get("bars_since_entry", 0) * bar_interval_seconds,
+                        at=self.clock.now(),
                     )
+                state["entry_price"] = None
+                state["entry_atr"] = None
+                state["target_price"] = None
+                state["hard_stop"] = None
+                state["bars_since_entry"] = 0
+                state["last_exit_time"] = self.clock.now()
+                self._mean_reversion_states[bot.id] = state
+                proposal = _single_evidence_proposal(
+                    direction=Direction.SELL, execution_intent=ExecutionIntent.CLOSE_POSITION,
+                    evidence_name=evidence_name, evidence_value=1.0,
+                    evidence_reason=evidence_reason,
+                    suggested_position_size=pos.amount * current_price,
+                )
+                return StandaloneAdapter.to_trade_signal(proposal)
 
-                    # Clear state
-                    state["entry_price"] = None
-                    state["entry_atr"] = None
-                    state["target_price"] = None
-                    state["hard_stop"] = None
-                    state["bars_since_entry"] = 0
-                    state["last_exit_time"] = self.clock.now()
-                    self._mean_reversion_states[bot.id] = state
+            # EXIT 1: Regime flip (force exit) - a trending market makes MR wrong.
+            if force_exit_regime:
+                logger.info(f"Bot {bot.id}: Mean Reversion EXIT (regime flip) - {regime_name}")
+                return _mr_exit(
+                    evidence_name="Regime flip exit",
+                    evidence_reason=f"regime flipped to {regime_name} - mean reversion not suitable for trends",
+                )
+            # EXIT 2: Mean reached (locked target).
+            if last_bar_close >= target_price:
+                logger.info(
+                    f"Bot {bot.id}: Mean Reversion EXIT (target) - close ${last_bar_close:.2f} >= ${target_price:.2f}"
+                )
+                return _mr_exit(
+                    evidence_name=f"{exit_label} reached",
+                    evidence_reason=f"bar close ${last_bar_close:.2f} reached the locked {exit_label} target ${target_price:.2f}",
+                )
+            # EXIT 3: Hard stop (locked ATR-based).
+            if hard_stop is not None and current_price <= hard_stop:
+                logger.info(f"Bot {bot.id}: Mean Reversion EXIT (hard stop) - ${current_price:.2f} <= ${hard_stop:.2f}")
+                return _mr_exit(
+                    evidence_name="Hard stop hit",
+                    evidence_reason=f"price ${current_price:.2f} <= locked hard stop ${hard_stop:.2f}",
+                )
+            # EXIT 4: Time stop (max hold bars).
+            if state["bars_since_entry"] >= max_hold_bars:
+                logger.info(f"Bot {bot.id}: Mean Reversion EXIT (time stop) - {state['bars_since_entry']} bars")
+                return _mr_exit(
+                    evidence_name="Time stop",
+                    evidence_reason=f"held {state['bars_since_entry']} bars >= max {max_hold_bars} without reaching the mean",
+                )
 
-                    return TradeSignal(
-                        action="sell",
-                        amount=sell_amount,
-                        order_type="market",
-                        reason=f"Mean Reversion: Force exit (regime={regime_name})",
-                    )
-
-                # === EXIT CONDITION 2: Mean Reached (TARGET) ===
-                # CRITICAL: Use the LOCKED target_price recorded at entry, never a
-                # freshly recomputed sma/upper_band. Mean reversion enters while
-                # price is declining into the lower band, so a live-recomputed sma
-                # keeps drifting down with it — "mean reached" would then fire the
-                # moment price stops falling, regardless of whether it ever
-                # recovered toward the level that made the trade worth taking.
-                # That silently turns the take-profit exit into a breakeven-or-worse
-                # exit. Locking the target the same way entry_atr/hard_stop are
-                # already locked closes that hole. Legacy positions opened before
-                # this field existed fall back to the current sma/upper_band once,
-                # same convention as the entry_atr_locked fallback above.
-                exit_label = "mean" if exit_at_mean else "upper band"
-                target_price = state.get("target_price")
-                if target_price is None:
-                    target_price = sma if exit_at_mean else upper_band
-
-                if last_bar_close >= target_price:
-                    sell_amount = pos.amount * current_price
-
-                    logger.info(
-                        f"Bot {bot.id}: Mean Reversion EXIT (target reached) - "
-                        f"Bar close ${last_bar_close:.2f} >= locked {exit_label} target ${target_price:.2f}"
-                    )
-
-                    # Clear state
-                    state["entry_price"] = None
-                    state["entry_atr"] = None
-                    state["target_price"] = None
-                    state["hard_stop"] = None
-                    state["bars_since_entry"] = 0
-                    state["last_exit_time"] = self.clock.now()
-                    self._mean_reversion_states[bot.id] = state
-
-                    return TradeSignal(
-                        action="sell",
-                        amount=sell_amount,
-                        order_type="market",
-                        reason=f"Mean Reversion: {exit_label} reached (${target_price:.2f})",
-                    )
-
-                # === EXIT CONDITION 3: Hard Stop (ATR-BASED) ===
-                # Stop is locked at entry, never widens
-                if hard_stop is not None and current_price <= hard_stop:
-                    sell_amount = pos.amount * current_price
-
-                    logger.info(
-                        f"Bot {bot.id}: Mean Reversion EXIT (hard stop) - "
-                        f"Price ${current_price:.2f} <= Stop ${hard_stop:.2f}, "
-                        f"Entry ATR (locked): ${entry_atr_locked:.4f}"
-                    )
-
-                    # Clear state
-                    state["entry_price"] = None
-                    state["entry_atr"] = None
-                    state["target_price"] = None
-                    state["hard_stop"] = None
-                    state["bars_since_entry"] = 0
-                    state["last_exit_time"] = self.clock.now()
-                    self._mean_reversion_states[bot.id] = state
-
-                    return TradeSignal(
-                        action="sell",
-                        amount=sell_amount,
-                        order_type="market",
-                        reason=f"Mean Reversion: Hard stop (${hard_stop:.2f})",
-                    )
-
-                # === EXIT CONDITION 4: Time Stop (MAX HOLD BARS) ===
-                # If mean not reached within N bars, exit anyway (bounded holding)
-                if state["bars_since_entry"] >= max_hold_bars:
-                    sell_amount = pos.amount * current_price
-
-                    logger.info(
-                        f"Bot {bot.id}: Mean Reversion EXIT (time stop) - "
-                        f"Held {state['bars_since_entry']} bars >= max {max_hold_bars}"
-                    )
-
-                    # Clear state
-                    state["entry_price"] = None
-                    state["entry_atr"] = None
-                    state["target_price"] = None
-                    state["hard_stop"] = None
-                    state["bars_since_entry"] = 0
-                    state["last_exit_time"] = self.clock.now()
-                    self._mean_reversion_states[bot.id] = state
-
-                    return TradeSignal(
-                        action="sell",
-                        amount=sell_amount,
-                        order_type="market",
-                        reason=f"Mean Reversion: Time stop ({state['bars_since_entry']} bars)",
-                    )
-
-            # Update state and hold
+            # No exit - hold.
             self._mean_reversion_states[bot.id] = state
-
-            # A conditional inside the f-string format spec ({x:.2f if ...}) is a
-            # ValueError ("Invalid format specifier"); format the optional stop
-            # outside the f-string so a held position never raises here.
             stop_str = f"${hard_stop:.2f}" if hard_stop is not None else "N/A"
-            return TradeSignal(
-                action="hold",
-                amount=0,
-                reason=f"Mean Reversion: Holding, target ${target_price:.2f}, stop {stop_str}, bars {state['bars_since_entry']}/{max_hold_bars}"
+            hold_proposal = _single_evidence_proposal(
+                direction=Direction.HOLD, execution_intent=ExecutionIntent.HOLD_POSITION,
+                evidence_name="Position intact",
+                evidence_value=1.0,
+                evidence_reason="no exit condition (regime flip, mean target, hard stop, time stop) triggered this cycle",
+                assumptions=("range/band structure not broken and the regime is still range-bound",),
+            )
+            return _emit_hold(
+                hold_proposal,
+                f"Mean Reversion: Holding, target ${target_price:.2f}, stop {stop_str}, "
+                f"bars {state['bars_since_entry']}/{max_hold_bars}",
             )
 
         # === ENTRY LOGIC (BAR-BASED) ===
-        # Entry: bar close <= lower BB, regime allowed, cooldown elapsed
+        # Entry: bar close <= lower BB (precondition), regime suitable (Pillar 2),
+        # Decision Score clears threshold (Pillar 3), edge not Category C
+        # (Pillar 7), cooldown elapsed.
 
-        # Regime gate: Block entries if wrong market conditions
+        # PILLAR 2 hard gate: refuse unsuitable regimes.
         if not regime_allows_entry:
             self._mean_reversion_states[bot.id] = state
-            return TradeSignal(
-                action="hold",
-                amount=0,
-                reason=f"Mean Reversion: Waiting for suitable regime (current: {regime_name})"
+            return _emit_hold(
+                _single_evidence_proposal(
+                    direction=Direction.NO_TRADE, execution_intent=ExecutionIntent.NO_ACTION,
+                    evidence_name="Market suitability", evidence_value=0.0,
+                    evidence_reason=suitability.reason,
+                ),
+                f"Mean Reversion: Waiting for suitable regime (current: {regime_name})",
             )
 
         # Cooldown check
@@ -2633,111 +2643,218 @@ class TradingEngine:
             if time_since_exit < cooldown_seconds:
                 remaining = int(cooldown_seconds - time_since_exit)
                 self._mean_reversion_states[bot.id] = state
-                return TradeSignal(
-                    action="hold",
-                    amount=0,
-                    reason=f"Mean Reversion: Cooldown ({remaining}s remaining)"
+                return _emit_hold(
+                    _single_evidence_proposal(
+                        direction=Direction.NO_TRADE, execution_intent=ExecutionIntent.NO_ACTION,
+                        evidence_name="Cooldown elapsed", evidence_value=0.0,
+                        evidence_reason=f"{remaining}s of post-exit cooldown remain",
+                    ),
+                    f"Mean Reversion: Cooldown ({remaining}s remaining)",
                 )
 
-        # Entry condition: bar close <= lower Bollinger Band
+        # PRECONDITION: bar close at/below the lower Bollinger Band. Mean
+        # reversion only ever buys a statistical extreme - kept as a hard gate;
+        # the Decision Score below grades the QUALITY of a genuine touch.
         if last_bar_close <= lower_band:
-            # Expected profit: from current execution price to the SMA (MR's
-            # profit target). Using current_price (not last_bar_close) reflects
-            # the actual cost basis at which the order would fill.
-            expected_move_pct = max(
-                0.0,
-                (sma - current_price) / current_price if current_price > 0 else 0.0,
-            )
+            # Expected profit: current execution price -> the SMA (MR's target).
+            reversion_frac = (sma - current_price) / current_price if current_price > 0 else 0.0
+            expected_move_pct = max(0.0, reversion_frac)
+            penetration_frac = (lower_band - last_bar_close) / lower_band if lower_band > 0 else 0.0
+            band_width_frac = (upper_band - lower_band) / sma if sma > 0 else 0.0
 
-            # Pre-flight viability: verify the band is wide enough to cover
-            # round-trip fees BEFORE we mutate state.  MR writes entry_price and
-            # hard_stop before returning the BUY signal; if the central viability
-            # gate in _execute_trade later rejects the order (fees exceed the
-            # expected move), MR's in-memory state would record an entry that has
-            # no matching DB position, causing re-entry attempts every loop.
-            # isinstance guard: tests where bot.exchange_fee is a Mock use 0.1 %
-            # default rather than propagating a non-numeric value into the check.
+            # Pillar 8 + pre-flight viability: the band must cover round-trip
+            # fees BEFORE state mutation (kept ahead of the score - a trade that
+            # cannot clear fees is rejected regardless of conviction).
             _fee_raw = getattr(bot, 'exchange_fee', 0.1)
             _mr_fee_pct = (
                 float(_fee_raw) if isinstance(_fee_raw, (int, float)) else 0.1
             ) / 100.0
             _mr_min_move = 2.0 * _mr_fee_pct + _VIABILITY_SAFETY_MARGIN_PCT
+            exp.check("Fee viability", expected_move_pct, f">= {_mr_min_move:.5f}", expected_move_pct >= _mr_min_move)
             if expected_move_pct < _mr_min_move:
                 self._mean_reversion_states[bot.id] = state
-                return TradeSignal(
-                    action="hold",
-                    amount=0,
-                    reason=(
+                return _emit_hold(
+                    _single_evidence_proposal(
+                        direction=Direction.NO_TRADE, execution_intent=ExecutionIntent.NO_ACTION,
+                        evidence_name="Fee viability", evidence_value=0.0,
+                        evidence_reason=(
+                            f"reversion target {expected_move_pct * 100:.3f}% < fee threshold "
+                            f"{_mr_min_move * 100:.3f}% - cannot clear round-trip costs"
+                        ),
+                    ),
+                    (
                         f"Mean Reversion: Band too narrow for fees "
                         f"({expected_move_pct * 100:.3f}% < {_mr_min_move * 100:.3f}%)"
                     ),
                 )
 
-            # Fixed percentage position sizing, capped at _BUY_BALANCE_FRACTION
-            # of balance so the simulated exchange fee cannot push cost + fee
-            # over available funds, then floored to the executable minimum.
-            buy_amount = min(
-                bot.current_balance * order_size_percent,
-                bot.current_balance * _BUY_BALANCE_FRACTION,
+            # === PILLAR 3: EVIDENCE-BASED DECISION SCORE ===
+            evidence_items = [
+                EvidenceItem(
+                    name="Reversion target distance",
+                    measurement=lambda d: reversion_frac,
+                    normalization=lambda r: max(-1.0, min(1.0, r / 0.02)),
+                    weight=35.0,
+                    reason=(
+                        "Theory (overreaction reversion): the reward is the distance from the "
+                        "oversold price back to the mean; a larger gap to the SMA is a larger "
+                        "expected reversion move, the core of the edge."
+                    ),
+                ),
+                EvidenceItem(
+                    name="Oversold penetration",
+                    measurement=lambda d: penetration_frac,
+                    normalization=lambda r: max(-1.0, min(1.0, r / 0.005)),
+                    weight=35.0,
+                    reason=(
+                        "Theory: the further price has pushed BELOW the lower band (a ~2-std "
+                        "extreme), the more likely the move is transient order-flow overreaction "
+                        "rather than information, and the stronger the snap-back tends to be."
+                    ),
+                ),
+                EvidenceItem(
+                    name="Band width adequacy",
+                    measurement=lambda d: band_width_frac,
+                    normalization=lambda r: max(-1.0, min(1.0, (r - 0.01) / 0.03)),
+                    weight=30.0,
+                    reason=(
+                        "Theory: reversion is only worth trading if the range is wide enough to "
+                        "profit after fees; a wider band (more realized volatility) means more "
+                        "room between the extreme and the mean, a collapsed band means none."
+                    ),
+                ),
+            ]
+            decision_score = DecisionScoreEngine().score(
+                "mean_reversion", evidence_items, {}, threshold=decision_score_threshold,
+            )
+            edge_manager.record_decision_score(bot.id, "mean_reversion", decision_score.total)
+            reasons_for, reasons_against = derive_reasons(decision_score)
+            assumptions = (
+                "range/band structure not broken: price stays within a mean-reverting range, "
+                "not the start of a trend",
+                "regime remains range-bound (trend_flat / high-volatility, not trending)",
+            )
+            exp.metric("decision_score_total", decision_score.total)
+            exp.metric("decision_score_threshold", decision_score_threshold)
+            exp.metric("edge_status_category", edge_status.category.value)
+            exp.check(
+                "Decision Score clears threshold", decision_score.total,
+                f">= {decision_score_threshold:.1f}", decision_score.approved,
+            )
+            exp.check(
+                "Strategy edge not disqualified", edge_status.category.value,
+                f"!= {EdgeCategory.C.value}", edge_status.category != EdgeCategory.C,
+                detail=edge_status.reason,
             )
 
+            blocking_reasons = []
+            if not decision_score.approved:
+                blocking_reasons.append(
+                    f"Decision Score {decision_score.total:.1f} < threshold {decision_score_threshold:.1f}"
+                )
+            if edge_status.category == EdgeCategory.C:
+                blocking_reasons.append(f"Strategy Edge Management: Category C - {edge_status.reason}")
+            if blocking_reasons:
+                self._mean_reversion_states[bot.id] = state
+                reason_text = "; ".join(blocking_reasons)
+                return _emit_hold(
+                    _single_evidence_proposal(
+                        direction=Direction.NO_TRADE, execution_intent=ExecutionIntent.NO_ACTION,
+                        evidence_name="Framework gates", evidence_value=0.0,
+                        evidence_reason=reason_text, assumptions=assumptions,
+                    ),
+                    f"Mean Reversion: band touched but {reason_text}",
+                )
+
+            # === PILLAR 5: DECISION-SCORE-WEIGHTED POSITION SIZING ===
+            score_range = max(100.0 - decision_score_threshold, 1e-9)
+            score_margin = max(0.0, min(1.0, (decision_score.total - decision_score_threshold) / score_range))
+            size_multiplier = 0.5 + score_margin
+            exp.metric("decision_score_size_multiplier", size_multiplier)
+
+            buy_amount = min(
+                bot.current_balance * order_size_percent * size_multiplier,
+                bot.current_balance * _BUY_BALANCE_FRACTION,
+            )
             if buy_amount < MIN_ORDER_USD:
                 if bot.current_balance >= MIN_ORDER_USD:
                     buy_amount = MIN_ORDER_USD
                 else:
+                    exp.check("Position size >= min order", buy_amount, f">= {MIN_ORDER_USD:.0f}", False)
                     self._mean_reversion_states[bot.id] = state
-                    return TradeSignal(
-                        action="hold",
-                        amount=0,
-                        reason=(
+                    return _emit_hold(
+                        _single_evidence_proposal(
+                            direction=Direction.NO_TRADE, execution_intent=ExecutionIntent.NO_ACTION,
+                            evidence_name="Order size", evidence_value=0.0,
+                            evidence_reason=(
+                                f"balance ${bot.current_balance:.2f} below ${MIN_ORDER_USD:.0f} minimum order"
+                            ),
+                        ),
+                        (
                             f"Mean Reversion: balance ${bot.current_balance:.2f} "
                             f"below ${MIN_ORDER_USD:.0f} minimum order"
                         ),
                     )
+            exp.check("Position size >= min order", buy_amount, f">= {MIN_ORDER_USD:.0f}", True)
 
-            logger.info(
-                f"Bot {bot.id}: Mean Reversion ENTRY - "
-                f"Bar close ${last_bar_close:.2f} <= lower BB ${lower_band:.2f}, "
-                f"Entry ATR locked at ${atr:.4f}, Position: ${buy_amount:.2f}"
-            )
-
-            # Initialize state with LOCKED entry_atr, hard stop, AND target.
-            # target_price is locked here (not recomputed from a live sma on every
-            # tick) so the take-profit exit cannot decay into a moving-loss exit —
-            # see the "mean reached" exit condition below for the failure mode
-            # this closes.
+            # Lock entry state (LOCKED entry_atr / hard stop / target).
             locked_target = sma if exit_at_mean else upper_band
             locked_stop = current_price - (atr * atr_stop_mult)
+            exp.check(
+                "Initial hard stop below entry", locked_stop, f"< {current_price:.2f}",
+                locked_stop < current_price,
+            )
             state["entry_price"] = current_price
-            state["entry_atr"] = atr  # LOCKED - stop distance will always use this
-            state["target_price"] = locked_target  # LOCKED - profit target never moves
+            state["entry_atr"] = atr
+            state["target_price"] = locked_target
             state["hard_stop"] = locked_stop
             state["bars_since_entry"] = 0
             self._mean_reversion_states[bot.id] = state
 
-            # Risk/reward at entry, in the same units as expected_move_pct (reward)
-            # so the execution-layer viability gate can enforce a minimum RR ratio
-            # without any strategy-specific logic of its own.
             expected_risk_pct = (
                 (current_price - locked_stop) / current_price if current_price > 0 else 0.0
             )
 
-            return TradeSignal(
-                action="buy",
-                amount=buy_amount,
-                order_type="market",
-                reason=f"Mean Reversion: Entry at lower band (${lower_band:.2f})",
-                expected_move_pct=expected_move_pct,
-                expected_risk_pct=expected_risk_pct,
+            logger.info(
+                f"Bot {bot.id}: Mean Reversion ENTRY - "
+                f"Decision Score {decision_score.total:.1f}/{decision_score_threshold:.1f}, "
+                f"Bar close ${last_bar_close:.2f} <= lower BB ${lower_band:.2f}, "
+                f"Entry ATR ${atr:.4f}, Position: ${buy_amount:.2f}"
             )
 
-        # Update state and hold
-        self._mean_reversion_states[bot.id] = state
+            # === PILLAR 10: STRATEGYPROPOSAL -> STANDALONE ADAPTER ===
+            gen = self.clock.now()
+            proposal = StrategyProposal(
+                strategy_id="mean_reversion", bot_id=bot.id, generated_at=gen,
+                direction=Direction.BUY, execution_intent=ExecutionIntent.OPEN_POSITION,
+                validity=ProposalValidity(
+                    generated_at=gen,
+                    valid_until=gen + timedelta(seconds=_validity_interval_seconds),
+                ),
+                decision_score=decision_score, market_suitability=suitability, edge_status=edge_status,
+                assumptions=assumptions, reasons_for=reasons_for, reasons_against=reasons_against,
+                suggested_position_size=buy_amount,
+                suggested_risk_budget_pct=order_size_percent * size_multiplier,
+                expected_holding_horizon="short",
+                adaptive_parameters_used={"decision_score_size_multiplier": size_multiplier},
+                explanation=exp.to_dict(),
+            )
+            return StandaloneAdapter.to_trade_signal(
+                proposal, expected_move_pct=expected_move_pct, expected_risk_pct=expected_risk_pct,
+            )
 
-        return TradeSignal(
-            action="hold",
-            amount=0,
-            reason=f"Mean Reversion: Waiting for lower band (current: ${last_bar_close:.2f}, target: ${lower_band:.2f})"
+        # No band touch - wait.
+        self._mean_reversion_states[bot.id] = state
+        return _emit_hold(
+            _single_evidence_proposal(
+                direction=Direction.NO_TRADE, execution_intent=ExecutionIntent.NO_ACTION,
+                evidence_name="Lower band touch", evidence_value=0.0,
+                evidence_reason=(
+                    f"bar close ${last_bar_close:.2f} above lower band ${lower_band:.2f} - "
+                    "no statistical extreme to fade"
+                ),
+            ),
+            f"Mean Reversion: Waiting for lower band (current: ${last_bar_close:.2f}, target: ${lower_band:.2f})",
         )
 
     async def _reconcile_live_account(

@@ -331,25 +331,39 @@ and sizing gaps; P5 needs a Decision Score input.
 
 ## Phase 4 — mean_reversion (P2/P6 already solid; needs P3/P5/P7 built)
 
+**Status: ✓ Complete (8/8), Under review** (see `audits/mean_reversion.md`'s
+Certification Checklist). Migrated in `_strategy_mean_reversion` (single
+method), now wired through `MarketSuitabilityGate` (its existing reference
+Pillar 2 routed through the shared gate), `DecisionScoreEngine` (3 Evidence
+Items, weighted so no single factor reaches the threshold), `StrategyEdgeManager`,
+Decision-Score-weighted sizing, `StrategyProposal`, and `StandaloneAdapter`. The
+band-touch entry precondition and all four exits (Pillar 6) are preserved.
+`bollinger_std` docstring/code mismatch fixed. 16 new tests
+(`backend/tests/test_mean_reversion_framework_migration.py`); four existing
+suites' MR fixtures isolated from the new score gate via
+`decision_score_threshold: 0.0` (mirroring Phase 2). Full suite: 1201/1201
+passing, zero regressions. Before/after backtest across bull/bear/chop — see
+`audits/mean_reversion.md`'s Backtesting section.
+
 See `audits/mean_reversion.md`. Gaps: P1, P3, P4 (beyond stop), P7, P9;
 P8 fee-gate/sizing gap; P5 needs a Decision Score input; fix the
 `bollinger_std` docstring/code mismatch (2130 says 2.0, code uses 1.8)
 while touching this strategy.
 
-- [ ] 4.1 Author theory (P1) and performance expectations (P9).
-- [ ] 4.2 Replace the single band-touch entry condition with a
+- [x] 4.1 Author theory (P1) and performance expectations (P9).
+- [x] 4.2 Replace the single band-touch entry condition with a
       `DecisionScoreEngine` call (this strategy's Pillar 2/6 are already
       the reference implementation - reuse its existing regime-detection
       pattern as a model for Phases 1-3's suitability gates), defining
       Evidence Items with documented Measurement/Normalization/Weight.
-- [ ] 4.3 Fix the `bollinger_std` docstring/code mismatch.
-- [ ] 4.4 Wire `StrategyEdgeManager` before entry; define this strategy's
+- [x] 4.3 Fix the `bollinger_std` docstring/code mismatch.
+- [x] 4.4 Wire `StrategyEdgeManager` before entry; define this strategy's
       specific Category A/B/C signal thresholds.
-- [ ] 4.5 Wire Decision-Score-weighted sizing in place of the flat
+- [x] 4.5 Wire Decision-Score-weighted sizing in place of the flat
       `order_size_percent`.
-- [ ] 4.6 Close Pillar 8 gaps: fee-viability gate and sizing/min-order
+- [x] 4.6 Close Pillar 8 gaps: fee-viability gate and sizing/min-order
       floor need `.check()` calls; verify the Evidence Report.
-- [ ] 4.7 Migrate this strategy's return type from `TradeSignal` to
+- [x] 4.7 Migrate this strategy's return type from `TradeSignal` to
       `StrategyProposal`, including this strategy's `execution_intent`
       mapping (band-touch entry -> OPEN_POSITION, mean-reversion exit ->
       CLOSE_POSITION), a `validity.valid_until` matching its evaluation
@@ -357,7 +371,7 @@ while touching this strategy.
       structure not broken, regime still range-bound"); verify standalone
       execution via the Standalone Adapter is behavior-identical to the
       pre-migration path.
-- [ ] 4.8 Certification review; before/after backtest comparison.
+- [x] 4.8 Certification review; before/after backtest comparison.
 
 ## Phase 5 — adaptive_grid (most complex state machine; sequenced after the framework is proven)
 

@@ -93,6 +93,10 @@ _MR_PARAMS = {
     "atr_period": 14,
     "order_size_percent": 0.95,
     "regime_filter_enabled": False,
+    # Isolate the viability/sizing path from the Phase-4 Decision Score gate
+    # (covered in test_mean_reversion_framework_migration.py). The fee-viability
+    # check runs BEFORE the score, so the "band too narrow" test still fires.
+    "decision_score_threshold": 0.0,
 }
 
 # Trend Following params: short periods and 1-loop confirmation so the strategy

@@ -183,7 +183,8 @@ class TestEngineExplanationIntegration:
         engine = TradingEngine()
         bot = _bot(
             "mean_reversion", 7002,
-            strategy_params={"regime_filter_enabled": False, "bollinger_period": 20},
+            strategy_params={"regime_filter_enabled": False, "bollinger_period": 20,
+                             "decision_score_threshold": 0.0},
         )
 
         base = datetime.utcnow() - timedelta(seconds=4000)

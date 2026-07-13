@@ -857,8 +857,10 @@ class TestDefaultParameterChanges:
         }
 
         with patch.object(engine, "_get_bot_positions", new=AsyncMock(return_value=[])):
+            # Isolate the band-touch entry mechanics from the Phase-4 Decision
+            # Score gate (covered in test_mean_reversion_framework_migration.py).
             signal = await engine._strategy_mean_reversion(
-                bot, sma_price - 300, {}, session
+                bot, sma_price - 300, {"decision_score_threshold": 0.0}, session
             )
 
         assert signal is not None

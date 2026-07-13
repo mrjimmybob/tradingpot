@@ -50,6 +50,10 @@ def _trending_candles(n=100, base=100.0, drift_pct=0.01, start_ms=1704067200000,
 _MEAN_REVERSION_PARAMS = {
     "bar_interval_seconds": 0, "regime_filter_enabled": False,
     "bollinger_period": 10, "atr_period": 10, "cooldown_seconds": 0,
+    # These are engine-mechanics tests (replay, fees, determinism), not tests of
+    # mean_reversion's Phase-4 Decision Score gate - isolate them from it so the
+    # engine still produces trades to measure.
+    "decision_score_threshold": 0.0,
 }
 
 
