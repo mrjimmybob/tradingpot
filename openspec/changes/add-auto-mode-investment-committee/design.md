@@ -797,3 +797,39 @@ execution pipeline.
   is than any single strategy) is left to whoever implements it — this
   design specifies WHAT must hold, not the process discipline around
   re-verifying it over time.
+
+## Open Questions — Resolutions (Phase 4)
+
+These record the implementation-phase decisions that close the Open Questions
+above. None changes the frozen architecture; all are the "calibrate/choose
+later" decisions the design deliberately deferred.
+
+- **Tie-breaking policy → RESOLVED: split allocation.** Exact ties (equal on
+  every ranking-key component) are resolved by splitting the available capital
+  **proportionally to each proposal's suggested size** — symmetric,
+  batch-order-independent, and strategy-identity-blind (never an arbitrary
+  pick). See `process.py` step 8 and the Phase 1 Decision. Certified by
+  `test_gate_3_...` and `test_gate_equal_ranked_...`.
+- **Ranking formula → RESOLVED (ordering, not weights).** The base ranking key
+  is `(decision_score.total, validated expected_edge_estimate.expectancy when
+  present, suggested_risk_budget_pct)`, descending — Comparison-Contract-only
+  and identity-blind (`process.rank_key`). No numeric cross-field weights are
+  fixed (none are needed for a lexicographic ordering); calibrated weighting
+  remains future work, and any trust-driven adjustment is isolated behind the
+  ranking-policy seam (Phase 3 Decision), so no ranking *mathematics* is baked
+  into the architecture.
+- **Multi-selection sequencing → RESOLVED.** The max-total-exposure cap is one
+  shared budget consumed across the complete decision in ranking order, with
+  proportional tie-splits — order-independent (Phase 1 Decision). Certified by
+  the combined-exposure and order-independence tests.
+- **`decision_id` determinism scope → RESOLVED.** Keyed deterministically on
+  `(evaluated_at, sorted proposal_ids considered)` (`decision.py`) — reproducible
+  per cycle/batch. Certified by `test_gate_8_...`.
+- **Correlation / concentration / cash-reserve location → STILL OPEN (out of
+  scope).** Not built by this change; their reserved place in step 5 is
+  unchanged. A future change chooses whether to extend `PortfolioRiskService`
+  or add a sibling service — either slots into step 5 without a Committee
+  Process redesign.
+- **Certification cadence → RESOLVED: continuously re-verified.** The nine-item
+  gate is an automated suite (`TestAutoCertificationGate`) re-run with the full
+  test suite on every change, not a one-time sign-off. See `certification.md`.

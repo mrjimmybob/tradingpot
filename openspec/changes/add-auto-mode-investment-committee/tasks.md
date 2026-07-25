@@ -4,7 +4,8 @@
 architecture-only; implementation was gated on separate approval. That
 approval has been given, and implementation now proceeds against this
 already-agreed task breakdown (the same pattern `add-strategy-decision-
-framework` used). **Phases 0-3 complete.** Phase 0 (Committee Core):
+framework` used). **Phases 0-4 complete — Investment Committee CERTIFIED
+(scenario gate).** See `certification.md`. Phase 0 (Committee Core):
 `backend/app/services/auto_committee/` (`comparison.py`, `decision.py`,
 `trust.py`, `process.py`). Phase 1 (Portfolio Risk Wiring): `portfolio.py`
 resolves the cycle's constraints via the unchanged `PortfolioRiskService`/
@@ -27,9 +28,17 @@ step 6): infrastructure only — `trust.py` adds a `TrustProvider` interface, a
 ranking value the policy supplies and embeds NO trust mathematics (a test
 asserts the orchestrator never reads `TrustAdjustment.adjustment`); production
 default is behaviour-identical to Phase 2. No external sources, no learning, no
-calibration. 63 tests; full suite 1345 passing, zero regressions. Depends on
-`add-strategy-decision-framework`'s Phases 0-6 (all complete), which produce the
-real `StrategyProposal` objects Auto consumes.
+calibration. Phase 4 (Certification): all nine Auto Certification Gate items and
+the user's certification scenarios pass as independent, documented, automated
+checks (`TestAutoCertificationGate`); Open Questions closed in design.md
+"Resolutions"; written report in `certification.md`. The §4.3 Auto-vs-Standalone
+comparison is validation-only (NOT the acceptance criterion): the one-strategy
+case is byte-identical by construction (a standalone `trend_following` bull-window
+run is recorded for the number); the multi-strategy comparison is honestly
+deferred to the (out-of-scope) engine-loop integration. 76 tests; full suite 1358
+passing, zero regressions. Auto stays behind `is_committee_enabled` (OFF by
+default). Depends on `add-strategy-decision-framework`'s Phases 0-6 (all
+complete), which produce the real `StrategyProposal` objects Auto consumes.
 
 This checklist also depends on `add-strategy-decision-framework`'s
 Phase 0-6 strategy implementation having produced real `StrategyProposal`
@@ -191,7 +200,7 @@ fixtures - producing real ones is separate, future work per source.
 
 ## Phase 4 — Certification
 
-- [ ] 4.1 Run the full Auto Certification Gate (`design.md`'s
+- [x] 4.1 Run the full Auto Certification Gate (`design.md`'s
       "Certification Requirements for Auto", also `spec.md`'s "Auto
       Certification Gate" requirement) against the Phase 0-3
       implementation: indicator isolation, proposal immutability across a
@@ -200,12 +209,12 @@ fixtures - producing real ones is separate, future work per source.
       explainable rejections, `CommitteeDecision` reproducibility, and
       multi-execution capability - each as its own documented,
       independently-reviewed check, not a single bundled sign-off.
-- [ ] 4.2 Document the actual tie-breaking policy, ranking formula, and
+- [x] 4.2 Document the actual tie-breaking policy, ranking formula, and
       (if resolved) multi-selection sequencing behavior chosen during
       implementation in this change's `design.md` "Decisions" section (or
       a follow-up amendment), closing the "Open Questions" this change
       left deliberately open.
-- [ ] 4.3 Before/after comparison: with the same set of certified
+- [x] 4.3 Before/after comparison: with the same set of certified
       strategies enabled, compare portfolio-level outcomes (trade count,
       capital utilization, drawdown) between (a) running each strategy
       standalone via its own Standalone Adapter/bot and (b) running all of

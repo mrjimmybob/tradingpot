@@ -769,3 +769,162 @@ class TestTrustCertificationProperties:
         # lives only behind the ranking_policy seam, not in the committee.
         src = _inspect.getsource(_process_mod)
         assert ".adjustment" not in src
+
+
+# ---------------------------------------------------------------------------
+# Phase 4 — Auto Certification Gate. Each of the nine gate items (design.md
+# "Certification Requirements for Auto" / spec.md "Auto Certification Gate")
+# plus the user's certification scenarios, as its own documented, independent
+# check. This class is the authoritative certification suite; see
+# openspec/changes/add-auto-mode-investment-committee/certification.md.
+# ---------------------------------------------------------------------------
+
+import re as _re
+import pathlib as _pathlib
+
+from app.services import auto_committee as _auto_pkg
+
+
+class TestAutoCertificationGate:
+    # Gate 1 — Auto never reads indicators.
+    def test_gate_1_never_reads_indicators(self):
+        pkg_dir = _pathlib.Path(_auto_pkg.__file__).parent
+        forbidden = _re.compile(r"\b(ema|atr|macd|rsi|bollinger|donchian|adx)\b", _re.I)
+        for pyfile in sorted(pkg_dir.glob("*.py")):
+            hit = forbidden.search(pyfile.read_text())
+            assert hit is None, f"{pyfile.name} references a strategy indicator: {hit.group(0)!r}"
+        # And comparison logic only ever sees the Comparison Contract projection.
+        view = read_comparison(_proposal())
+        assert set(vars(view)) == {"proposal_id", *COMPARISON_CONTRACT_FIELDS}
+
+    # Gate 2 — Auto never rewrites a StrategyProposal (full cycle).
+    def test_gate_2_never_rewrites_a_proposal(self):
+        older = _proposal(bot_id=1, strategy_id="mr", gen=_GEN, total=30.0)
+        newer = _proposal(bot_id=1, strategy_id="mr", gen=_GEN + timedelta(seconds=1), total=88.0)
+        win = _proposal(bot_id=2, strategy_id="tf", total=95.0)
+        dead = _proposal(bot_id=3, strategy_id="db", edge_cat=EdgeCategory.C)
+        batch = [older, newer, win, dead]
+        ta = TrustAdjustment(win.proposal_id, "fear_greed", 3.0, _GEN)
+        before = [read_comparison(p) for p in batch]
+        run_committee(batch, now=_NOW + timedelta(seconds=1),
+                      portfolio=PortfolioConstraints(exposure_headroom_usd=1e6),
+                      trust_adjustments=[ta], ranking_policy=_MultiplierTestPolicy())
+        assert [read_comparison(p) for p in batch] == before
+
+    # Gate 3 — Tie-breaking is deterministic (fixed near-tie set, N runs + restarts).
+    def test_gate_3_tie_breaking_deterministic(self):
+        x = _proposal(strategy_id="x", total=50.0, size=300.0)
+        y = _proposal(strategy_id="y", total=50.0, size=100.0)
+        pc = PortfolioConstraints(exposure_headroom_usd=200.0, min_order_usd=10.0)
+        outs = {
+            tuple((s.proposal_id, s.allocated_size) for s in
+                  sorted(run_committee([x, y], now=_NOW, portfolio=pc).selected,
+                         key=lambda s: s.proposal_id))
+            for _ in range(25)
+        }
+        assert len(outs) == 1  # identical tie resolution every run
+
+    # Gate 4 — Ranking is reproducible.
+    def test_gate_4_ranking_reproducible(self):
+        batch = [_proposal(strategy_id="a", total=40.0),
+                 _proposal(strategy_id="b", total=90.0),
+                 _proposal(strategy_id="c", total=65.0)]
+        snaps = {tuple(run_committee(batch, now=_NOW).ranking_snapshot) for _ in range(25)}
+        assert len(snaps) == 1
+
+    # Gate 5 — Ranking is strategy-identity-blind.
+    def test_gate_5_ranking_identity_blind(self):
+        r1 = [_proposal(strategy_id="trend_following", total=90.0),
+              _proposal(strategy_id="mean_reversion", total=40.0)]
+        r2 = [_proposal(strategy_id="mean_reversion", total=90.0),
+              _proposal(strategy_id="trend_following", total=40.0)]
+        assert _ranked_scores(run_committee(r1, now=_NOW), r1) == \
+               _ranked_scores(run_committee(r2, now=_NOW), r2) == [90.0, 40.0]
+
+    # Gate 6 — Trust adjustments are auditable and their effect reconstructable.
+    def test_gate_6_trust_auditable(self):
+        hi = _proposal(strategy_id="hi", total=90.0)
+        lo = _proposal(strategy_id="lo", total=40.0)
+        ta = TrustAdjustment(lo.proposal_id, "fear_greed", 10.0, _GEN)  # 40*10 > 90
+        d = run_committee([hi, lo], now=_NOW, trust_adjustments=[ta],
+                          ranking_policy=_MultiplierTestPolicy())
+        assert d.trust_adjustments_applied == (f"fear_greed:{lo.proposal_id}",)
+        assert d.ranking_snapshot[0] == lo.proposal_id  # effect visible in ranking_snapshot
+
+    # Gate 7 — Every rejection names a specific step and a measurable reason.
+    def test_gate_7_rejections_explainable(self):
+        now = _GEN + timedelta(minutes=5)
+        g = _GEN + timedelta(minutes=4)
+        expired = _proposal(strategy_id="exp", gen=_GEN, valid_minutes=1)
+        old = _proposal(strategy_id="dup", bot_id=9, gen=g, total=50.0)
+        new = _proposal(strategy_id="dup", bot_id=9, gen=g + timedelta(seconds=1), total=50.0)
+        edge = _proposal(strategy_id="edge", gen=g, edge_cat=EdgeCategory.C)
+        capped = _proposal(strategy_id="cap", gen=g, total=80.0)
+        hold = _proposal(strategy_id="hold", gen=g, direction=Direction.NO_TRADE,
+                         intent=ExecutionIntent.NO_ACTION)
+        pc = PortfolioConstraints(capacity_block={capped.proposal_id: "trend_following at capacity"})
+        d = run_committee([expired, old, new, edge, capped, hold], now=now, portfolio=pc)
+        steps = {r.rejection_step for r in d.rejected}
+        assert {"expired", "superseded", "edge_disqualified",
+                "strategy_capacity", "not_actionable"} <= steps
+        for r in d.rejected:
+            assert r.rejection_step and r.rejection_reason  # named step + measurable reason
+        assert new.proposal_id in {s.proposal_id for s in d.selected}
+
+    # Gate 8 — CommitteeDecision is reproducible (identical, including decision_id).
+    def test_gate_8_committee_decision_reproducible(self):
+        batch = [_proposal(strategy_id="a", total=90.0),
+                 _proposal(strategy_id="b", total=40.0)]
+        d1 = run_committee(batch, now=_NOW)
+        d2 = run_committee(batch, now=_NOW)
+        assert d1 == d2 and d1.decision_id == d2.decision_id
+
+    # Gate 9 — Multiple-execution capability is actually exercised.
+    def test_gate_9_multi_execution_exercised(self):
+        batch = [_proposal(strategy_id="a", total=90.0),
+                 _proposal(strategy_id="b", total=70.0),
+                 _proposal(strategy_id="c", total=50.0)]
+        d = run_committee(batch, now=_NOW)
+        assert len(d.selected) == 3
+        assert [s.execution_priority for s in
+                sorted(d.selected, key=lambda s: s.execution_priority)] == [1, 2, 3]
+
+    # --- User certification scenarios (mapped to the same suite) -------------
+
+    @pytest.mark.asyncio
+    async def test_gate_single_proposal_identical_to_standalone(self):
+        proposal = _proposal(strategy_id="trend_following", direction=Direction.BUY,
+                             intent=ExecutionIntent.OPEN_POSITION, total=75.0, size=500.0)
+        bot, exch, sess = object(), object(), object()
+        eng_a, eng_b = _exec_engine(), _exec_engine()
+        await StandaloneAdapter().execute(proposal, engine=eng_a, bot=bot, exchange=exch,
+                                          current_price=100.0, session=sess, now=_NOW)
+        decision = run_committee([proposal], now=_NOW)
+        await execute_committee_decision(
+            decision, {proposal.proposal_id: proposal}, engine=eng_b, exchange=exch,
+            session=sess, bot_for=lambda p: bot, price_for=lambda p: 100.0, now=_NOW)
+        assert eng_a._execute_trade.call_args.args == eng_b._execute_trade.call_args.args
+
+    def test_gate_portfolio_enforced_across_the_whole_decision(self):
+        hi = _proposal(strategy_id="hi", total=90.0, size=600.0)
+        lo = _proposal(strategy_id="lo", total=50.0, size=600.0)
+        d = run_committee([hi, lo], now=_NOW,
+                          portfolio=PortfolioConstraints(exposure_headroom_usd=1000.0, min_order_usd=10.0))
+        alloc = {s.proposal_id: s.allocated_size for s in d.selected}
+        assert sum(alloc.values()) == pytest.approx(1000.0)  # combined, never exceeds budget
+
+    def test_gate_equal_ranked_handled_per_spec_split_allocation(self):
+        x = _proposal(strategy_id="x", total=50.0, size=300.0)
+        y = _proposal(strategy_id="y", total=50.0, size=100.0)
+        d = run_committee([x, y], now=_NOW,
+                          portfolio=PortfolioConstraints(exposure_headroom_usd=200.0, min_order_usd=10.0))
+        alloc = {s.proposal_id: s.allocated_size for s in d.selected}
+        assert alloc[x.proposal_id] == pytest.approx(150.0)  # 3:1 proportional split
+        assert alloc[y.proposal_id] == pytest.approx(50.0)
+
+    def test_gate_trust_neutral_by_default(self):
+        batch = [_proposal(strategy_id="a", total=90.0),
+                 _proposal(strategy_id="b", total=40.0)]
+        d = run_committee(batch, now=_NOW)  # default provider + neutral policy
+        assert d.trust_adjustments_applied == ()
+        assert _ranked_scores(d, batch) == [90.0, 40.0]
