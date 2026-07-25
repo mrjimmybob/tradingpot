@@ -25,6 +25,7 @@ from sqlalchemy.orm import sessionmaker
 
 from app.models import Base, Bot, BotStatus, Order, OrderType, OrderStatus
 from app.services.trading_engine import TradingEngine
+from app.services.strategy_explain import ExplanationBuilder
 
 from .candle import Candle, ms_to_naive_utc
 from .clock import BacktestClock
@@ -218,6 +219,19 @@ class BacktestEngine:
                     executor = engine._get_strategy_executor(strategy)
                     if executor is None:
                         raise ValueError(f"Unknown strategy: {strategy!r}")
+
+                    # Fresh per-evaluation structured-explanation builder, exactly
+                    # as TradingEngine._execute_strategy does in the live path.
+                    # This harness calls the executor DIRECTLY (to avoid the live
+                    # order/diagnostics side effects), so without this reset the
+                    # per-bot builder is never cleared and accumulates every bar's
+                    # checks for the whole run; any strategy that serialises it
+                    # (`explanation=self._explain(bot.id).to_dict()` on its per-bar
+                    # proposals — every framework-migrated strategy) would then pay
+                    # an O(n^2) cost over a long replay. Observability only: the
+                    # builder never influences a signal, so this changes run speed,
+                    # never results.
+                    engine._explanations[bot.id] = ExplanationBuilder(strategy)
 
                     signal = await executor(
                         bot, decision_candle.close, strategy_params, session,

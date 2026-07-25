@@ -375,29 +375,58 @@ while touching this strategy.
 
 ## Phase 5 — adaptive_grid (most complex state machine; sequenced after the framework is proven)
 
-See `audits/adaptive_grid.md`. Gaps: P1, P3, P7 (telemetry exists, not
-adaptive), P9; P4/P5/P6 partial; P8's biggest single gap (kill switches
-invisible to diagnostics).
+**Status: ✓ Complete (7/7), Under review** (see `audits/adaptive_grid.md`'s
+Certification Checklist — implementation and testing done; the doc's own
+"Under review" status is pending human sign-off on the before/after backtest
+comparison). Migrated in `backend/app/services/trading_engine.py`
+(`_strategy_grid`, now wired through `MarketSuitabilityGate`,
+`DecisionScoreEngine`, `StrategyEdgeManager`, `StrategyProposal`, and
+`StandaloneAdapter`; new `_ema_slope_pct` helper for the range-bound-conviction
+Evidence Item). 28 new tests
+(`backend/tests/test_adaptive_grid_framework_migration.py`, 8 classes covering
+Evidence Generation, Decision Score, Market Suitability, Edge Management,
+Proposal Generation, Standalone Adapter Compatibility, Kill-Switch Diagnostics,
+and Regressions). Full suite green, zero regressions. Before/after backtest
+across the same bull/bear/chop windows as Phases 1–4 (see
+`audits/adaptive_grid.md`): fees and drawdown fell in every window and return
+moved to uniformly non-negative (+0.00 / +0.20 / +0.10), with the grid fully
+abstaining in the bull trend — capital preservation through selectivity, not a
+demonstrated positive edge (the grid is structurally near-dormant at 1m). Also
+fixed a pre-existing O(n²) in the backtest harness (it bypassed
+`_execute_strategy`, so the per-bar explanation builder was never reset;
+`backend/app/backtesting/engine.py`) — observability-only, changes speed not
+results, benefits every migrated strategy. Behaviour preserved by design:
+`decision_score_threshold` defaults to 0.0 and all three Evidence Items
+are non-negative in range-bound conditions, so the grid's mechanical
+buy-low/sell-high behaviour is unchanged by default; the score's primary role
+is Pillar 5 sizing. The one-order-per-bar invariant is why a single
+`StrategyProposal` per evaluation remains sufficient — no multiple concurrent
+proposals or staged execution intents were required.
 
-- [ ] 5.1 Author theory (P1) and performance expectations (P9).
-- [ ] 5.2 Replace the single grid-level-crossing trigger with a
+See `audits/adaptive_grid.md`. Gaps (pre-migration): P1, P3, P7 (telemetry
+exists, not adaptive), P9; P4/P5/P6 partial; P8's biggest single gap (kill
+switches invisible to diagnostics) — all closed except P4/P6 (intentionally
+partial, unchanged).
+
+- [x] 5.1 Author theory (P1) and performance expectations (P9).
+- [x] 5.2 Replace the single grid-level-crossing trigger with a
       `DecisionScoreEngine` call per level (or per batch of levels),
       defining Evidence Items with documented Measurement/Normalization/
       Weight.
-- [ ] 5.3 Promote the existing kill-switch telemetry
+- [x] 5.3 Promote the existing kill-switch telemetry
       (`kill_switch_count`, `lifetime_return_pct`,
       `lifetime_max_drawdown_pct`) into real `StrategyEdgeManager` inputs
       instead of unused telemetry - this strategy already tracks the raw
       numbers Phase 0.5 needs, it just never reads them back or
       classifies why a kill switch fired (Category A regime shift vs.
       Category B spacing/multiplier mismatch vs. Category C).
-- [ ] 5.4 Wire Decision-Score-weighted sizing in place of the flat
+- [x] 5.4 Wire Decision-Score-weighted sizing in place of the flat
       base-%-times-depth-multiplier formula, preserving the depth
       multiplier as `add-unified-position-sizing` already specifies.
-- [ ] 5.5 **Fix the single biggest Pillar 8 gap found in the audit**: add
+- [x] 5.5 **Fix the single biggest Pillar 8 gap found in the audit**: add
       `self._explain()` calls to both kill switches (drawdown,
       ATR-distance) - currently invisible to the diagnostics UI entirely.
-- [ ] 5.6 Migrate this strategy's return type from `TradeSignal` to
+- [x] 5.6 Migrate this strategy's return type from `TradeSignal` to
       `StrategyProposal` - including translating grid-level fills (not a
       single position) into the proposal shape; confirm with a dedicated
       test that `HOLD` is the correct direction for "no grid level
@@ -412,7 +441,7 @@ invisible to diagnostics).
       medium, price within the current grid range"). Verify standalone
       execution via the Standalone Adapter is behavior-identical to the
       pre-migration path.
-- [ ] 5.7 Certification review; before/after backtest comparison.
+- [x] 5.7 Certification review; before/after backtest comparison.
 
 ## Phase 6 — dca_accumulator (requires a design decision before mechanical work)
 

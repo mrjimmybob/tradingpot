@@ -1419,13 +1419,42 @@ class TradingEngine:
 
         CAPITAL-BOUNDED, REGIME-AWARE, LONG-BIASED grid for crypto spot markets.
 
+        Migrated to the Strategy Decision Framework
+        (add-strategy-decision-framework, Phase 5 - see this change's
+        design.md/tasks.md and audits/adaptive_grid.md). This is the most
+        mechanically complex of the six (virtual grid inventory, not a single
+        position); Phase 5 adds the Evidence-Based Decision Score (Pillar 3),
+        Decision-Score-weighted sizing on top of the existing depth multiplier
+        (Pillar 5), real Strategy Edge Management fed by the previously-unused
+        kill-switch telemetry (Pillar 7), self-diagnostics on both kill
+        switches (Pillar 8), and the StrategyProposal/Standalone-Adapter
+        interface (Pillar 10), WITHOUT changing the grid's mechanical
+        buy-low/sell-high behaviour, its regime gate, or its kill switches.
+
+        THEORY (Pillar 1): the grid manufactures profit from MEAN REVERSION
+        inside a bounded range. In a range-bound (non-trending) regime, price
+        oscillates around a center; the grid pre-positions resting buy levels
+        below and sell levels above and harvests each oscillation as a
+        completed buy->sell cycle whose gross profit is one grid spacing. The
+        edge exists ONLY while the market is genuinely ranging: a sustained
+        trend turns "buy the dip" into "catch a falling knife", so the regime
+        gate (Pillar 2) and the two kill switches (drawdown, range-escape) are
+        the core risk control, not add-ons. Long-biased for crypto's secular
+        drift (7 buy / 3 sell of 10 levels). Failure modes: (a) a trend the
+        regime gate misses -> range-escape kill (a spacing/multiplier
+        mismatch, Pillar 7 Category B); (b) a sustained bleed -> drawdown kill
+        (a genuine loss of edge, Pillar 7 Category C candidate).
+
         DESIGN PHILOSOPHY:
         - Grid is a MANUFACTURING PROCESS: converts cash to crypto at favorable prices
         - Long-biased for crypto: more buy levels below, fewer sell levels above
         - Capital-bounded: hard kill switches prevent runaway losses
         - Regime-aware: pauses in trends/high volatility, operates in flat/normal markets
         - Depth-aware sizing: larger orders at deeper discounts (convex payoff)
-        - Bar-based: one order max per bar (no cascading, no tick noise)
+        - Bar-based: one order max per bar (no cascading, no tick noise) - this
+          per-bar single-order invariant is exactly WHY one StrategyProposal
+          per evaluation remains sufficient: the grid never needs multiple
+          concurrent proposals or staged execution intents (see tasks.md 5.6).
         - Fast exits: admits failure quickly via kill switches
 
         RISK CONTROLS:
@@ -1452,6 +1481,20 @@ class TradingEngine:
             regime_filter_enabled: Enable regime gating (default: True)
             allowed_regimes: Allowed regimes (default: ["trend_flat", "volatility_medium"])
             cooldown_after_kill_hours: Hours to wait after hard kill switch (default: 2)
+            decision_score_threshold: minimum Evidence-Based Decision Score a
+                crossed level must clear to fill (default: 0.0). Default 0.0 is
+                deliberate and preserves the grid's mechanical nature: the
+                three Evidence Items (range-bound conviction, post-fee spacing
+                margin, volatility adequacy) are all non-negative in normal
+                range-bound operation, so at 0.0 the score gate NEVER suppresses
+                a fill in the conditions the grid is designed for - it only
+                declines a crossing whose net evidence has gone negative (a
+                trend the gate let slip, or a dead market with no cycles to
+                harvest). The score's primary job here is Pillar 5 sizing, not
+                gating. An operator can raise this to demand higher-quality
+                fills. The evidence is side-independent (identical for a buy or
+                sell crossing on the same bar), so the gate never introduces
+                buy/sell inventory asymmetry.
         """
         # === PARAMETER EXTRACTION ===
         bar_interval_seconds = params.get("bar_interval_seconds", 60)
@@ -1471,6 +1514,19 @@ class TradingEngine:
         # which is the range-bound condition the grid is designed for.
         allowed_regimes = params.get("allowed_regimes", ["trend_flat", "volatility_medium"])
         cooldown_after_kill_hours = params.get("cooldown_after_kill_hours", 2)
+        decision_score_threshold = params.get("decision_score_threshold", 0.0)
+        _validity_interval_seconds = max(bar_interval_seconds, 1)
+
+        # Pillar 7: per-engine, per-bot Strategy Edge Manager. Fed the grid's
+        # own realised outcomes (each realised SELL fill = a harvested cycle
+        # win; each kill switch = a loss episode) plus every fill's Decision
+        # Score. Range-escape kills are classified Category B (spacing/multiplier
+        # mismatch - parameter, adaptable, non-blocking); a drawdown kill in a
+        # suitable regime is the genuine Category C "edge gone" signal. See the
+        # audit's Pillar 7 section for the modelling rationale.
+        if not hasattr(self, "_grid_edge_manager"):
+            self._grid_edge_manager = StrategyEdgeManager()
+        edge_manager = self._grid_edge_manager
 
         # Long-biased split for crypto: more buy levels below, fewer sell above
         buy_levels = int(grid_count * 0.7)  # 70% below center
@@ -1501,6 +1557,7 @@ class TradingEngine:
                 # COOLDOWN TRACKING (prevents immediate re-entry after kill)
                 "last_kill_switch_time": None,  # Timestamp of last kill switch activation
                 "kill_switch_count": 0,  # Number of times kill switch has fired
+                "last_kill_reason": None,  # "range_escape" | "drawdown" - drives Pillar 7 classification
                 # ATR LOCKING (refreshed on recenter)
                 "atr_at_recenter": None,  # ATR value captured at last recenter
                 # DYNAMIC SPACING DIAGNOSTICS
@@ -1585,6 +1642,118 @@ class TradingEngine:
             f"${completed_bars[-1]['low']:.2f} / ${completed_bars[-1]['close']:.2f}"
         )
 
+        # === MARKET SUITABILITY (Pillar 2, shared MarketSuitabilityGate) ===
+        # Computed every completed bar (the price-only _detect_market_regime is
+        # a pure function, no side effects), so every proposal below carries a
+        # real MarketSuitabilityResult and the hard regime gate still returns at
+        # its original position — the order of gates is unchanged. Uses the same
+        # dict-shaped bar-close price history the pre-migration grid built, so
+        # the regime verdict is bit-for-bit identical. Only LEVEL/trend tags are
+        # referenced by allowed_regimes, so volatility_direction is not needed.
+        price_history_from_bars = [
+            {"price": b["close"], "timestamp": b["start_ts"]} for b in completed_bars
+        ]
+        price_history_with_current = price_history_from_bars + [
+            {"price": current_price, "timestamp": now}
+        ]
+        current_regime = self._detect_market_regime(price_history_with_current, None)
+        trend_state = current_regime.get("trend_state", "flat")
+        volatility_state = current_regime.get("volatility_state", "medium")
+        regime_names = [f"trend_{trend_state}", f"volatility_{volatility_state}"]
+        # regime_filter_enabled (kept as a test-isolation affordance) maps to
+        # allowed=["all"] when disabled, so `suitability` is always a real
+        # result for the proposal while Pillar 2 stays enforced by default. The
+        # gate's OR-across-tags semantics reproduce the pre-migration
+        # `any(r in allowed_regimes ...)` check exactly for the default tags.
+        suitability = MarketSuitabilityGate().evaluate(
+            current_regime, allowed_regimes if regime_filter_enabled else ["all"],
+        )
+        regime_allowed = suitability.is_suitable
+
+        # === STRATEGY EDGE MANAGEMENT (Pillar 7) — baseline for this bar ===
+        # A range-escape kill is a spacing/multiplier (parameter) mismatch ->
+        # Category B (adaptable, non-blocking). A drawdown kill cites no
+        # parameter, so in a suitable regime it surfaces as Category C (edge
+        # gone -> stop). The kill-switch branches below record the fresh outcome
+        # and re-evaluate; this baseline is what the pre-fill proposals and the
+        # fill gate consult.
+        _recent_kill_range_escape = state.get("last_kill_reason") == "range_escape"
+        _baseline_param_evidence = (
+            f"range-escape kills dominate recent history: the grid span "
+            f"(atr_range_multiplier={atr_range_multiplier}x ATR) keeps failing to "
+            f"contain realised volatility — a spacing/multiplier mismatch"
+            if _recent_kill_range_escape else None
+        )
+        edge_status = edge_manager.evaluate(
+            bot.id, "adaptive_grid",
+            regime_outside_suitable_range=not suitability.is_suitable,
+            parameter_mismatch_evidence=_baseline_param_evidence,
+            now=now,
+        )
+
+        # === Proposal helpers (Pillar 10) ===
+        def _single_evidence_proposal(
+            *, direction: "Direction", execution_intent: "ExecutionIntent",
+            evidence_name: str, evidence_value: float, evidence_reason: str,
+            threshold: float = 1.0, suggested_position_size: Optional[float] = None,
+            assumptions: tuple = (), edge: Optional["EdgeStatus"] = None,
+        ) -> StrategyProposal:
+            """Single-evidence proposal for every already-decided branch
+            (cooldown/regime/kill/insufficient-funds no-trades and the
+            no-level-crossed hold)."""
+            item = EvidenceItem(
+                name=evidence_name, measurement=lambda d: evidence_value,
+                normalization=lambda r: r, weight=100.0, reason=evidence_reason,
+            )
+            score = DecisionScoreEngine().score("adaptive_grid", [item], {}, threshold=threshold)
+            reasons_for, reasons_against = derive_reasons(score)
+            return StrategyProposal(
+                strategy_id="adaptive_grid", bot_id=bot.id, generated_at=now,
+                direction=direction, execution_intent=execution_intent,
+                validity=ProposalValidity(
+                    generated_at=now,
+                    valid_until=now + timedelta(seconds=_validity_interval_seconds),
+                ),
+                decision_score=score, market_suitability=suitability,
+                edge_status=(edge if edge is not None else edge_status),
+                assumptions=assumptions, reasons_for=reasons_for, reasons_against=reasons_against,
+                suggested_position_size=suggested_position_size,
+                suggested_risk_budget_pct=base_order_size_pct,
+                explanation=self._explain(bot.id).to_dict(),
+            )
+
+        def _emit_hold(proposal: StrategyProposal, reason: str) -> TradeSignal:
+            sig = StandaloneAdapter.to_trade_signal(proposal)
+            return sig if sig is not None else TradeSignal(action="hold", amount=0, reason=reason)
+
+        def _no_trade(
+            evidence_name: str, evidence_value: float, evidence_reason: str, reason: str,
+            *, assumptions: tuple = (), edge: Optional["EdgeStatus"] = None,
+        ) -> TradeSignal:
+            return _emit_hold(
+                _single_evidence_proposal(
+                    direction=Direction.NO_TRADE, execution_intent=ExecutionIntent.NO_ACTION,
+                    evidence_name=evidence_name, evidence_value=evidence_value,
+                    evidence_reason=evidence_reason, assumptions=assumptions, edge=edge,
+                ),
+                reason,
+            )
+
+        def _hold_position(
+            evidence_name: str, evidence_reason: str, reason: str, *, assumptions: tuple = (),
+        ) -> TradeSignal:
+            # "no grid level crossed this bar": the grid is live and holding its
+            # virtual inventory, so HOLD + HOLD_POSITION is the correct pairing
+            # (not NO_TRADE/NO_ACTION) — see tasks.md 5.6.
+            return _emit_hold(
+                _single_evidence_proposal(
+                    direction=Direction.HOLD, execution_intent=ExecutionIntent.HOLD_POSITION,
+                    evidence_name=evidence_name, evidence_value=1.0,
+                    evidence_reason=evidence_reason, assumptions=assumptions,
+                ),
+                reason,
+            )
+
         # === COOLDOWN CHECK (after kill switch) ===
         last_kill_time = state.get("last_kill_switch_time")
         if last_kill_time is not None:
@@ -1608,10 +1777,10 @@ class TradingEngine:
                     "Kill-switch cooldown", f"{remaining_minutes:.1f} min remaining",
                     "elapsed", False, detail="paused after a kill switch",
                 )
-                return TradeSignal(
-                    action="hold",
-                    amount=0,
-                    reason=f"Grid: Cooldown after kill ({remaining_minutes:.0f}min remaining)"
+                return _no_trade(
+                    "Kill-switch cooldown", 0.0,
+                    f"{remaining_minutes:.0f} min of post-kill cooldown remain before the grid may resume",
+                    f"Grid: Cooldown after kill ({remaining_minutes:.0f}min remaining)",
                 )
             else:
                 # Cooldown expired, clear the timestamp
@@ -1622,39 +1791,23 @@ class TradingEngine:
                 state["last_kill_switch_time"] = None
 
         # === REGIME GATING (operate only in flat/normal markets) ===
-        if regime_filter_enabled:
-            # Build price history from bars for regime detection
-            price_history_from_bars = [{"price": b["close"], "timestamp": b["start_ts"]} for b in completed_bars]
-            price_history_with_current = price_history_from_bars + [{"price": current_price, "timestamp": now}]
-
-            current_regime = self._detect_market_regime(price_history_with_current, None)
-            trend_state = current_regime.get("trend_state", "flat")
-            volatility_state = current_regime.get("volatility_state", "medium")
-
-            # Map to user-friendly names
-            regime_names = [f"trend_{trend_state}", f"volatility_{volatility_state}"]
-
-            # Check if ANY required regime is met (OR logic across trend/volatility)
-            regime_allowed = any(r in allowed_regimes for r in regime_names)
-
-            if not regime_allowed:
-                logger.info(
-                    f"Bot {bot.id}: Grid PAUSED (regime unsuitable) - "
-                    f"Current: {regime_names}, Allowed: {allowed_regimes}. "
-                    f"Grid operates in flat/normal markets only (range-bound conditions)."
-                )
-                self._explain(bot.id).state("WAITING_REGIME").update({
-                    "current_price": current_price,
-                    "regime": ", ".join(regime_names),
-                }).check(
-                    "Regime suitable", ", ".join(regime_names),
-                    f"in [{', '.join(allowed_regimes)}]", False,
-                )
-                return TradeSignal(
-                    action="hold",
-                    amount=0,
-                    reason=f"Grid: Paused (regime={regime_names}, need flat/normal markets)"
-                )
+        if regime_filter_enabled and not regime_allowed:
+            logger.info(
+                f"Bot {bot.id}: Grid PAUSED (regime unsuitable) - "
+                f"Current: {regime_names}, Allowed: {allowed_regimes}. "
+                f"Grid operates in flat/normal markets only (range-bound conditions)."
+            )
+            self._explain(bot.id).state("WAITING_REGIME").update({
+                "current_price": current_price,
+                "regime": ", ".join(regime_names),
+            }).check(
+                "Regime suitable", ", ".join(regime_names),
+                f"in [{', '.join(allowed_regimes)}]", False,
+            )
+            return _no_trade(
+                "Market suitability", 0.0, suitability.reason,
+                f"Grid: Paused (regime={regime_names}, need flat/normal markets)",
+            )
 
         # === CALCULATE ATR (drives both spacing and kill switch) ===
         atr = None
@@ -1736,6 +1889,7 @@ class TradingEngine:
             # Activate cooldown and track kill switch event
             state["last_kill_switch_time"] = now
             state["kill_switch_count"] = state.get("kill_switch_count", 0) + 1
+            state["last_kill_reason"] = "drawdown"
 
             logger.warning(
                 f"Bot {bot.id}: Grid KILL SWITCH #{state['kill_switch_count']} ACTIVATED (drawdown) - "
@@ -1743,6 +1897,39 @@ class TradingEngine:
                 f"Grid admits failure. Liquidating all virtual positions. "
                 f"Cooldown: {cooldown_after_kill_hours}h"
             )
+
+            # Pillar 7: a drawdown kill is a realised loss episode with NO
+            # parameter citation (the grid was correctly spaced but still bled),
+            # so in a suitable regime it is the genuine Category C "edge gone"
+            # signal. Record it, then re-evaluate so the proposal carries the
+            # escalated status.
+            edge_manager.record_trade_outcome(
+                bot.id, "adaptive_grid", pnl=-float(drawdown), win=False, at=now,
+            )
+            dd_edge = edge_manager.evaluate(
+                bot.id, "adaptive_grid",
+                regime_outside_suitable_range=not suitability.is_suitable,
+                parameter_mismatch_evidence=None,
+                now=now,
+            )
+
+            # Pillar 8: the drawdown kill switch was previously invisible to the
+            # diagnostics UI (log-only). Surface the full decision math.
+            self._explain(bot.id).state("KILL_SWITCH_DRAWDOWN").update({
+                "current_price": current_price,
+                "grid_center": center_price,
+                "drawdown_pct": drawdown_pct,
+                "max_drawdown_pct": max_drawdown_pct * 100,
+                "peak_portfolio_value": state["peak_portfolio_value"],
+                "portfolio_value": current_portfolio_value,
+                "kill_switch_count": state["kill_switch_count"],
+                "edge_status_category": dd_edge.category.value,
+            }).check(
+                "Drawdown kill switch", f"{drawdown_pct:.2f}%",
+                f"<= {max_drawdown_pct * 100:.1f}%", False,
+                detail="grid liquidates virtual inventory and enters cooldown",
+            )
+
             # Reset grid (liquidate virtual positions, restart)
             state["virtual_cash"] = current_portfolio_value
             state["virtual_crypto"] = 0.0
@@ -1752,10 +1939,15 @@ class TradingEngine:
             state["last_recenter_time"] = now
             self._save_grid_state(bot.id, state)
 
-            return TradeSignal(
-                action="hold",
-                amount=0,
-                reason=f"Grid: Kill switch (drawdown {drawdown*100:.1f}%), {cooldown_after_kill_hours}h cooldown"
+            return _no_trade(
+                "Drawdown kill switch", 0.0,
+                (
+                    f"portfolio drawdown {drawdown * 100:.1f}% exceeded the "
+                    f"{max_drawdown_pct * 100:.1f}% max: grid liquidated virtual inventory, "
+                    f"{cooldown_after_kill_hours}h cooldown"
+                ),
+                f"Grid: Kill switch (drawdown {drawdown*100:.1f}%), {cooldown_after_kill_hours}h cooldown",
+                edge=dd_edge,
             )
 
         # === KILL SWITCH 2: ATR DISTANCE (hard stop — soft recenter fires first) ===
@@ -1769,6 +1961,7 @@ class TradingEngine:
                 # Activate cooldown and track kill switch event
                 state["last_kill_switch_time"] = now
                 state["kill_switch_count"] = state.get("kill_switch_count", 0) + 1
+                state["last_kill_reason"] = "range_escape"
 
                 # Lock ATR at recenter (ensures fresh baseline for new grid)
                 state["atr_at_recenter"] = atr
@@ -1779,25 +1972,72 @@ class TradingEngine:
                     f"(> {kill_atr_mult}x ATR = {kill_distance:.2f}). Re-centering grid. "
                     f"ATR locked at {atr:.2f}. Cooldown: {cooldown_after_kill_hours}h"
                 )
+
+                # Pillar 7: a range-escape kill is a spacing/multiplier
+                # (parameter) mismatch — the grid span didn't contain realised
+                # volatility. Record the loss episode and classify with that
+                # parameter citation so it lands as Category B (adaptable,
+                # non-blocking), NOT Category C.
+                param_evidence = (
+                    f"price escaped {atr_distance:.2f} from center (> {kill_atr_mult}x ATR "
+                    f"= {kill_distance:.2f}): the grid span (atr_range_multiplier="
+                    f"{atr_range_multiplier}x ATR) did not contain realised volatility"
+                )
+                edge_manager.record_trade_outcome(
+                    bot.id, "adaptive_grid",
+                    pnl=-(atr_distance / center_price if center_price > 0 else 0.0),
+                    win=False, at=now,
+                )
+                atr_edge = edge_manager.evaluate(
+                    bot.id, "adaptive_grid",
+                    regime_outside_suitable_range=not suitability.is_suitable,
+                    parameter_mismatch_evidence=param_evidence,
+                    now=now,
+                )
+
+                # Pillar 8: the range-escape kill switch was previously invisible
+                # to the diagnostics UI (log-only). Surface the full math.
+                self._explain(bot.id).state("KILL_SWITCH_RANGE_ESCAPE").update({
+                    "current_price": current_price,
+                    "grid_center": center_price,
+                    "atr": atr,
+                    "atr_distance": atr_distance,
+                    "kill_distance": kill_distance,
+                    "kill_atr_multiplier": kill_atr_mult,
+                    "kill_switch_count": state["kill_switch_count"],
+                    "edge_status_category": atr_edge.category.value,
+                }).check(
+                    "Range-escape kill switch", f"{atr_distance:.2f} from center",
+                    f"<= {kill_distance:.2f} ({kill_atr_mult}x ATR)", False,
+                    detail="grid re-centers on the escaped price and enters cooldown",
+                )
+
                 # Re-center grid
                 state["center_price"] = bar_close_price
                 state["grid_levels"] = {}
                 state["last_recenter_time"] = now
                 self._save_grid_state(bot.id, state)
 
-                return TradeSignal(
-                    action="hold",
-                    amount=0,
-                    reason=f"Grid: Re-centered at ${bar_close_price:.2f} (range escape), {cooldown_after_kill_hours}h cooldown"
+                return _no_trade(
+                    "Range-escape kill switch", 0.0, param_evidence,
+                    (
+                        f"Grid: Re-centered at ${bar_close_price:.2f} (range escape), "
+                        f"{cooldown_after_kill_hours}h cooldown"
+                    ),
+                    assumptions=(
+                        f"price stays within the grid range (|price - center| <= "
+                        f"{kill_atr_mult}x ATR)",
+                    ),
+                    edge=atr_edge,
                 )
 
         # === ONE ORDER PER BAR CHECK ===
         last_order_bar = state.get("last_order_bar")
         if last_order_bar is not None and last_order_bar == completed_bars[-1]["start_ts"]:
-            return TradeSignal(
-                action="hold",
-                amount=0,
-                reason="Grid: Already traded this bar (one order per bar limit)"
+            return _hold_position(
+                "One order per bar",
+                "already filled a level this bar — the grid caps itself at one order per bar",
+                "Grid: Already traded this bar (one order per bar limit)",
             )
 
         # === CALCULATE GRID LEVELS (ATR-based; rebuild when spacing changes >10%) ===
@@ -1969,36 +2209,163 @@ class TradingEngine:
                 f"virtual_crypto={state['virtual_crypto']:.6f}"
             )
             nearest_buy_str = f"${nearest_buy:.2f}" if nearest_buy else "none"
-            return TradeSignal(
-                action="hold",
-                amount=0,
-                reason=(
+            return _hold_position(
+                "No level crossed",
+                (
+                    f"bar close ${bar_close_price:.2f} did not cross any unfilled grid level "
+                    f"(spacing ${grid_spacing:.2f}, ATR={atr_str}, nearest buy {nearest_buy_str}) — "
+                    "grid holds its virtual inventory"
+                ),
+                (
                     f"Grid: No levels triggered "
                     f"(spacing=${grid_spacing:.2f}, ATR={atr_str}, "
                     f"nearest_buy={nearest_buy_str})"
-                )
+                ),
+                assumptions=(
+                    f"regime remains range-bound ({', '.join(regime_names)})",
+                    f"price stays within the grid range (|price - center| <= {grid_half_range:.2f})",
+                ),
             )
 
         # === EXECUTE ORDER AT NEAREST LEVEL ===
         level_data = grid_levels[nearest_level]
         depth = level_data["depth"]
 
-        # Depth-aware sizing: larger orders at deeper discounts (convex payoff)
-        # Example: depth=1 → 1.0x, depth=2 → 1.5x, depth=3 → 2.25x, etc.
+        # === PILLAR 3: EVIDENCE-BASED DECISION SCORE (per crossed level) ===
+        # The level crossing is the grid's hard precondition (analogous to mean
+        # reversion's band touch). These three side-independent Evidence Items
+        # then GRADE the crossing's quality — feeding Pillar 5 sizing and, when
+        # decision_score_threshold > 0, an optional quality gate. All three are
+        # non-negative in the range-bound conditions the grid is designed for,
+        # so the default 0.0 threshold never suppresses a normal fill; they turn
+        # negative (declining the fill, leaving virtual state untouched) only
+        # when the grid's own edge premise has broken. Crucially, NONE of them
+        # references level depth — depth is the grid's intended convex payoff,
+        # rewarded separately by the depth multiplier, not penalised here.
+        _fee_threshold_move = 2.0 * taker_fee_pct + spread_pct + min_profit_buffer_pct
+        _spacing_move = grid_spacing / bar_close_price if bar_close_price > 0 else 0.0
+        _spacing_margin = (
+            (_spacing_move - _fee_threshold_move) / _fee_threshold_move
+            if _fee_threshold_move > 0 else 0.0
+        )
+        # Trend flatness: EMA(20) slope over recent bar closes, as a fraction.
+        _recent_closes = [b["close"] for b in completed_bars]
+        _ema_slope_pct = self._ema_slope_pct(_recent_closes, 20)
+        _flat_threshold = 0.005  # 0.5% EMA slope over the window = "no longer flat"
+        _vol_ratio = (atr / bar_close_price) if (atr and bar_close_price > 0) else 0.0
+        _vol_floor, _vol_target = 0.0005, 0.004  # ATR/price sweet spot for cycling
+
+        evidence_items = [
+            EvidenceItem(
+                name="Range-bound conviction",
+                measurement=lambda d: _ema_slope_pct,
+                normalization=lambda r: max(
+                    -1.0, min(1.0, (_flat_threshold - abs(r)) / _flat_threshold)
+                ),
+                weight=40.0,
+                reason=(
+                    "Theory (mean reversion in a range): the grid only has an edge while the "
+                    "market is genuinely ranging. A flat EMA(20) is direct evidence the range "
+                    "holds; a steepening slope is evidence AGAINST — a trend turns buy-the-dip "
+                    "into catch-the-knife. This is independent of which level filled."
+                ),
+            ),
+            EvidenceItem(
+                name="Post-fee spacing margin",
+                measurement=lambda d: _spacing_margin,
+                normalization=lambda r: max(-1.0, min(1.0, r)),
+                weight=35.0,
+                reason=(
+                    "Theory: a completed buy->sell cycle's gross profit is one grid spacing; the "
+                    "net edge is that spacing minus round-trip fees. The more the spacing exceeds "
+                    "the fee floor, the more each harvested cycle actually earns. Barely covering "
+                    "fees is evidence the edge is marginal."
+                ),
+            ),
+            EvidenceItem(
+                name="Volatility adequacy",
+                measurement=lambda d: _vol_ratio,
+                normalization=lambda r: max(
+                    -1.0, min(1.0, (r - _vol_floor) / (_vol_target - _vol_floor))
+                ),
+                weight=25.0,
+                reason=(
+                    "Theory: the grid harvests oscillation. Too little volatility (ATR/price near "
+                    "zero) means price never traverses levels and no cycles complete — evidence "
+                    "against acting; adequate volatility means the range is alive and cycling."
+                ),
+            ),
+        ]
+        decision_score = DecisionScoreEngine().score(
+            "adaptive_grid", evidence_items, {}, threshold=decision_score_threshold,
+        )
+        edge_manager.record_decision_score(bot.id, "adaptive_grid", decision_score.total)
+        reasons_for, reasons_against = derive_reasons(decision_score)
+        _fill_assumptions = (
+            f"regime remains range-bound ({', '.join(regime_names)})",
+            f"price stays within the grid range (|price - center| <= {grid_half_range:.2f})",
+            "grid spacing continues to cover round-trip fees",
+        )
+        exp.metric("decision_score_total", decision_score.total)
+        exp.metric("decision_score_threshold", decision_score_threshold)
+        exp.metric("edge_status_category", edge_status.category.value)
+        exp.check(
+            "Decision Score clears threshold", round(decision_score.total, 2),
+            f">= {decision_score_threshold:.1f}", decision_score.approved,
+        )
+        exp.check(
+            "Strategy edge not disqualified", edge_status.category.value,
+            f"!= {EdgeCategory.C.value}", edge_status.category != EdgeCategory.C,
+            detail=edge_status.reason,
+        )
+
+        # Framework gates (both no-ops in the grid's normal range-bound regime):
+        # the Decision Score threshold (default 0.0) and a Category-C edge stop.
+        # A blocked crossing leaves the level UNFILLED and the virtual wallet
+        # untouched — no buy/sell inventory desync — and the grid retries next bar.
+        blocking_reasons = []
+        if not decision_score.approved:
+            blocking_reasons.append(
+                f"Decision Score {decision_score.total:.1f} < threshold {decision_score_threshold:.1f}"
+            )
+        if edge_status.category == EdgeCategory.C:
+            blocking_reasons.append(f"Strategy Edge Management: Category C — {edge_status.reason}")
+        if blocking_reasons:
+            reason_text = "; ".join(blocking_reasons)
+            self._save_grid_state(bot.id, state)
+            return _no_trade(
+                "Framework gates", 0.0, reason_text,
+                f"Grid: level {nearest_level} crossed but {reason_text}",
+                assumptions=_fill_assumptions,
+            )
+
+        # === PILLAR 5: DECISION-SCORE-WEIGHTED SIZING (preserves depth mult) ===
+        # order = initial_capital * base% * depth_multiplier * score_multiplier.
+        # The depth multiplier (convex payoff) is unchanged from the pre-migration
+        # formula; the score multiplier (0.5..1.5) is the new, orthogonal factor.
         size_multiplier = depth_multiplier ** (depth - 1)
+        _score_range = max(100.0 - decision_score_threshold, 1e-9)
+        _score_margin = max(0.0, min(1.0, (decision_score.total - decision_score_threshold) / _score_range))
+        score_size_multiplier = 0.5 + _score_margin
+        exp.metric("decision_score_size_multiplier", round(score_size_multiplier, 4))
         order_size_usd = min(
-            initial_capital * base_order_size_pct * size_multiplier,
+            initial_capital * base_order_size_pct * size_multiplier * score_size_multiplier,
             bot.current_balance * _BUY_BALANCE_FRACTION,  # never exceed real funds
         )
 
         if order_size_usd < MIN_ORDER_USD:
-            return TradeSignal(
-                action="hold",
-                amount=0,
-                reason=(
+            self._save_grid_state(bot.id, state)
+            return _no_trade(
+                "Order size", 0.0,
+                (
+                    f"order ${order_size_usd:.2f} below the ${MIN_ORDER_USD:.0f} minimum "
+                    "(increase budget or base_order_size_percent)"
+                ),
+                (
                     f"Grid: Order ${order_size_usd:.2f} below minimum ${MIN_ORDER_USD} "
                     f"(increase budget or base_order_size_percent)"
-                )
+                ),
+                assumptions=_fill_assumptions,
             )
 
         if level_data["side"] == "buy":
@@ -2009,10 +2376,15 @@ class TradingEngine:
                     f"Bot {bot.id}: Grid BUY skipped at level {nearest_level} - "
                     f"Insufficient virtual cash: ${state['virtual_cash']:.2f} < ${order_size_usd:.2f}"
                 )
-                return TradeSignal(
-                    action="hold",
-                    amount=0,
-                    reason=f"Grid: Insufficient virtual cash for buy at level {nearest_level}"
+                self._save_grid_state(bot.id, state)
+                return _no_trade(
+                    "Virtual cash sufficiency", 0.0,
+                    (
+                        f"virtual cash ${state['virtual_cash']:.2f} < order ${order_size_usd:.2f} "
+                        f"at buy level {nearest_level}"
+                    ),
+                    f"Grid: Insufficient virtual cash for buy at level {nearest_level}",
+                    assumptions=_fill_assumptions,
                 )
 
             # Viability pre-check: verify grid_spacing covers round-trip fees before
@@ -2026,16 +2398,25 @@ class TradingEngine:
                 float(_fee_raw_grid) if isinstance(_fee_raw_grid, (int, float)) else 0.1
             ) / 100.0
             _grid_min_move = 2.0 * _grid_fee_pct + _VIABILITY_SAFETY_MARGIN_PCT
+            exp.check(
+                "Fee viability", round(_grid_expected_move, 6),
+                f">= {_grid_min_move:.5f}", _grid_expected_move >= _grid_min_move,
+                detail="grid spacing must cover round-trip fees",
+            )
             if _grid_expected_move < _grid_min_move:
                 self._save_grid_state(bot.id, state)
-                return TradeSignal(
-                    action="hold",
-                    amount=0,
-                    reason=(
+                return _no_trade(
+                    "Fee viability", 0.0,
+                    (
+                        f"grid spacing {_grid_expected_move * 100:.3f}% < fee threshold "
+                        f"{_grid_min_move * 100:.3f}% (exchange_fee={_grid_fee_pct * 100:.2f}%)"
+                    ),
+                    (
                         f"Grid: spacing {_grid_expected_move * 100:.3f}% < "
                         f"fee threshold {_grid_min_move * 100:.3f}% "
                         f"(exchange_fee={_grid_fee_pct * 100:.2f}%)"
                     ),
+                    assumptions=_fill_assumptions,
                 )
 
             # Execute virtual buy
@@ -2051,18 +2432,40 @@ class TradingEngine:
             logger.info(
                 f"Bot {bot.id}: Grid BUY at level {nearest_level} (depth={depth}) - "
                 f"Price: ${bar_close_price:.2f}, Amount: ${order_size_usd:.2f} "
-                f"(size_mult={size_multiplier:.2f}x), Virtual: ${state['virtual_cash']:.2f} cash + "
+                f"(size_mult={size_multiplier:.2f}x, score_mult={score_size_multiplier:.2f}x), "
+                f"Virtual: ${state['virtual_cash']:.2f} cash + "
                 f"{state['virtual_crypto']:.4f} crypto | "
+                f"Decision Score {decision_score.total:.1f}/{decision_score_threshold:.1f} | "
                 f"Lifetime: {state['lifetime_return_pct']:+.2f}% return, "
                 f"{state['lifetime_max_drawdown_pct']:.2f}% max DD"
             )
 
-            return TradeSignal(
-                action="buy",
-                amount=order_size_usd,
-                order_type="market",
-                reason=f"Grid: Buy at level {nearest_level} (${bar_close_price:.2f}, depth={depth})",
-                expected_move_pct=_grid_expected_move,
+            # Pillar 10: grid entries are INCREMENTAL virtual-inventory adds, not
+            # fresh single positions (contrast Phases 1-4's OPEN_POSITION), so a
+            # buy fill maps to BUY + ADD_TO_POSITION (tasks.md 5.6).
+            gen = now
+            proposal = StrategyProposal(
+                strategy_id="adaptive_grid", bot_id=bot.id, generated_at=gen,
+                direction=Direction.BUY, execution_intent=ExecutionIntent.ADD_TO_POSITION,
+                validity=ProposalValidity(
+                    generated_at=gen,
+                    valid_until=gen + timedelta(seconds=_validity_interval_seconds),
+                ),
+                decision_score=decision_score, market_suitability=suitability,
+                edge_status=edge_status, assumptions=_fill_assumptions,
+                reasons_for=reasons_for, reasons_against=reasons_against,
+                suggested_position_size=order_size_usd,
+                suggested_risk_budget_pct=base_order_size_pct * size_multiplier * score_size_multiplier,
+                expected_holding_horizon="short",
+                adaptive_parameters_used={
+                    "depth_size_multiplier": size_multiplier,
+                    "decision_score_size_multiplier": score_size_multiplier,
+                    "grid_spacing": grid_spacing,
+                },
+                explanation=exp.to_dict(),
+            )
+            return StandaloneAdapter.to_trade_signal(
+                proposal, expected_move_pct=_grid_expected_move,
             )
 
         else:
@@ -2074,10 +2477,15 @@ class TradingEngine:
                     f"Bot {bot.id}: Grid SELL skipped at level {nearest_level} - "
                     f"Insufficient virtual crypto: {state['virtual_crypto']:.4f} < {crypto_to_sell:.4f}"
                 )
-                return TradeSignal(
-                    action="hold",
-                    amount=0,
-                    reason=f"Grid: Insufficient virtual crypto for sell at level {nearest_level}"
+                self._save_grid_state(bot.id, state)
+                return _no_trade(
+                    "Virtual crypto sufficiency", 0.0,
+                    (
+                        f"virtual crypto {state['virtual_crypto']:.6f} < {crypto_to_sell:.6f} "
+                        f"needed at sell level {nearest_level}"
+                    ),
+                    f"Grid: Insufficient virtual crypto for sell at level {nearest_level}",
+                    assumptions=_fill_assumptions,
                 )
 
             # Execute virtual sell
@@ -2087,23 +2495,59 @@ class TradingEngine:
             state["last_order_bar"] = completed_bars[-1]["start_ts"]
             state["total_trades"] += 1
 
+            # Pillar 7: a realised sell fill IS a harvested buy->sell cycle — the
+            # grid's profit unit — so record it as a win of roughly one grid
+            # spacing (gross), the modelling the audit documents.
+            edge_manager.record_trade_outcome(
+                bot.id, "adaptive_grid",
+                pnl=float(grid_spacing) * crypto_to_sell, win=True, at=now,
+            )
+
             self._save_grid_state(bot.id, state)
+
+            # Remaining virtual inventory decides CLOSE vs REDUCE: a sell that
+            # empties the virtual crypto pool closes the grid's net position;
+            # otherwise it reduces it (tasks.md 5.6, "remaining depth").
+            _remaining_crypto = state["virtual_crypto"]
+            _dust = crypto_to_sell * 1e-6
+            if _remaining_crypto <= _dust:
+                sell_intent = ExecutionIntent.CLOSE_POSITION
+            else:
+                sell_intent = ExecutionIntent.REDUCE_POSITION
 
             logger.info(
                 f"Bot {bot.id}: Grid SELL at level {nearest_level} (depth={depth}) - "
                 f"Price: ${bar_close_price:.2f}, Amount: ${order_size_usd:.2f} "
-                f"(size_mult={size_multiplier:.2f}x), Virtual: ${state['virtual_cash']:.2f} cash + "
+                f"(size_mult={size_multiplier:.2f}x, score_mult={score_size_multiplier:.2f}x), "
+                f"intent={sell_intent.value}, Virtual: ${state['virtual_cash']:.2f} cash + "
                 f"{state['virtual_crypto']:.4f} crypto | "
+                f"Decision Score {decision_score.total:.1f}/{decision_score_threshold:.1f} | "
                 f"Lifetime: {state['lifetime_return_pct']:+.2f}% return, "
                 f"{state['lifetime_max_drawdown_pct']:.2f}% max DD"
             )
 
-            return TradeSignal(
-                action="sell",
-                amount=order_size_usd,
-                order_type="market",
-                reason=f"Grid: Sell at level {nearest_level} (${bar_close_price:.2f}, depth={depth})",
+            gen = now
+            proposal = StrategyProposal(
+                strategy_id="adaptive_grid", bot_id=bot.id, generated_at=gen,
+                direction=Direction.SELL, execution_intent=sell_intent,
+                validity=ProposalValidity(
+                    generated_at=gen,
+                    valid_until=gen + timedelta(seconds=_validity_interval_seconds),
+                ),
+                decision_score=decision_score, market_suitability=suitability,
+                edge_status=edge_status, assumptions=_fill_assumptions,
+                reasons_for=reasons_for, reasons_against=reasons_against,
+                suggested_position_size=order_size_usd,
+                suggested_risk_budget_pct=base_order_size_pct * size_multiplier * score_size_multiplier,
+                expected_holding_horizon="short",
+                adaptive_parameters_used={
+                    "depth_size_multiplier": size_multiplier,
+                    "decision_score_size_multiplier": score_size_multiplier,
+                    "grid_spacing": grid_spacing,
+                },
+                explanation=exp.to_dict(),
             )
+            return StandaloneAdapter.to_trade_signal(proposal)
 
     def _get_grid_state(self, bot_id: int, params: dict) -> dict:
         """Get grid state for a bot, initializing if needed."""
@@ -2142,6 +2586,28 @@ class TradingEngine:
         if not true_ranges:
             return 0.0
         return sum(true_ranges) / len(true_ranges)
+
+    def _ema_slope_pct(self, prices: list, period: int) -> float:
+        """Fractional slope of the EMA(period) over the last ``period`` bars.
+
+        Deterministic Measurement for the Adaptive Grid's "range-bound
+        conviction" Evidence Item (Pillar 3): computes the EMA series via the
+        shared ``_calculate_ema`` and returns
+        ``(ema[-1] - ema[-1-period]) / ema[-1-period]`` — the fractional change
+        in the trend line across the window. ~0 means a flat range (grid edge
+        intact); a larger magnitude means a developing trend (edge against).
+        Returns 0.0 (neutral/flat) when there is insufficient data, so a
+        warming-up grid is treated as range-bound rather than penalised.
+        """
+        if not prices or len(prices) < period * 2:
+            return 0.0
+        ema = self._calculate_ema(prices, period)
+        if len(ema) < period + 1:
+            return 0.0
+        past = ema[-1 - period]
+        if past == 0:
+            return 0.0
+        return (ema[-1] - past) / past
 
     async def _strategy_mean_reversion(
         self,
