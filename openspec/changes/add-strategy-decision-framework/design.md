@@ -119,6 +119,30 @@ see Context). The gate must actually block standalone entries, not just
 compute a diagnostic value only wired to Auto Mode's OWN separate,
 already-correct check.
 
+**Pure-accumulator exception (`dca_accumulator`).** A schedule-driven
+Dollar-Cost-Averaging strategy *deliberately ignores short- and
+medium-term market direction*: gating accumulation on a "suitable" trend
+regime would convert it into a market-timing strategy, which is precisely
+the behaviour a classic DCA rejects. There is a hard line here between
+**market timing** (deciding *whether to accumulate* from expected
+short/medium-term price movement — not allowed for DCA) and **execution
+quality / portfolio governance / thesis validity** (deciding *how well and
+whether it is still appropriate* to deploy a chunk whose timing was already
+fixed by the schedule — allowed). For `dca_accumulator`, Pillar 2's gate is
+therefore *redefined, not removed*: "suitability" means
+**execution-quality, portfolio-constraint, and long-term-investment-thesis**
+suitability, never expected short-term direction. It declares **no trend
+`allowed_regimes` gate**; the gate may only block, defer, or trim a
+scheduled buy for (a) degraded execution quality on this fill (spread,
+liquidity, slippage), (b) portfolio risk-governance limits (exposure cap,
+budget exhaustion, concentration), or (c) invalidation of the long-term
+investment thesis (a structural condition, never a price-direction
+forecast). This is the one documented per-strategy exception to the hard
+trend-regime gate above — it changes only *what DCA gates on*, not the
+`StrategyProposal` contract or any other strategy. See
+`audits/dca_accumulator.md`'s "Phase 6.1 Design Decision" and the Phase 6
+tasks.
+
 **3. Evidence-Based Decision Score** (formerly "Trade Quality Score" /
 "Confidence") — A trading system must never "feel confident." Every
 candidate trade's score SHALL be entirely derived from measurable

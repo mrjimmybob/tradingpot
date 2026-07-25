@@ -450,60 +450,98 @@ position to manage (never sells). Sequenced last so the framework is
 mature/validated on 5 signal-driven strategies before tackling a
 fundamentally different strategy shape.
 
-- [ ] 6.1 **Design decision (blocking, not mechanical)**: does "DCA never
+- [x] 6.1 **Design decision (blocking, not mechanical)**: does "DCA never
       sells" remain correct given the finding that its apparent 2020-2026
-      profitability is a bull-market-window artifact? Options include (a)
-      keep never-sell but add a documented, evidence-based theory for why
-      that's still correct risk management for an accumulator, or (b) add
-      a real exit thesis (e.g. periodic rebalancing, profit-taking above a
-      threshold). This decision must be made and documented in
-      `audits/dca_accumulator.md` before 6.2 onward.
-- [ ] 6.2 Author theory (P1) and performance expectations (P9),
-      informed by 6.1's decision.
-- [ ] 6.3 If 6.1 keeps DCA schedule-driven: build a lighter-weight
-      suitability/Decision Score check appropriate to a schedule-based
-      accumulator (e.g. skip/reduce a scheduled buy in unfavorable
-      conditions, rather than a per-signal score). If 6.1 adds an exit
-      thesis: build full Pillar 3/6 as a signal-driven strategy would.
-- [ ] 6.4 Wire `StrategyEdgeManager` — even a schedule-driven accumulator
-      should classify "this regime filter keeps blocking every buy"
-      (Category A) versus "buys keep happening into a declining balance
-      with no evidence of recovery" (Category C) as distinct, measurable
-      edge-management signals, not just "am I losing."
-- [ ] 6.5 Wire Decision-Score-weighted sizing if 6.1/6.3 introduce a
-      scorable signal; otherwise document why flat sizing remains correct
-      for a pure accumulator (Pillar 4's "document why fixed" escape
-      hatch applies to sizing too, if genuinely justified).
-- [ ] 6.6 Close Pillar 8 gaps: positive `.check()` when the regime gate
-      passes (today only the failure path is explained), and the
-      buy-amount branching logic.
+      profitability is a bull-market-window artifact? **RESOLVED: Option
+      (a) — keep DCA a classic accumulator that buys in timely chunks *no
+      matter the market conditions*.** DCA stays pure and never-sell; the
+      framework migration improves operational discipline, auditability,
+      portfolio integration, execution quality, and risk governance, but
+      must **not** convert DCA into a market-timing strategy. The
+      load-bearing rule: gating is legitimate only when justified by
+      **execution quality, portfolio constraints, or long-term-thesis
+      invalidation** — never by expected short/medium-term price direction.
+      Consequently the existing trend regime filter (pauses buying in
+      `trend_down`) is re-scoped: it is *market timing* and is removed as
+      the default (see 6.3). Documented with the full market-timing-vs-
+      execution-quality distinction and the obligations it imposes on 6.2–
+      6.8 in `audits/dca_accumulator.md`'s "Phase 6.1 Design Decision"
+      section and `design.md`'s "Pure-accumulator exception."
+- [ ] 6.2 Author theory (P1) and performance expectations (P9), informed
+      by 6.1. Theory: DCA's value is **direction-agnostic entry-timing-
+      variance reduction plus disciplined scheduled deployment and good
+      execution quality** — it holds no directional view and by design does
+      not forecast short/medium-term price. Performance expectations must
+      state honestly that DCA **underperforms lump-sum in a monotonic bull**
+      (cash drag) and **keeps accumulating through, and holds, the full
+      bear drawdown with no pause and no loss-cutting**; its claim is
+      discipline + execution + governance, not a return figure. No P6 exit
+      thesis is authored (Not Applicable by design — 6.1).
+- [ ] 6.3 **Re-scope Pillar 2 away from market timing.** Remove the trend
+      `allowed_regimes` gate as DCA's default (retain only as an explicit,
+      clearly-labelled non-classic operator override, `regime_filter_
+      enabled` defaulting to `False`). In its place build the accumulator-
+      appropriate suitability gate: it may skip/defer/trim a scheduled buy
+      ONLY for (a) degraded **execution quality** on this fill (spread,
+      liquidity, expected slippage — a bounded deferral/trim that can never
+      become "wait indefinitely for a better price"), (b) **portfolio
+      constraints** (exposure cap via `PortfolioRiskService`, concentration,
+      budget exhaustion), or (c) **long-term-thesis invalidation** (a
+      structural stop, not a price move). No factor in this gate may be a
+      short/medium-term price-direction forecast (verified by a test that a
+      pure `trend_down` regime, absent any execution/portfolio/thesis
+      problem, does NOT block a scheduled buy — the inverse of the other
+      five strategies' suitability tests). If any Decision Score is used at
+      all, its Evidence Items are execution-cost factors that modulate
+      *how* a due chunk is deployed, never *whether* to deploy it on
+      direction.
+- [ ] 6.4 Wire `StrategyEdgeManager` with accumulator-correct categories:
+      **ordinary mark-to-market drawdown is explicitly NOT a degradation
+      signal** (DCA is designed to hold through it). Category C =
+      **long-term-investment-thesis invalidation** (structural; requires
+      human re-certification), not a losing streak or falling balance.
+      Category A/B = **execution/portfolio** adaptation only (e.g. chunk
+      size vs. available liquidity, exposure headroom), never a directional
+      "wait for a better regime." Dedicated test that a simulated bear
+      drawdown alone does not trip Category C, and that a simulated thesis-
+      invalidation signal does.
+- [ ] 6.5 Do NOT introduce Decision-Score-weighted sizing (edge-weighted
+      sizing would smuggle in a directional/quality view DCA rejects).
+      **Document why flat, schedule-fixed chunk sizing is correct** for a
+      classic accumulator (Pillar 4/5 "document why fixed" escape hatch),
+      with the one permitted modulation being a **portfolio-cap trim**
+      (never an increase, never direction-driven). Verify sizing still
+      respects the `PortfolioRiskService` exposure cap.
+- [ ] 6.6 Close Pillar 8 gaps: add a positive `.check()` when the new
+      execution/portfolio/thesis suitability gate PASSES (today only the
+      old regime failure path is explained), surface the individual
+      execution-quality / portfolio / thesis checks, and explain the
+      buy-amount branching logic (fixed vs. percent, capped, floored,
+      portfolio-trimmed) rather than only the final `buy_amount` metric.
 - [ ] 6.7 Migrate this strategy's return type from `TradeSignal` to
-      `StrategyProposal`. DCA never emits `SELL` today (6.1 may change
-      that). Open judgment call to resolve during this phase, not decided
-      here: once DCA has accumulated any holdings, is an interval-gated
-      "not time to buy yet" tick a `HOLD` (a position exists, no change
-      recommended) or a `NO_TRADE` (no new-entry decision is being made,
-      distinct from managing an existing one)? `design.md`'s direction
-      semantics define `HOLD` as "position open, no change recommended"
-      and `NO_TRADE` as "no position, entry not recommended" - DCA's
-      always-accumulating, never-exiting shape doesn't map cleanly onto
-      either without 6.1's design decision settling what "managing" even
-      means for this strategy. Note that `execution_intent=NO_ACTION`
-      applies identically regardless of which `direction` value is chosen
-      here, since both candidates agree "no order should be placed this
-      tick" - the `direction` ambiguity affects only bookkeeping/display,
-      not the Standalone Adapter's behavior, which branches on
-      `execution_intent`. A scheduled buy maps to `OPEN_POSITION` (first
-      buy) or `ADD_TO_POSITION` (subsequent buys). Also define this
-      strategy's `validity.valid_until` (likely tied to its buy interval,
-      not a candle timeframe) and its objective assumptions if 6.1 adds
-      any regime-based skip/reduce condition. Verify standalone execution
-      via the Standalone Adapter is behavior-identical to the pre-migration
-      path regardless of which direction is chosen.
-- [ ] 6.8 Certification review; before/after backtest comparison across
-      bull, bear, AND chop windows specifically (DCA's profitability
-      claim is a bull-window artifact - certification must show it
-      remains defensible, or that 6.1's redesign fixes that).
+      `StrategyProposal`. DCA never emits `SELL` (6.1 keeps never-sell), so
+      `direction` is only ever `BUY` (scheduled buy) or a non-buying tick.
+      A non-buying tick (schedule not due, or an execution/portfolio/thesis
+      gate deferred it) is **`NO_TRADE`** — no *entry* decision is being
+      made this interval — paired with `execution_intent=NO_ACTION` (a pure
+      accumulator has no actively-managed open position, so `HOLD`/`HOLD_
+      POSITION` would misrepresent it). A due, ungated buy maps to
+      `OPEN_POSITION` (first buy) or `ADD_TO_POSITION` (subsequent buys).
+      Define `validity.valid_until` against the buy interval (not a candle
+      timeframe). Every stated assumption must be objective and
+      execution/portfolio/thesis-based (e.g. "spread within tolerance,"
+      "exposure below cap," "long-term thesis not invalidated") — **never a
+      direction forecast**. Verify standalone execution via the Standalone
+      Adapter is behavior-identical to the pre-migration path.
+- [ ] 6.8 Certification review; before/after backtest across bull, bear,
+      AND chop windows. Because 6.3 removes the trend pause, this is a
+      **deliberate behaviour change**: the backtest must show DCA now
+      **keeps accumulating on schedule through the bear window** (where it
+      previously paused), and that any skipped/deferred/trimmed buys are
+      attributable to execution quality, portfolio limits, or thesis
+      invalidation — never to price direction. Certification confirms DCA
+      behaves as a disciplined, direction-agnostic accumulator with honest
+      Pillar 9 expectations, not that it is profitable in all regimes.
 
 ## Acceptance Criteria (all phases)
 
