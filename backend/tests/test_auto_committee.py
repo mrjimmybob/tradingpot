@@ -497,3 +497,125 @@ class TestResolvePortfolioConstraints:
     async def test_empty_batch_unconstrained(self):
         pc = await resolve_portfolio_constraints([], session=object())
         assert pc.hard_block_reason is None and pc.exposure_headroom_usd is None
+
+
+# ---------------------------------------------------------------------------
+# Phase 2 — execution pipeline wiring (step 10) + the byte-identical regression
+# ---------------------------------------------------------------------------
+
+from app.services.auto_committee import execute_committee_decision, is_committee_enabled
+from app.services.strategy_framework.standalone_adapter import StandaloneAdapter
+
+_SENTINEL_ORDER = object()
+
+
+def _exec_engine():
+    return SimpleNamespace(_execute_trade=AsyncMock(return_value=_SENTINEL_ORDER))
+
+
+class TestExecutionWiringRegression:
+    """A single Alpha strategy executed through Auto Mode must produce a
+    byte-identical execution request to the Standalone Adapter path — same bot,
+    exchange, price, session, and (field-for-field) TradeSignal. Identical
+    inputs to the unchanged _execute_trade guarantee identical direction,
+    amount, flags, portfolio-risk behaviour, fees, state transitions, trades."""
+
+    @pytest.mark.asyncio
+    async def test_single_alpha_byte_identical_to_standalone(self):
+        proposal = _proposal(strategy_id="trend_following", direction=Direction.BUY,
+                             intent=ExecutionIntent.OPEN_POSITION, total=75.0, size=500.0)
+        bot, exch, sess = object(), object(), object()
+
+        eng_a = _exec_engine()
+        await StandaloneAdapter().execute(
+            proposal, engine=eng_a, bot=bot, exchange=exch,
+            current_price=100.0, session=sess, now=_NOW)
+
+        eng_b = _exec_engine()
+        decision = run_committee([proposal], now=_NOW)
+        assert len(decision.selected) == 1
+        assert decision.selected[0].allocated_size == 500.0  # == suggested, unconstrained
+        await execute_committee_decision(
+            decision, {proposal.proposal_id: proposal},
+            engine=eng_b, exchange=exch, session=sess,
+            bot_for=lambda p: bot, price_for=lambda p: 100.0, now=_NOW)
+
+        assert eng_a._execute_trade.call_count == 1
+        assert eng_b._execute_trade.call_count == 1
+        a, b = eng_a._execute_trade.call_args.args, eng_b._execute_trade.call_args.args
+        assert a[0] is b[0]           # bot
+        assert a[1] is b[1]           # exchange
+        assert a[2] == b[2]           # TradeSignal — byte-identical (dataclass eq)
+        assert a[3] == b[3]           # current_price
+        assert a[4] is b[4]           # session
+
+    @pytest.mark.asyncio
+    async def test_submits_in_execution_priority_order(self):
+        hi = _proposal(strategy_id="hi", total=90.0, size=100.0)
+        lo = _proposal(strategy_id="lo", total=40.0, size=100.0)
+        eng = _exec_engine()
+        decision = run_committee([lo, hi], now=_NOW)  # ranks hi above lo
+        await execute_committee_decision(
+            decision, {hi.proposal_id: hi, lo.proposal_id: lo},
+            engine=eng, exchange=object(), session=object(),
+            bot_for=lambda p: object(), price_for=lambda p: 100.0, now=_NOW)
+        scores = [c.args[2].score for c in eng._execute_trade.call_args_list]
+        assert scores == [90.0, 40.0]  # highest priority (rank 1) executed first
+
+    @pytest.mark.asyncio
+    async def test_allocated_size_scales_the_order_amount(self):
+        p = _proposal(size=1000.0)
+        eng = _exec_engine()
+        decision = run_committee([p], now=_NOW,
+                                 portfolio=PortfolioConstraints(exposure_headroom_usd=300.0))
+        await execute_committee_decision(
+            decision, {p.proposal_id: p}, engine=eng, exchange=object(), session=object(),
+            bot_for=lambda x: object(), price_for=lambda x: 100.0, now=_NOW)
+        assert eng._execute_trade.call_args.args[2].amount == 300.0  # trimmed, not raw 1000
+
+    @pytest.mark.asyncio
+    async def test_expired_selected_proposal_is_skipped(self):
+        p = _proposal(valid_minutes=60, size=100.0)
+        eng = _exec_engine()
+        decision = run_committee([p], now=_NOW)
+        assert len(decision.selected) == 1
+        late = _GEN + timedelta(minutes=120)  # past valid_until
+        orders = await execute_committee_decision(
+            decision, {p.proposal_id: p}, engine=eng, exchange=object(), session=object(),
+            bot_for=lambda x: object(), price_for=lambda x: 100.0, now=late)
+        eng._execute_trade.assert_not_called()
+        assert orders == []
+
+    @pytest.mark.asyncio
+    async def test_never_bypasses_execute_trade(self):
+        # Every executed order goes through engine._execute_trade — the executor
+        # has no other path to an order.
+        p = _proposal(size=100.0)
+        eng = _exec_engine()
+        decision = run_committee([p], now=_NOW)
+        orders = await execute_committee_decision(
+            decision, {p.proposal_id: p}, engine=eng, exchange=object(), session=object(),
+            bot_for=lambda x: object(), price_for=lambda x: 100.0, now=_NOW)
+        assert eng._execute_trade.call_count == 1
+        assert orders == [_SENTINEL_ORDER]
+
+
+class TestCommitteeFeatureFlag:
+    def test_disabled_by_default(self, monkeypatch):
+        monkeypatch.delenv("AUTO_COMMITTEE_ENABLED", raising=False)
+        assert is_committee_enabled() is False
+        assert is_committee_enabled(SimpleNamespace(strategy_params={})) is False
+
+    def test_global_env_enables(self, monkeypatch):
+        monkeypatch.setenv("AUTO_COMMITTEE_ENABLED", "true")
+        assert is_committee_enabled() is True
+
+    def test_per_bot_param_enables(self, monkeypatch):
+        monkeypatch.delenv("AUTO_COMMITTEE_ENABLED", raising=False)
+        bot = SimpleNamespace(strategy_params={"auto_committee_enabled": True})
+        assert is_committee_enabled(bot) is True
+
+    def test_per_bot_param_can_disable_when_global_on(self, monkeypatch):
+        monkeypatch.setenv("AUTO_COMMITTEE_ENABLED", "1")
+        bot = SimpleNamespace(strategy_params={"auto_committee_enabled": False})
+        assert is_committee_enabled(bot) is False

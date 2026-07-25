@@ -14,6 +14,8 @@ execution pipeline.
 """
 from .comparison import ComparisonView, read_comparison
 from .decision import CommitteeDecision, RejectedProposal, SelectedAllocation
+from .execution import execute_committee_decision
+from .flag import is_committee_enabled
 from .portfolio import PortfolioConstraints, resolve_portfolio_constraints
 from .process import run_committee
 from .trust import TrustAdjustment
@@ -28,4 +30,6 @@ __all__ = [
     "PortfolioConstraints",
     "resolve_portfolio_constraints",
     "run_committee",
+    "execute_committee_decision",
+    "is_committee_enabled",
 ]

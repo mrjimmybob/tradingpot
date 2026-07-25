@@ -4,17 +4,24 @@
 architecture-only; implementation was gated on separate approval. That
 approval has been given, and implementation now proceeds against this
 already-agreed task breakdown (the same pattern `add-strategy-decision-
-framework` used). **Phases 0-1 complete.** Phase 0 (Committee Core):
+framework` used). **Phases 0-2 complete.** Phase 0 (Committee Core):
 `backend/app/services/auto_committee/` (`comparison.py`, `decision.py`,
 `trust.py`, `process.py`). Phase 1 (Portfolio Risk Wiring): `portfolio.py`
 resolves the cycle's constraints via the unchanged `PortfolioRiskService`/
-`StrategyCapacityService`, and step 5/8 evaluate the max-total-exposure cap as
-a single shared budget across the complete decision (consumed in ranking order,
-tie-groups split proportionally) — order-independent, no reimplementation, no
-optimisation, trim-only. 41 tests in `backend/tests/test_auto_committee.py`;
-full suite 1323 passing, zero regressions. Depends on `add-strategy-decision-
-framework`'s Phases 0-6 (all complete), which produce the real
-`StrategyProposal` objects Auto consumes.
+`StrategyCapacityService`; step 5/8 evaluate the max-total-exposure cap as a
+single shared budget across the complete decision (ranking order, tie-groups
+split proportionally) — order-independent, trim-only, no reimplementation, no
+optimisation. Phase 2 (Execution Pipeline Wiring): `execution.py`
+(`execute_committee_decision`) submits each selected proposal to the unchanged
+`_execute_trade` in `execution_priority` order, reusing the Standalone
+Adapter's exact translation (amount scaled to `allocated_size`); `flag.py`
+(`is_committee_enabled`) gates it, OFF by default, coexisting with the
+Standalone path. The required regression proves a single Alpha strategy through
+Auto is byte-identical to the Standalone Adapter path (same bot/exchange/price/
+session and field-identical `TradeSignal`). 50 tests; full suite 1332 passing,
+zero regressions. Depends on `add-strategy-decision-framework`'s Phases 0-6
+(all complete), which produce the real `StrategyProposal` objects Auto
+consumes.
 
 This checklist also depends on `add-strategy-decision-framework`'s
 Phase 0-6 strategy implementation having produced real `StrategyProposal`
@@ -126,7 +133,7 @@ routed through Auto instead of a single-strategy path.
 
 ## Phase 2 — Execution Pipeline Wiring (step 10)
 
-- [ ] 2.1 Build the translation from a `CommitteeDecision.selected` entry
+- [x] 2.1 Build the translation from a `CommitteeDecision.selected` entry
       back into the order-intent shape `_execute_trade`
       (`backend/app/services/trading_engine.py:6332`) already expects -
       the same `direction`/`suggested_position_size` extraction the
@@ -134,19 +141,19 @@ routed through Auto instead of a single-strategy path.
       performs for a single proposal, reused here per selected proposal,
       now scaled by `SelectedAllocation.allocated_size` instead of the
       proposal's raw `suggested_position_size`.
-- [ ] 2.2 Submit each selected proposal to `_execute_trade` in
+- [x] 2.2 Submit each selected proposal to `_execute_trade` in
       `execution_priority` order, per `SelectedAllocation`. The existing
       pipeline (portfolio risk check, strategy capacity check, cost
       estimate, viability gate, order size validation, execution routing,
       execution) runs UNCHANGED for each.
-- [ ] 2.3 **Regression test (required, not optional)**: with exactly one
+- [x] 2.3 **Regression test (required, not optional)**: with exactly one
       strategy enabled, confirm the committee-driven path produces an
       IDENTICAL outcome to the pre-Auto-Mode Standalone-Adapter-driven
       path, for a fixed set of historical scenarios - a one-strategy
       portfolio through Auto should behave exactly like today's
       single-strategy standalone execution, proving the committee adds
       capability without changing behavior in the degenerate case.
-- [ ] 2.4 Feature-flag the committee path so it can be enabled per-bot or
+- [x] 2.4 Feature-flag the committee path so it can be enabled per-bot or
       globally without removing the existing Standalone Adapter path -
       exact flagging mechanism is an implementation detail, not specified
       here.
