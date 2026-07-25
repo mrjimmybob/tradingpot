@@ -113,6 +113,10 @@ class StandaloneAdapter:
             expected_move_pct=expected_move_pct,
             expected_risk_pct=expected_risk_pct,
             is_accumulation=is_accumulation,
+            # Carry the source proposal so the Auto committee (Phase 5) can
+            # collect it from a strategy that returns a TradeSignal. compare=False
+            # on the field keeps TradeSignal equality byte-identical.
+            _source_proposal=proposal,
         )
 
     async def execute(

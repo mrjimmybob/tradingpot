@@ -5,7 +5,7 @@ import json
 import logging
 from datetime import datetime, timedelta
 from typing import Optional, Dict, Any, Callable, Awaitable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -62,6 +62,11 @@ from .strategy_framework.proposal import (
     derive_reasons,
 )
 from .strategy_framework.standalone_adapter import StandaloneAdapter
+from .auto_committee import (
+    is_committee_enabled,
+    resolve_portfolio_constraints,
+    run_committee,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -182,6 +187,20 @@ _ALPHA_STRATEGIES = (
     "volatility_breakout",
 )
 
+# The Investment Committee's Alpha set (add-auto-mode-investment-committee's
+# "Strategy Categories" clarification): Alpha strategies compete for capital in
+# the committee; the Allocation strategy dca_accumulator does NOT and never
+# enters the committee. This deliberately differs from the legacy
+# _ALPHA_STRATEGIES above (which includes dca_accumulator and omits
+# dip_recovery) - the committee uses THIS set.
+_COMMITTEE_ALPHA_STRATEGIES = (
+    "trend_following",
+    "mean_reversion",
+    "volatility_breakout",
+    "dip_recovery",
+    "adaptive_grid",
+)
+
 _DT_TAG = "__dt__"
 
 
@@ -277,6 +296,14 @@ class TradeSignal:
     # a fee sanity check (fee % < _MAX_ACCUMULATION_FEE_PCT) instead of the
     # directional edge check used for is_accumulation=False signals.
     is_accumulation: bool = False
+
+    # The StrategyProposal this signal was translated from, when it came through
+    # the Standalone Adapter (add-auto-mode-investment-committee Phase 5). Lets
+    # the Auto committee collect proposals from a strategy that returns a
+    # TradeSignal, without a per-strategy edit or a StrategyProposal-contract
+    # change. compare=False/repr=False so it never affects TradeSignal equality
+    # (the Phase 2 byte-identical guarantee) or logs. Observability/plumbing only.
+    _source_proposal: Any = field(default=None, compare=False, repr=False)
 
 
 def evaluate_reward_risk(
@@ -6608,6 +6635,127 @@ class TradingEngine:
             ),
         )
 
+    async def _committee_select(
+        self,
+        bot: Bot,
+        current_price: float,
+        candidates: tuple,
+        session: AsyncSession,
+    ) -> Optional[TradeSignal]:
+        """Evaluate each candidate Alpha strategy, collect StrategyProposals, run
+        the Investment Committee, and return the winning proposal's TradeSignal
+        (scaled to the committee's allocated_size), or None if nothing is
+        selected (add-auto-mode-investment-committee Phase 5).
+
+        Each strategy is evaluated in isolation (its own per-strategy state dict,
+        a fresh explanation builder, _invoked_by_auto). Strategies that return no
+        proposal (warmup/structural holds) or a non-order proposal simply don't
+        compete this cycle.
+        """
+        base_params = dict(bot.strategy_params or {})
+        base_params["_invoked_by_auto"] = True
+
+        proposals = []
+        proposal_by_id = {}
+        for strat in candidates:
+            executor = self._get_strategy_executor(strat)
+            if executor is None:
+                continue
+            # Fresh builder per strategy (mirrors _execute_strategy) so each
+            # strategy's own checks populate its own proposal explanation.
+            self._explanations[bot.id] = ExplanationBuilder(strat)
+            try:
+                sig = await executor(bot, current_price, dict(base_params), session)
+            except Exception as exc:  # noqa: BLE001 - one strategy erroring must not sink the cycle
+                logger.warning("Bot %s: Auto committee - %s evaluation failed (skipped): %s",
+                               bot.id, strat, exc)
+                continue
+            proposal = getattr(sig, "_source_proposal", None) if sig is not None else None
+            if proposal is not None:
+                proposals.append(proposal)
+                proposal_by_id[proposal.proposal_id] = proposal
+
+        if not proposals:
+            return None
+
+        now = self.clock.now()
+        try:
+            constraints = await resolve_portfolio_constraints(proposals, session=session)
+        except Exception as exc:  # noqa: BLE001 - fall back to unconstrained rather than crash
+            logger.warning("Bot %s: Auto committee - portfolio resolve failed, unconstrained: %s",
+                           bot.id, exc)
+            constraints = None
+        decision = run_committee(proposals, now=now, portfolio=constraints)
+
+        if not decision.selected:
+            return None
+
+        # Single-bot host: realise ONE position per cycle — the top-ranked
+        # selection (execution_priority == 1). Runtime multi-execution needs a
+        # multi-position/multi-bot model (out of scope; the capability stays
+        # certified).
+        top = min(decision.selected, key=lambda s: s.execution_priority)
+        winner = proposal_by_id.get(top.proposal_id)
+        if winner is None:
+            return None
+        signal = StandaloneAdapter.to_trade_signal(winner)
+        if signal is None:
+            return None
+        if top.allocated_size is not None:
+            signal.amount = top.allocated_size
+        # Stamp ownership so _resolve_owning_strategy records the winning
+        # sub-strategy (bot.strategy is "auto_mode" for every dispatch).
+        signal.reason = f"[Auto:{winner.strategy_id}|committee] {signal.reason or ''}".strip()
+        return signal
+
+    async def _strategy_auto_committee(
+        self,
+        bot: Bot,
+        current_price: float,
+        params: dict,
+        session: AsyncSession,
+    ) -> Optional[TradeSignal]:
+        """Auto Mode via the Investment Committee (Phase 5, single bot, no
+        scheduler). In a position → dispatch only the owning strategy (its own
+        exit rules, per auto-mode-position-ownership). Flat → run the committee
+        over the Alpha set and execute the winner.
+        """
+        open_positions = await self._get_bot_positions(bot.id, session)
+
+        if open_positions:
+            owner = next(
+                (getattr(p, "owning_strategy", None) for p in open_positions
+                 if getattr(p, "owning_strategy", None)),
+                None,
+            )
+            if not owner:
+                # Legacy/unowned position: don't open anything new; let existing
+                # safety nets (stop-loss in the run loop) manage it.
+                logger.warning("Bot %s: Auto committee - open position has no owning_strategy; holding.",
+                               bot.id)
+                return TradeSignal(action="hold", amount=0,
+                                   reason="[Auto:committee] Holding unowned open position")
+            executor = self._get_strategy_executor(owner)
+            if executor is None:
+                return TradeSignal(action="hold", amount=0,
+                                   reason=f"[Auto:{owner}|committee] owner executor unavailable")
+            dispatched = dict(bot.strategy_params or {})
+            dispatched["_invoked_by_auto"] = True
+            self._explanations[bot.id] = ExplanationBuilder(owner)
+            sig = await executor(bot, current_price, dispatched, session)
+            if sig is not None and not (sig.reason or "").startswith("[Auto:"):
+                sig.reason = f"[Auto:{owner}|committee] {sig.reason or ''}".strip()
+            return sig
+
+        # Flat → committee entry competition.
+        sig = await self._committee_select(
+            bot, current_price, _COMMITTEE_ALPHA_STRATEGIES, session
+        )
+        if sig is not None:
+            return sig
+        return TradeSignal(action="hold", amount=0,
+                           reason="[Auto:committee] No proposal selected this cycle")
+
     async def _strategy_auto(
         self,
         bot: Bot,
@@ -6639,6 +6787,13 @@ class TradingEngine:
             disabled_factors: Legacy parameter (ignored)
             switch_threshold: Legacy parameter (ignored)
         """
+        # === Runtime committee integration (Phase 5, behind the flag) ===
+        # When enabled, Auto decides via the Investment Committee instead of the
+        # legacy rotation policy below. OFF by default → the existing behaviour
+        # (everything after this block) is unchanged.
+        if is_committee_enabled(bot):
+            return await self._strategy_auto_committee(bot, current_price, params, session)
+
         # === PARAMETER EXTRACTION ===
         min_switch_interval = params.get("min_switch_interval_minutes", 15)
         bar_interval_seconds = params.get("bar_interval_seconds", 60)

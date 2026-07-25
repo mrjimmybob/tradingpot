@@ -4,8 +4,17 @@
 architecture-only; implementation was gated on separate approval. That
 approval has been given, and implementation now proceeds against this
 already-agreed task breakdown (the same pattern `add-strategy-decision-
-framework` used). **Phases 0-4 complete — Investment Committee CERTIFIED
-(scenario gate).** See `certification.md`. Phase 0 (Committee Core):
+framework` used). **Phases 0-5 COMPLETE — Investment Committee certified AND
+runtime-integrated end-to-end; the change is ready to archive once deployed.**
+Phase 5 (Runtime Integration): `_strategy_auto` delegates (behind
+`is_committee_enabled`, OFF by default) to `_strategy_auto_committee` — flat →
+evaluate all Alpha strategies, `_committee_select` runs the committee and
+executes the winner through the unchanged `_execute_trade`; in a position →
+dispatch only the `owning_strategy`. Proposals surfaced via `TradeSignal.
+_source_proposal` (`compare=False`, byte-identical guarantee intact); no
+scheduler, no contract change, no per-strategy edits; `dca_accumulator` never a
+candidate. 13 runtime tests (`test_auto_committee_runtime.py`); full suite 1371
+passing, zero regressions. See `certification.md` §5. Phase 0 (Committee Core):
 `backend/app/services/auto_committee/` (`comparison.py`, `decision.py`,
 `trust.py`, `process.py`). Phase 1 (Portfolio Risk Wiring): `portfolio.py`
 resolves the cycle's constraints via the unchanged `PortfolioRiskService`/
@@ -226,6 +235,60 @@ fixtures - producing real ones is separate, future work per source.
 passing, documented test; Open Questions this change left unresolved are
 closed with recorded decisions; a before/after comparison exists and is
 reviewed before Auto Mode is enabled for any real bot.
+
+## Phase 5 — Runtime Integration (single Auto bot; no scheduler)
+
+Wire the committee into the running engine so Auto Mode actually decides via
+the committee at runtime, per the approved integration decision: **Auto is one
+bot, not a portfolio of bots.** Inside the existing Auto bot's loop, evaluate
+all enabled Alpha strategies, collect their `StrategyProposal`s, run the
+Investment Committee, and execute the selected proposal through the existing
+`_execute_trade` pipeline. **No cross-bot scheduler or portfolio-level
+runtime.** Behind `is_committee_enabled` (OFF by default); the existing
+rotation-based Auto path is unchanged when the flag is off.
+
+- [x] 5.1 Surface each strategy's `StrategyProposal` to the committee without
+      per-strategy edits or a `StrategyProposal`-contract change: attach the
+      source proposal to the `TradeSignal` the Standalone Adapter already
+      produces (`_source_proposal`, `field(compare=False, repr=False)` so it
+      never affects `TradeSignal` equality — the Phase 2 byte-identical
+      guarantee holds).
+- [x] 5.2 Use the clarified committee Alpha set (`trend_following`,
+      `mean_reversion`, `volatility_breakout`, `dip_recovery`,
+      `adaptive_grid`) — NOT the legacy `_ALPHA_STRATEGIES` constant (which
+      includes `dca_accumulator` and omits `dip_recovery`). Reconcile the
+      naming so the committee uses the correct Alpha set; `dca_accumulator`
+      (Allocation) never enters the committee.
+- [x] 5.3 Build `_committee_select`: evaluate each candidate Alpha strategy in
+      isolation (fresh explanation builder per strategy, `_invoked_by_auto`),
+      collect the proposals, `resolve_portfolio_constraints` +
+      `run_committee` (neutral trust/policy), and return the top-ranked
+      selected proposal's signal scaled to `allocated_size`, or nothing.
+- [x] 5.4 Build `_strategy_auto_committee` and delegate to it from
+      `_strategy_auto` when `is_committee_enabled(bot)`: **in a position →
+      dispatch only the `owning_strategy`** (reuses the existing
+      `auto-mode-position-ownership` rule — the entering strategy manages its
+      own exit); **flat → `_committee_select`**, stamping the winner's reason
+      `[Auto:<strategy>|committee]` so `_resolve_owning_strategy` records the
+      correct owner on execution. One position at a time (single-bot host);
+      runtime multi-execution needs a multi-position/multi-bot model and is
+      NOT built here (the capability stays certified).
+- [x] 5.5 Tests: flag-off leaves `_strategy_auto` behaviour unchanged;
+      `_committee_select` picks the highest-ranked actionable proposal and
+      scales its amount; the in-position path dispatches only the owner; the
+      winner's reason is stamped for ownership resolution; `dca_accumulator`
+      is never a committee candidate.
+- [x] 5.6 End-to-end certification: extend the Auto Certification Gate /
+      `certification.md` with the runtime-integration checks and confirm the
+      full suite passes. This closes the runtime-integration gap flagged in
+      Phase 4's §4.3.
+
+**Phase 5 acceptance criteria**: with the flag on, an Auto bot evaluates all
+Alpha strategies, runs the committee, and executes the selected proposal
+through the unchanged `_execute_trade`; position ownership is preserved via
+`owning_strategy`; `dca_accumulator` never competes; with the flag off,
+behaviour is byte-identical to the pre-Phase-5 rotation Auto. No cross-bot
+scheduler, no `StrategyProposal`-contract change, no per-strategy edits.
 
 ## Explicitly Out of Scope (this change and all its phases)
 

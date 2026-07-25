@@ -284,6 +284,33 @@ step and reason for each), `trust_adjustments_applied`, and a
 - **THEN** it is never subsequently edited; any change in outcome is
   represented by a new `CommitteeDecision` from a later evaluation cycle
 
+### Requirement: Single-Bot Runtime Integration
+Auto Mode SHALL run the Investment Committee inside a single Auto bot's own
+evaluation loop: it evaluates all enabled Alpha strategies, collects their
+`StrategyProposal` objects, runs the Committee Process, and executes the
+selected proposal through the existing, unchanged `_execute_trade` pipeline.
+Auto is one bot, not a portfolio of bots: there SHALL be no cross-bot
+scheduler or portfolio-level runtime. `dca_accumulator` (an Allocation
+strategy) SHALL NOT be a committee candidate. The committee runtime SHALL be
+behind a feature flag, OFF by default, leaving the pre-existing Auto behaviour
+unchanged when disabled.
+
+#### Scenario: Committee runs inside the single Auto bot when flat
+- **WHEN** an Auto bot with the committee flag enabled evaluates while holding
+  no position
+- **THEN** it evaluates every enabled Alpha strategy, runs the committee over
+  their proposals, and executes the selected proposal through `_execute_trade`,
+  without any cross-bot scheduler
+
+#### Scenario: Position ownership is preserved
+- **WHEN** the Auto bot holds a position opened by a committee-selected strategy
+- **THEN** only that `owning_strategy` is dispatched to manage the exit, and no
+  other strategy's proposal is executed against that position until it closes
+
+#### Scenario: Flag off leaves Auto unchanged
+- **WHEN** the committee flag is disabled
+- **THEN** the Auto bot uses its pre-existing selection behaviour, unchanged
+
 ### Requirement: Auto Certification Gate
 Auto Mode's implementation SHALL NOT be considered certified for
 production use until a written review confirms: it never reads

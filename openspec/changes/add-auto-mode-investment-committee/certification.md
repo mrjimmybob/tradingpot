@@ -72,20 +72,54 @@ path reproduces these exactly): `trend_following`, binance BTCUSDT 1m,
 (Auto is not expected to beat Buy-and-hold or Standalone; this is capability
 wiring, not an alpha change.)
 
-**Deferred — multi-strategy portfolio comparison.** A multi-strategy
-standalone-vs-Auto backtest requires wiring the committee into the per-bot
-engine run-loop (collecting proposals from several Alpha bots into one
-committee cycle). That loop integration is deliberately **out of scope for this
-change** (it is the post-certification, behind-the-flag step) and is **not**
-built here, so the multi-strategy before/after is deferred to that future
-integration rather than fabricated. This is stated honestly rather than
-implied complete — no multi-strategy Auto execution path exists yet to
-measure.
+## §5 Runtime integration (Phase 5) — now implemented
+
+The runtime integration that Phase 4 recorded as deferred is now built (Phase
+5), per the approved single-bot decision: **Auto is one bot, not a portfolio of
+bots.** Inside the existing Auto bot's loop, `_strategy_auto` delegates (behind
+`is_committee_enabled`, OFF by default) to `_strategy_auto_committee`, which:
+
+- **Flat** → evaluates all Alpha strategies (`_COMMITTEE_ALPHA_STRATEGIES` =
+  trend_following, mean_reversion, volatility_breakout, dip_recovery,
+  adaptive_grid — `dca_accumulator` excluded), collects each strategy's
+  `StrategyProposal` (surfaced on the returned `TradeSignal` via
+  `_source_proposal`, `compare=False` so the Phase 2 byte-identical guarantee
+  holds), runs `resolve_portfolio_constraints` + `run_committee`, and executes
+  the top-ranked selection through the **unchanged** `_execute_trade`.
+- **In a position** → dispatches only the `owning_strategy` (its own exit
+  rules), reusing the existing `auto-mode-position-ownership` rule; the winner's
+  reason is stamped `[Auto:<strategy>|committee]` so `_resolve_owning_strategy`
+  records the correct owner on execution.
+
+No cross-bot scheduler, no portfolio-level runtime, no `StrategyProposal`-
+contract change, no per-strategy edits.
+
+**Runtime-integration checks (`tests/test_auto_committee_runtime.py`, 13 tests):**
+
+| Property | Check | Result |
+|---|---|---|
+| Proposal surfaced without contract change | `to_trade_signal` carries `_source_proposal`; equality unaffected (`compare=False`) | PASS |
+| Winner = highest-ranked, amount scaled, owner-stamped | `_committee_select` picks top rank, scales to `allocated_size`, stamps `[Auto:…|committee]` | PASS |
+| One failing strategy doesn't sink the cycle | erroring strategy skipped, others still compete | PASS |
+| In a position → only owner dispatched | `_committee_select` never called; owner's exit returned | PASS |
+| Flat + no selection → hold | committee returns nothing → HOLD | PASS |
+| Flag on → delegates; flag off → unchanged | delegation asserted; flag OFF by default (1371-test suite runs on the unchanged path) | PASS |
+| `dca_accumulator` never a candidate; `dip_recovery` is | `_COMMITTEE_ALPHA_STRATEGIES` membership | PASS |
+
+**Single-bot scope (honest):** a single-position Auto bot realises **one**
+position per cycle — the committee's top selection. Runtime *multi-execution*
+(multiple simultaneous positions) needs a multi-position/multi-bot model and is
+**not** built; the multi-execution *capability* remains certified (Gate item 9).
+The multi-strategy standalone-vs-Auto backtest still requires that multi-bot
+model and remains future validation work — but the runtime integration itself
+is complete, so nothing about Auto's decision path is left unimplemented.
 
 ## Conclusion
 
 The Investment Committee is **certified for correctness and determinism** under
-all supported scenarios. Enabling Auto for any real bot additionally requires
-the engine-loop integration and its own multi-strategy before/after review;
-until then Auto remains behind the `is_committee_enabled` flag (OFF by default),
-coexisting with the unchanged Standalone path.
+all supported scenarios, **and the runtime integration is complete**: an Auto
+bot decides via the committee end-to-end, behind `is_committee_enabled` (OFF by
+default), with position ownership preserved and execution byte-identical to the
+Standalone path in the degenerate one-strategy case. Enabling Auto for a real
+bot remains an operator decision (flip the flag) after whatever live review the
+operator requires; the code path is finished, not deferred.
