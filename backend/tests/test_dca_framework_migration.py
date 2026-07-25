@@ -16,12 +16,18 @@ buy still fires in a downtrend, absent an execution/portfolio/thesis problem".
 """
 from __future__ import annotations
 
+import inspect
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from app.routers.config import STRATEGIES
+from app.services.strategy_framework.edge_management import (
+    DCA_THESIS_INVALIDATION_CONDITIONS,
+    DcaEdgeManager,
+    EdgeCategory,
+)
 from app.services.trading_engine import MIN_ORDER_USD, TradingEngine
 
 
@@ -167,3 +173,117 @@ class TestBudgetExhaustionStop:
         sig = await engine._strategy_dca(bot, 50_000.0, {}, AsyncMock())
         assert sig.action == "hold"
         assert "accumulation complete" in (sig.reason or "").lower()
+
+
+# ---------------------------------------------------------------------------
+# 5. Strategy Edge Management (Pillar 7) — DcaEdgeManager classifier
+# ---------------------------------------------------------------------------
+
+class TestDcaEdgeManagerClassification:
+    """A classic DCA fails ONLY when its accumulation thesis is objectively
+    invalidated - never because the market falls. These tests pin the
+    classification axis: C = thesis invalidation only; A/B = operational; and
+    there is deliberately NO price/performance input that could trip C."""
+
+    @pytest.mark.parametrize("condition", DCA_THESIS_INVALIDATION_CONDITIONS)
+    def test_each_thesis_condition_is_category_C(self, condition):
+        status = DcaEdgeManager().evaluate(thesis_invalidation={condition: True})
+        assert status.category is EdgeCategory.C
+        assert status.should_stop is True
+        assert status.can_adapt is False and status.should_wait is False
+        assert condition in status.reason
+
+    def test_operational_pause_is_category_A(self):
+        status = DcaEdgeManager().evaluate(operational_pause="budget temporarily exhausted")
+        assert status.category is EdgeCategory.A
+        assert status.should_wait is True
+        assert status.should_stop is False  # A is never a permanent stop
+
+    def test_operational_adaptation_is_category_B(self):
+        status = DcaEdgeManager().evaluate(operational_adaptation="chunk floored to $10")
+        assert status.category is EdgeCategory.B
+        assert status.can_adapt is True
+        assert status.should_stop is False
+
+    def test_no_conditions_is_healthy_none(self):
+        status = DcaEdgeManager().evaluate()
+        assert status.category is EdgeCategory.NONE
+        assert not status.should_stop and not status.should_wait
+
+    def test_unrecognised_condition_cannot_invalidate_thesis(self):
+        """A price/performance/trend-flavoured condition passed by mistake must
+        be ignored - only the objective, whitelisted conditions invalidate."""
+        status = DcaEdgeManager().evaluate(
+            thesis_invalidation={"price_fell": True, "drawdown_deep": True, "trend_down": True}
+        )
+        assert status.category is EdgeCategory.NONE
+        assert status.should_stop is False
+
+    def test_thesis_invalidation_takes_precedence(self):
+        status = DcaEdgeManager().evaluate(
+            thesis_invalidation={"asset_delisted": True},
+            operational_pause="budget exhausted",
+            operational_adaptation="chunk floored",
+        )
+        assert status.category is EdgeCategory.C
+
+    def test_classifier_has_no_price_or_performance_input(self):
+        """Structural guarantee: DcaEdgeManager.evaluate exposes no pnl/price/
+        drawdown/win-rate parameter, so drawdown cannot be an input at all."""
+        params = set(inspect.signature(DcaEdgeManager.evaluate).parameters) - {"self"}
+        assert params == {"thesis_invalidation", "operational_pause",
+                          "operational_adaptation", "now"}
+        forbidden = ("pnl", "price", "drawdown", "return", "win", "profit", "loss")
+        assert not any(any(f in p for f in forbidden) for p in params)
+
+
+class TestDcaEdgeWiring:
+    """Edge management wired into _strategy_dca: C halts, drawdown never does,
+    and the operational A/B paths are classified where DCA actually hits them."""
+
+    @pytest.mark.asyncio
+    async def test_drawdown_regime_never_trips_category_C(self):
+        """The whole point: a falling market (down regime, low price) keeps
+        accumulating and is classified NONE - never C."""
+        engine = _engine(regime_state="down")
+        bot = _bot()
+        sig = await engine._strategy_dca(bot, 100.0, {}, AsyncMock())  # deeply "down" price
+        assert sig.action == "buy"
+        assert engine._explain(bot.id).exp.metrics["edge_status_category"] == EdgeCategory.NONE.value
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("condition", DCA_THESIS_INVALIDATION_CONDITIONS)
+    async def test_each_thesis_condition_halts_accumulation(self, condition):
+        engine = _engine(regime_state="up")
+        bot = _bot()
+        sig = await engine._strategy_dca(bot, 50_000.0, {condition: True}, AsyncMock())
+        assert sig.action == "hold"
+        assert "thesis invalidated" in (sig.reason or "").lower()
+        assert engine._explain(bot.id).exp.metrics["edge_status_category"] == EdgeCategory.C.value
+
+    @pytest.mark.asyncio
+    async def test_legacy_thesis_invalidated_param_maps_to_operator_invalidated(self):
+        engine = _engine(regime_state="up")
+        bot = _bot()
+        sig = await engine._strategy_dca(bot, 50_000.0, {"thesis_invalidated": True}, AsyncMock())
+        assert sig.action == "hold"
+        assert engine._explain(bot.id).exp.metrics["edge_status_category"] == EdgeCategory.C.value
+
+    @pytest.mark.asyncio
+    async def test_budget_exhaustion_classified_category_A(self):
+        engine = _engine(regime_state="down")
+        bot = _bot(balance=MIN_ORDER_USD - 1.0)
+        sig = await engine._strategy_dca(bot, 50_000.0, {}, AsyncMock())
+        assert sig.action == "hold"
+        assert engine._explain(bot.id).exp.metrics["edge_status_category"] == EdgeCategory.A.value
+
+    @pytest.mark.asyncio
+    async def test_chunk_floor_classified_category_B(self):
+        # balance 50 * 10% = $5 chunk, below the $10 minimum but affordable ->
+        # floored to $10 (operational adaptation, Category B).
+        engine = _engine(regime_state="down")
+        bot = _bot(balance=50.0)
+        sig = await engine._strategy_dca(bot, 50_000.0, {}, AsyncMock())
+        assert sig.action == "buy"
+        assert sig.amount == MIN_ORDER_USD
+        assert engine._explain(bot.id).exp.metrics["edge_status_category"] == EdgeCategory.B.value

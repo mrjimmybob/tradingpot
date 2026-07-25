@@ -294,9 +294,50 @@ legitimately Not Applicable for a pure accumulator (documented, not merely
 absent). Risk management is relocated entirely to the entry side (Pillars
 2/5/7).
 
-## Pillar 7 — Strategy Edge Management: Not present
+## Pillar 7 — Strategy Edge Management: Present, accumulation-health axis (Phase 6.4)
 
-No tracking of DCA's own performance anywhere in the function.
+**Pre-Phase-6 state:** no tracking of any kind in the function.
+
+**Implemented (Phase 6.4):** a dedicated `DcaEdgeManager`
+(`strategy_framework/edge_management.py`), wired into `_strategy_dca` exactly
+as the other strategies wire `StrategyEdgeManager` (lazy-instantiated,
+evaluated before entry, category surfaced via `_explain().metric(
+"edge_status_category", ...)` + a `"Accumulation thesis intact"` check, and a
+Category-C `should_stop` that halts). It reuses the shared `EdgeStatus` /
+`EdgeCategory` / `EdgeSignal` output contract, so DCA is wired to Pillar 7
+identically to the rest — **only the classification axis differs**, and
+deliberately so.
+
+The load-bearing design point: **a classic DCA does not fail because the
+market falls; it fails only when its investment thesis fails.** So the manager
+monitors the health of the **accumulation process**, never mark-to-market
+profitability. `DcaEdgeManager` records no trade outcomes and computes no
+performance statistics — its `evaluate()` exposes **no pnl / price / drawdown /
+win-rate parameter at all** (pinned by a signature test), so an ordinary
+drawdown *cannot* be an input, let alone a degradation signal.
+
+- **Category C** (stop, human re-certification) — the ONLY halt. Fires solely
+  on an objective, permanent, whitelisted invalidation condition:
+  `operator_invalidated`, `asset_delisted`, `fundamental_failure`,
+  `regulatory_impossibility`, `portfolio_withdrawn`
+  (`DCA_THESIS_INVALIDATION_CONDITIONS`). Unrecognised (e.g. price/trend/
+  performance-flavoured) keys are ignored, so nothing can invalidate the
+  thesis through the back door. The Phase 6.3 `thesis_invalidated` param maps
+  to `operator_invalidated`.
+- **Category A** (wait, never a stop) — a *temporary* operational/portfolio
+  pause. Wired where DCA actually hits one: balance below the minimum order
+  (capital temporarily unavailable).
+- **Category B** (adapt, never directional) — an operational/portfolio
+  parameter adaptation. Wired where DCA actually hits one: the configured
+  chunk floored up to the `$MIN_ORDER_USD` executable minimum.
+- **NONE** — accumulation process healthy; continue on schedule (the normal
+  case, including through a full drawdown).
+
+29 tests in `backend/tests/test_dca_framework_migration.py` (classifier unit
+tests for each category, the "unrecognised condition cannot invalidate"
+guarantee, the no-price/performance-input signature test, and integration
+tests proving a down-regime drawdown stays NONE while each thesis condition
+halts with Category C). Full suite 1257 passing, zero regressions.
 
 ## Pillar 8 — Self-Diagnostics: Partial
 

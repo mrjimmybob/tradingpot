@@ -49,7 +49,7 @@ from collections import deque
 from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
-from typing import Deque, Dict, List, Optional, Tuple
+from typing import Deque, Dict, List, Mapping, Optional, Tuple
 
 
 class EdgeCategory(str, Enum):
@@ -395,3 +395,129 @@ class StrategyEdgeManager:
                 f"(beyond epsilon {self.decision_score_trend_epsilon:.4f})"
             )
         return bool(reasons), reasons
+
+
+# Objective, permanent invalidation conditions for a DCA accumulation thesis.
+# These are the ONLY things that make a classic DCA "lose its edge". NONE of
+# them is price-, trend-, or performance-based - that is the entire point.
+DCA_THESIS_INVALIDATION_CONDITIONS: Tuple[str, ...] = (
+    "operator_invalidated",       # operator manually declares the thesis dead
+    "asset_delisted",             # asset permanently delisted / untradeable
+    "fundamental_failure",        # fundamental project failure
+    "regulatory_impossibility",   # holding/trading the asset is legally impossible
+    "portfolio_withdrawn",        # portfolio policy permanently withdraws the asset
+)
+
+
+class DcaEdgeManager:
+    """Strategy Edge Management (Pillar 7) for a classic, direction-agnostic DCA.
+
+    Deliberately distinct from ``StrategyEdgeManager``: a classic DCA does NOT
+    fail because the market falls, so this monitors the health of the
+    ACCUMULATION PROCESS, never mark-to-market profitability. It records no
+    trade outcomes and computes no performance statistics - there is
+    intentionally **no price / pnl / trend input on this class at all**, so an
+    ordinary drawdown can never be reinterpreted as loss of edge. It reuses the
+    shared ``EdgeStatus`` / ``EdgeCategory`` / ``EdgeSignal`` output contract so
+    it is wired to the framework identically to the other strategies; only the
+    classification axis differs (see audits/dca_accumulator.md Phase 6.1/6.4 and
+    design.md's "Pure-accumulator exception"). Stateless and fully deterministic.
+
+    Categories:
+      C    - objective, permanent invalidation of the accumulation thesis
+             (operator invalidation, delisting, fundamental failure, regulatory
+             impossibility, portfolio withdrawal). The ONLY thing that stops a
+             classic DCA; requires human re-certification.
+      A    - a TEMPORARY operational / portfolio-management pause (e.g. budget
+             temporarily exhausted, portfolio exposure headroom reached, an
+             opt-in operator overlay pausing). Wait; never a permanent stop.
+      B    - an operational / portfolio PARAMETER adaptation (e.g. chunk size
+             floored to the executable minimum or trimmed to portfolio
+             headroom). Adapt; never a directional change.
+      NONE - accumulation process healthy; continue on schedule.
+    """
+
+    def evaluate(
+        self,
+        *,
+        thesis_invalidation: Optional[Mapping[str, bool]] = None,
+        operational_pause: Optional[str] = None,
+        operational_adaptation: Optional[str] = None,
+        now: Optional[datetime] = None,
+    ) -> EdgeStatus:
+        """Classify accumulation-process health from operational/thesis inputs.
+
+        Args:
+            thesis_invalidation: mapping of objective, permanent invalidation
+                conditions (keys from ``DCA_THESIS_INVALIDATION_CONDITIONS``) to
+                booleans. Any True -> Category C. Unrecognised keys are ignored,
+                so no ad-hoc (e.g. price/performance) condition can invalidate
+                the thesis through this door.
+            operational_pause: citation of a TEMPORARY operational/portfolio
+                reason accumulation is paused this cycle -> Category A.
+            operational_adaptation: citation of an operational/portfolio
+                parameter being adapted this cycle -> Category B.
+        """
+        conditions = thesis_invalidation or {}
+        active = [
+            name for name in DCA_THESIS_INVALIDATION_CONDITIONS
+            if bool(conditions.get(name))
+        ]
+        if active:
+            return EdgeStatus(
+                category=EdgeCategory.C,
+                action=(
+                    "Stop accumulating. Do not resume without a human-reviewed "
+                    "re-certification of the investment thesis."
+                ),
+                signals=[
+                    EdgeSignal(name, 1.0, "objective thesis-invalidation condition active")
+                    for name in active
+                ],
+                reason="accumulation thesis objectively invalidated: " + ", ".join(active),
+                can_adapt=False,
+                should_wait=False,
+                should_stop=True,
+                evaluated_at=now,
+            )
+
+        if operational_pause:
+            return EdgeStatus(
+                category=EdgeCategory.A,
+                action=(
+                    "Temporarily reduce/pause accumulation for this operational "
+                    "reason; resume automatically when it clears. Never a permanent stop."
+                ),
+                signals=[EdgeSignal("operational_pause", 1.0, operational_pause)],
+                reason=f"temporary operational/portfolio pause: {operational_pause}",
+                can_adapt=False,
+                should_wait=True,
+                should_stop=False,
+                evaluated_at=now,
+            )
+
+        if operational_adaptation:
+            return EdgeStatus(
+                category=EdgeCategory.B,
+                action=(
+                    "Adapt the operational parameter (e.g. chunk size vs. the "
+                    "executable minimum or portfolio headroom). Never a directional change."
+                ),
+                signals=[EdgeSignal("operational_adaptation", 1.0, operational_adaptation)],
+                reason=f"operational/portfolio parameter adaptation: {operational_adaptation}",
+                can_adapt=True,
+                should_wait=False,
+                should_stop=False,
+                evaluated_at=now,
+            )
+
+        return EdgeStatus(
+            category=EdgeCategory.NONE,
+            action="Accumulation process healthy - continue on schedule.",
+            signals=[],
+            reason="thesis valid; no operational pause or adaptation in effect",
+            can_adapt=False,
+            should_wait=False,
+            should_stop=False,
+            evaluated_at=now,
+        )

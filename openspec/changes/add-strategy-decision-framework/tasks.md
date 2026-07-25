@@ -495,7 +495,7 @@ fundamentally different strategy shape.
       all, its Evidence Items are execution-cost factors that modulate
       *how* a due chunk is deployed, never *whether* to deploy it on
       direction.
-- [ ] 6.4 Wire `StrategyEdgeManager` with accumulator-correct categories:
+- [x] 6.4 Wire `StrategyEdgeManager` with accumulator-correct categories:
       **ordinary mark-to-market drawdown is explicitly NOT a degradation
       signal** (DCA is designed to hold through it). Category C =
       **long-term-investment-thesis invalidation** (structural; requires

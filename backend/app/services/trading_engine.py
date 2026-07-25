@@ -53,7 +53,7 @@ from .strategy_framework.market_suitability import MarketSuitabilityGate
 from .strategy_framework.decision_score import DecisionScoreEngine, EvidenceItem
 from .strategy_framework.adaptive_params import AdaptiveParameterResolver
 from .strategy_framework.trade_management import TradeManagementMonitor
-from .strategy_framework.edge_management import EdgeCategory, StrategyEdgeManager
+from .strategy_framework.edge_management import DcaEdgeManager, EdgeCategory, StrategyEdgeManager
 from .strategy_framework.proposal import (
     Direction,
     ExecutionIntent,
@@ -1250,37 +1250,48 @@ class TradingEngine:
         regime_filter_enabled = params.get("regime_filter_enabled", False)
         allowed_regimes = params.get("allowed_regimes", ["trend_up", "trend_flat"])
 
-        # === ACCUMULATION-SUITABILITY GATE (Pillar 2 for a classic DCA) ===
-        # DCA does NOT gate on market direction. The ONLY structural condition
-        # that halts accumulation here is invalidation of the long-term
-        # investment thesis - a non-price, operator/edge-manager-set condition
-        # (Pillar 7 Category C, wired in Phase 6.4). Execution-feasibility (a)
-        # and portfolio-constraint (b) suitability are enforced downstream (the
-        # MIN_ORDER_USD floor + fee-adjusted cap below, and the execution
-        # pipeline's PortfolioRiskService), not duplicated here - keeping this
-        # gate simple and deterministic is deliberate (reference-benchmark role).
-        if thesis_invalidated:
+        # === STRATEGY EDGE MANAGEMENT + SUITABILITY GATE (Pillars 7 & 2) ===
+        # A classic DCA does NOT fail because the market falls - it fails ONLY
+        # when its accumulation thesis is objectively invalidated. DcaEdgeManager
+        # therefore monitors the health of the ACCUMULATION PROCESS (thesis +
+        # operational state), never mark-to-market profitability: it has no
+        # price/pnl/trend input at all, so an ordinary drawdown can never be
+        # reinterpreted as loss of edge (Phase 6.1/6.4; design.md "Pure-
+        # accumulator exception"). Category C = objective thesis invalidation
+        # (the ONLY halt on suitability grounds; a non-price, structural stop).
+        # Execution-feasibility and portfolio-constraint suitability are enforced
+        # downstream (the MIN_ORDER_USD floor + fee-adjusted cap below, and the
+        # execution pipeline's PortfolioRiskService) - not duplicated here.
+        if not hasattr(self, "_dca_edge_manager"):
+            self._dca_edge_manager = DcaEdgeManager()
+        thesis_conditions = {
+            "operator_invalidated": bool(thesis_invalidated or params.get("operator_invalidated", False)),
+            "asset_delisted": bool(params.get("asset_delisted", False)),
+            "fundamental_failure": bool(params.get("fundamental_failure", False)),
+            "regulatory_impossibility": bool(params.get("regulatory_impossibility", False)),
+            "portfolio_withdrawn": bool(params.get("portfolio_withdrawn", False)),
+        }
+        edge_status = self._dca_edge_manager.evaluate(
+            thesis_invalidation=thesis_conditions, now=self.clock.now(),
+        )
+        _edge_exp = self._explain(bot.id)
+        _edge_exp.metric("edge_status_category", edge_status.category.value)
+        _edge_exp.check(
+            "Accumulation thesis intact", edge_status.category.value,
+            f"!= {EdgeCategory.C.value}", edge_status.category != EdgeCategory.C,
+            detail=edge_status.reason,
+        )
+        if edge_status.should_stop:  # Category C - objective thesis invalidation
             logger.info(
-                f"Bot {bot.id}: DCA HALTED - long-term investment thesis invalidated. "
-                f"Accumulation stops (structural, not a price-direction signal)."
+                f"Bot {bot.id}: DCA HALTED (Pillar 7 Category C) - {edge_status.reason}. "
+                f"Structural stop, not a price-direction signal; requires re-certification."
             )
-            self._explain(bot.id).state("THESIS_INVALIDATED").update({
-                "current_price": current_price,
-            }).check(
-                "Long-term thesis valid", "invalidated", "valid", False,
-                detail="structural stop - not a price/direction signal",
-            )
+            _edge_exp.state("THESIS_INVALIDATED").update({"current_price": current_price})
             return TradeSignal(
                 action="hold",
                 amount=0,
-                reason="DCA: Halted - long-term investment thesis invalidated (structural stop)",
+                reason=f"DCA: Halted - {edge_status.reason} (thesis invalidated, structural stop)",
             )
-        # Suitability passes: DCA is a direction-agnostic accumulator, so a
-        # valid long-term thesis is the whole of its entry-side suitability.
-        self._explain(bot.id).check(
-            "Long-term thesis valid", "valid", "valid", True,
-            detail="classic DCA accumulates through all regimes",
-        )
 
         # === REGIME FILTER (NON-CLASSIC market-timing overlay, off by default) ===
         # This is market timing - it pauses buying on expected short-term
@@ -1439,12 +1450,33 @@ class TradingEngine:
         # infinite accumulation has reached its natural end (budget exhausted).
         if buy_amount < MIN_ORDER_USD:
             if bot.current_balance >= MIN_ORDER_USD:
+                # Operational parameter adaptation (Pillar 7 Category B): the
+                # configured chunk is below the executable minimum, so adapt it
+                # up to MIN_ORDER_USD. Operational, not directional.
                 buy_amount = MIN_ORDER_USD
+                _b_edge = self._dca_edge_manager.evaluate(
+                    operational_adaptation=(
+                        f"chunk floored to ${MIN_ORDER_USD:.0f} executable minimum"
+                    ),
+                    now=now,
+                )
+                self._explain(bot.id).metric("edge_status_category", _b_edge.category.value)
             else:
+                # Temporary operational pause (Pillar 7 Category A): capital is
+                # unavailable this cycle (below the minimum order). Not a thesis
+                # failure - accumulation resumes if the balance is topped up.
+                _a_edge = self._dca_edge_manager.evaluate(
+                    operational_pause=(
+                        f"balance ${bot.current_balance:.2f} below "
+                        f"${MIN_ORDER_USD:.0f} minimum order (capital unavailable)"
+                    ),
+                    now=now,
+                )
                 logger.info(
                     f"Bot {bot.id}: DCA infinite accumulation complete - "
                     f"Balance ${bot.current_balance:.2f} < ${MIN_ORDER_USD:.0f} minimum order"
                 )
+                self._explain(bot.id).metric("edge_status_category", _a_edge.category.value)
                 return TradeSignal(
                     action="hold",
                     amount=0,
