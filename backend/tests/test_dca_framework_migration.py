@@ -28,7 +28,7 @@ from app.services.strategy_framework.edge_management import (
     DcaEdgeManager,
     EdgeCategory,
 )
-from app.services.trading_engine import MIN_ORDER_USD, TradingEngine
+from app.services.trading_engine import _BUY_BALANCE_FRACTION, MIN_ORDER_USD, TradingEngine
 
 
 # ---------------------------------------------------------------------------
@@ -287,3 +287,73 @@ class TestDcaEdgeWiring:
         assert sig.action == "buy"
         assert sig.amount == MIN_ORDER_USD
         assert engine._explain(bot.id).exp.metrics["edge_status_category"] == EdgeCategory.B.value
+
+
+# ---------------------------------------------------------------------------
+# 6. Position Sizing (Pillar 5) — flat, schedule-driven, deterministic
+# ---------------------------------------------------------------------------
+
+class TestDcaFlatSizing:
+    """Classic DCA deploys capital consistently, not by conviction. Sizing must
+    be flat, deterministic, and independent of market state - no Decision-Score
+    weighting, no market timing through sizing, no price-based adaptation. The
+    only legitimate adjuster is objective portfolio governance, enforced
+    downstream by the pipeline (PortfolioRiskService / StrategyCapacityService),
+    not re-implemented here."""
+
+    @pytest.mark.asyncio
+    async def test_flat_percentage_of_balance(self):
+        engine = _engine(regime_state="down")
+        bot = _bot(balance=1_000.0)
+        sig = await engine._strategy_dca(bot, 50_000.0, {"amount_percent": 10}, AsyncMock())
+        assert sig.action == "buy"
+        assert sig.amount == pytest.approx(100.0)  # 10% of 1000, well below cap
+
+    @pytest.mark.asyncio
+    async def test_fixed_usd_overrides_percent_deterministically(self):
+        engine = _engine(regime_state="down")
+        bot = _bot(balance=1_000.0)
+        sig = await engine._strategy_dca(
+            bot, 50_000.0, {"amount_percent": 10, "amount_usd": 250}, AsyncMock()
+        )
+        assert sig.amount == pytest.approx(250.0)
+
+    @pytest.mark.asyncio
+    async def test_sizing_independent_of_price_and_regime(self):
+        """The core 'no market-timing through sizing' guarantee: identical
+        balance + params must yield an identical chunk regardless of price or
+        (overlay-off) regime state."""
+        amounts = []
+        for price, regime in [(10.0, "down"), (50_000.0, "up"), (123_456.0, "flat")]:
+            engine = _engine(regime_state=regime)
+            bot = _bot(balance=1_000.0)
+            sig = await engine._strategy_dca(bot, price, {"amount_percent": 10}, AsyncMock())
+            amounts.append(sig.amount)
+        assert len(set(amounts)) == 1, f"sizing varied with market state: {amounts}"
+        assert amounts[0] == pytest.approx(100.0)
+
+    @pytest.mark.asyncio
+    async def test_deterministic_across_repeated_calls(self):
+        engine = _engine(regime_state="down")
+        bot = _bot(balance=777.0)
+        a = await engine._strategy_dca(bot, 50_000.0, {"amount_percent": 7}, AsyncMock())
+        b = await engine._strategy_dca(bot, 40_000.0, {"amount_percent": 7}, AsyncMock())
+        assert a.amount == b.amount == pytest.approx(777.0 * 0.07)
+
+    @pytest.mark.asyncio
+    async def test_never_exceeds_fee_adjusted_budget(self):
+        """Even a 100% chunk is capped to the fee/spread-adjusted balance so a
+        buy can never exceed available funds (strategy-layer budget respect;
+        portfolio-level caps are enforced downstream)."""
+        engine = _engine(regime_state="down")
+        bot = _bot(balance=1_000.0)
+        sig = await engine._strategy_dca(bot, 50_000.0, {"amount_percent": 100}, AsyncMock())
+        assert sig.amount <= 1_000.0 * _BUY_BALANCE_FRACTION + 1e-9
+
+    def test_strategy_source_has_no_decision_score_sizing(self):
+        """Structural guarantee: _strategy_dca contains no Decision-Score /
+        conviction-weighted sizing path at all."""
+        src = inspect.getsource(TradingEngine._strategy_dca)
+        lowered = src.lower()
+        assert "decision_score" not in lowered
+        assert "decisionscore" not in lowered

@@ -505,7 +505,7 @@ fundamentally different strategy shape.
       "wait for a better regime." Dedicated test that a simulated bear
       drawdown alone does not trip Category C, and that a simulated thesis-
       invalidation signal does.
-- [ ] 6.5 Do NOT introduce Decision-Score-weighted sizing (edge-weighted
+- [x] 6.5 Do NOT introduce Decision-Score-weighted sizing (edge-weighted
       sizing would smuggle in a directional/quality view DCA rejects).
       **Document why flat, schedule-fixed chunk sizing is correct** for a
       classic accumulator (Pillar 4/5 "document why fixed" escape hatch),

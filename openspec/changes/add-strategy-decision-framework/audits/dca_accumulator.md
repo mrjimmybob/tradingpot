@@ -279,11 +279,57 @@ All hardcoded: `interval_minutes=60`, `amount_percent=10`,
 `allowed_regimes` (1170-1175). Nothing scales with volatility or regime
 beyond the binary allow/deny gate.
 
-## Pillar 5 — Position Sizing: Flat
+## Pillar 5 — Position Sizing: Flat by design, deterministic (Phase 6.5)
 
-`buy_amount = bot.current_balance * amount_percent` (line 1316, fixed 10%
-of balance), or a fixed USD override — no Decision Score, exposure, or
-drawdown input.
+`buy_amount = bot.current_balance * amount_percent` (fixed % of balance), or
+a fixed USD override — no Decision Score, no price, no regime, no
+expected-move input. **This is the correct implementation, not a gap**, and
+Phase 6.5 makes that a documented, tested design decision rather than an
+unexamined default.
+
+**Why flat scheduled sizing is correct for a classic DCA under the
+framework.** The framework's general rule (design.md Pillar 5,
+`add-unified-position-sizing`) is that sizing takes the Decision Score as an
+input so conviction scales exposure. That rule exists to *maximise
+risk-adjusted return* for signal-driven strategies. A classic DCA has a
+different objective: it does **not** attempt to maximise return — it deploys
+capital **consistently and professionally**. Scaling chunk size by
+conviction, volatility, or expected move would be:
+
+- **market timing through sizing** — buying more when the model "likes" the
+  price is a directional bet, which 6.1/6.3 established DCA must not make; and
+- **a determinism/benchmark violation** — DCA is the project's reference
+  accumulation strategy (Pillar 1). Its value as a benchmark depends on being
+  fully determined by `(interval, chunk, start, price path)`. Any adaptive
+  sizing contaminates the baseline that future adaptive/AI accumulators are
+  measured against.
+
+So DCA deliberately takes **no** Decision Score (it has none — 6.3 added no
+score) and no conviction weighting. Per the framework's own "document why
+fixed" escape hatch (Pillar 4/5), flat schedule-driven sizing is the
+justified, correct choice.
+
+**The only legitimate adjuster is objective portfolio governance — enforced
+downstream, not re-implemented here.** Consistent with the single-source-of-
+truth pattern from 6.3, DCA emits a flat chunk and the execution pipeline
+applies objective governance to it uniformly:
+`PortfolioRiskService.check_portfolio_risk` blocks or **resizes** (only ever
+a *reduction*, `adjusted_amount`) at STEP 3, and `StrategyCapacityService`
+trims at STEP 4 (`trading_engine.py` ~8237–8286). At the strategy layer, the
+fee-adjusted `_BUY_BALANCE_FRACTION` cap and the `MIN_ORDER_USD` floor keep a
+buy inside available funds. None of these is an increase and none is
+directional — matching the framework requirement that sizing respect the
+portfolio exposure cap without DCA duplicating that logic.
+
+**Behaviour unchanged → no backtest required for 6.5.** The sizing math is
+identical to pre-migration; 6.5 adds documentation, in-code Pillar-5 markers,
+and tests only. The phase's one behaviour change (the 6.3 regime-gate
+removal) is certified by the 6.8 bull/bear/chop backtest. Six sizing tests in
+`backend/tests/test_dca_framework_migration.py` (flat %, fixed-USD override,
+price/regime independence, cross-call determinism, fee-adjusted budget cap,
+and a source-level guarantee that `_strategy_dca` contains no
+Decision-Score-weighted sizing path). Full suite 1263 passing, zero
+regressions.
 
 ## Pillar 6 — Trade Management: Not applicable (by design, resolved)
 

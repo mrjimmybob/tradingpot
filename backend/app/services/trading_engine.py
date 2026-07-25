@@ -1198,6 +1198,19 @@ class TradingEngine:
         market timing. It survives only as an explicit, off-by-default,
         non-classic operator overlay (regime_filter_enabled), see below.
 
+        SIZING (Pillar 5, Phase 6.5): FLAT and SCHEDULE-DRIVEN by design. Each
+        buy is a fixed chunk - a fixed % of balance (amount_percent) or a fixed
+        USD amount (amount_usd) - and takes NO Decision Score, no price, no
+        regime, and no expected-future-move input. Classic DCA does not try to
+        maximise return; it deploys capital consistently, so deterministic flat
+        sizing IS the correct implementation, not a gap (it is also what makes
+        DCA a clean benchmark). The ONLY legitimate adjustments are objective
+        portfolio-governance constraints, and those are enforced DOWNSTREAM by
+        the execution pipeline (PortfolioRiskService resize/block at STEP 3,
+        StrategyCapacityService at STEP 4) plus the fee-adjusted balance cap and
+        MIN_ORDER_USD floor below - never re-implemented here, and never an
+        increase or a directional adjustment.
+
         Auto Mode may select this strategy (it is the designated fallback -
         see _get_strategy_capabilities): that is a SUPERVISED call, routed
         through _strategy_auto's own eligibility/regime/scoring gate, and is
@@ -1429,10 +1442,16 @@ class TradingEngine:
                     f"Allowing immediate first buy (edge case handling)."
                 )
 
-        # === AMOUNT CALCULATION ===
-        # Cap is _BUY_BALANCE_FRACTION of balance (not the full balance) so the
-        # simulated exchange fee (cost * 0.1 %) + bid/ask spread cannot push the
-        # total deduction over the available funds.
+        # === AMOUNT CALCULATION (Pillar 5: flat, schedule-driven, deterministic) ===
+        # DELIBERATELY flat: a fixed USD chunk or a fixed % of balance, with NO
+        # Decision Score, price, regime, or expected-move input. This is not a
+        # missing feature - a classic DCA deploys capital consistently rather
+        # than trying to time or size by conviction (see docstring SIZING note,
+        # audit Pillar 5). Objective portfolio governance is the only legitimate
+        # adjuster and is enforced downstream (PortfolioRiskService / capacity),
+        # not here. The cap below is _BUY_BALANCE_FRACTION of balance (not the
+        # full balance) so the simulated fee (cost * 0.1 %) + bid/ask spread
+        # cannot push the total deduction over available funds.
         max_buy = bot.current_balance * _BUY_BALANCE_FRACTION
         if amount_usd and amount_usd > 0:
             # Use fixed USD amount
