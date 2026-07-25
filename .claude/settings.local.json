@@ -196,7 +196,17 @@
       "Bash(/opt/tradingbot/venv/bin/python -m pytest tests/test_strategy_activity.py -q -k \"LegacyPosition\")",
       "Bash(sed -i '2436s/.*/                entry_atr_locked = state.get\\(\"entry_atr\"\\) or atr  # Fallback for legacy positions/' app/services/trading_engine.py)",
       "Bash(sed -i '3176s/.*/                entry_atr_locked = state.get\\(\"entry_atr\"\\) or atr  # Fallback to current ATR for legacy positions/' app/services/trading_engine.py)",
-      "Bash(timeout 90 /opt/tradingbot/venv/bin/python -m backend.app.backtesting.run --exchange binance --symbol BTCUSDT --timeframe 1d --strategy trend_following --start 2020-01-01 --end 2026-07-08)"
+      "Bash(timeout 90 /opt/tradingbot/venv/bin/python -m backend.app.backtesting.run --exchange binance --symbol BTCUSDT --timeframe 1d --strategy trend_following --start 2020-01-01 --end 2026-07-08)",
+      "Bash(gcc --version)",
+      "Bash(pkg-config --exists libcurl)",
+      "Bash(pkg-config --modversion libcurl)",
+      "Bash(echo \"libcurl OK: $\\(pkg-config --modversion libcurl\\)\")",
+      "Bash(/tmp/claude-1000/-home-dallas-Development-tradingpot/86378976-f5e1-4ea8-b2d4-4ad4262e81a7/scratchpad/test_parser)",
+      "Bash(command -v nix-shell)",
+      "Bash(timeout 300 nix-shell -p curl.dev pkg-config gcc gnumake --run 'make rebuild BUILD=release')",
+      "Bash(timeout 200 nix-shell -p curl.dev pkg-config gcc gnumake --run 'make rebuild BUILD=release')",
+      "Bash(make clean *)",
+      "Bash(./deploy.sh --help)"
     ]
   }
 }
