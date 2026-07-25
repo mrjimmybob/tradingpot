@@ -533,7 +533,7 @@ fundamentally different strategy shape.
       "exposure below cap," "long-term thesis not invalidated") — **never a
       direction forecast**. Verify standalone execution via the Standalone
       Adapter is behavior-identical to the pre-migration path.
-- [ ] 6.8 Certification review; before/after backtest across bull, bear,
+- [x] 6.8 Certification review; before/after backtest across bull, bear,
       AND chop windows. Because 6.3 removes the trend pause, this is a
       **deliberate behaviour change**: the backtest must show DCA now
       **keeps accumulating on schedule through the bear window** (where it

@@ -268,16 +268,28 @@ The non-classic overlay's pause behaviour is preserved under explicit opt-in
 zero regressions. See the 6.1 section above and `../design.md`'s
 "Pure-accumulator exception."
 
-## Pillar 3 — Evidence-Based Decision Score: Not present
+## Pillar 3 — Evidence-Based Decision Score: Intentionally absent by design (certified 6.8)
 
-Entry fires purely on elapsed clock time (`_interval_ok`, 1242,
-1274-1298) — no multi-factor scoring at all.
+Entry fires on the deterministic clock schedule, not a multi-factor score —
+**and that is correct for a classic DCA, not a gap.** A conviction/edge score
+that decided *whether* to buy would be market timing (6.1/6.3); one that
+scaled *how much* would be adaptive sizing (6.5). Both are explicitly
+forbidden for a direction-agnostic accumulator. The frozen `StrategyProposal`
+contract still requires a `decision_score` field, so each proposal carries a
+single *descriptive* deterministic evidence item restating the schedule/thesis
+decision (Pillar 10) — it introduces no scoring intelligence and never gates
+or sizes. This is the framework's documented "no real score → describe the
+decision" path, exercised by adaptive_grid's non-scored branches too.
 
-## Pillar 4 — Parameter Adaptation: Not present
+## Pillar 4 — Parameter Adaptation: Intentionally absent by design (certified 6.8)
 
-All hardcoded: `interval_minutes=60`, `amount_percent=10`,
-`allowed_regimes` (1170-1175). Nothing scales with volatility or regime
-beyond the binary allow/deny gate.
+All parameters are **fixed by design**: `interval_minutes` (schedule),
+`amount_percent`/`amount_usd` (chunk), `thesis_invalidation` flags
+(structural), and the off-by-default `regime_filter_enabled` overlay. Nothing
+scales with volatility, regime, or price — the framework's Pillar 4 "document
+why fixed" escape hatch applies in full: a classic DCA's value comes from
+*not* adapting (deterministic, benchmarkable deployment). `adaptive_
+parameters_used` on every proposal is empty, confirming no adaptation runs.
 
 ## Pillar 5 — Position Sizing: Flat by design, deterministic (Phase 6.5)
 
@@ -528,3 +540,154 @@ Other contract details:
 the file). Full suite 1282 passing, zero regressions; three pre-existing
 auto-mode DCA tests updated from the old `"DCA buy #N"` reason string to the
 mechanically-derived accumulation reason (execution outcome unchanged).
+
+## Backtesting & Certification (Phase 6.8)
+
+**No strategy code was changed during certification** — no defect was found,
+no parameter was tuned, no threshold optimised. This phase measures the
+completed implementation only.
+
+**Method.** Same migrated engine throughout. "AFTER" = the migrated default
+(`regime_filter_enabled=False`). "BEFORE" = the migrated code with the *old
+default* regime overlay re-enabled (`regime_filter_enabled=True,
+allowed_regimes=["trend_up","trend_flat"]`), which reproduces the
+pre-migration gate. binance BTCUSDT 1m, `--starting-balance 10000`, default
+`interval_minutes=60`, standard windows used across Phases 1–5.
+
+**Results (AFTER, migrated default):**
+
+| Window | Dates | DCA return | Buy&Hold | DCA − B&H | Max DD | Fees (≈ deployed) |
+|---|---|---|---|---|---|---|
+| Bull | 2023-10-01→11-15 | +30.72% | +31.84% | **−1.12 pp** | 8.04% | $9.98 |
+| Bear | 2022-11-01→12-15 | −13.26% | −13.07% | **−0.19 pp** | 27.72% | $9.98 |
+| Chop | 2024-04-01→05-15 | −11.94% | −13.59% | **+1.65 pp** | 22.16% | $9.98 |
+
+("Trades = 0" in every window because DCA never closes a round trip — the
+metric counts completed buy→sell cycles, which a never-sell accumulator has
+none of. The real activity is the ≈$9,980 deployed, reflected in fees.)
+
+**Before/After comparison — the key finding.** BEFORE and AFTER are
+**byte-identical** in every window (bear: both $8,674.47 / −13.26%; bull: both
+$13,071.75 / +30.72%). The reason is important and stated honestly: **in the
+backtest harness the overlay's regime detector always returns `flat`** — the
+harness does not populate the live tick price-history that
+`_detect_market_regime` needs for trend detection (the documented "regime flat
+until history populated" behaviour). Since `flat` is inside the old default
+`allowed_regimes`, the pre-migration gate *never actually paused in backtests
+either* — the trend-pause was always a **live-only** behaviour. Consequently
+the regime-removal difference **cannot be demonstrated through the CLI
+backtest**; it is instead proven by unit tests that control the regime input
+directly (`test_trend_down_does_not_block_scheduled_buy`,
+`test_overlay_opt_in_still_pauses_in_downtrend`,
+`test_regime_detector_not_consulted_by_default`).
+
+**Gate-engaged proxy.** Restricting the overlay to `allowed_regimes=
+["trend_up"]` (so the always-`flat` harness regime is disallowed) makes the
+gate fire on every tick: **$10,000.00 / +0.00% / $0 fees — zero capital
+deployed.** This is a faithful backtest illustration of what a regime-gated
+accumulator does when its gate rejects the prevailing regime (the live bear
+case), versus the classic AFTER which deploys the full ≈$9,980 on schedule.
+
+**Determinism.** The bear AFTER run reproduced **byte-identically** across two
+independent invocations ($8,674.47 / −13.26%), and fees are **exactly $9.98 in
+all three regimes** — the same deterministic deployment regardless of market
+direction.
+
+### Explicit verifications required by Phase 6.8
+
+- **Accumulates through sustained bear markets (no regime pause):** ✅ Bear
+  AFTER deployed ≈$9,980 on schedule across the entire 6-week downtrend, ending
+  $8,674 (tracking the −13% asset) — it did **not** pause. Contrast the
+  gate-engaged proxy's $0 deployment. Trend-down-specific non-pause proven by
+  unit test.
+- **Accumulation schedule remains deterministic:** ✅ Byte-identical re-runs;
+  identical $9.98 fees across all regimes; 53 deterministic unit tests.
+- **No market timing introduced:** ✅ Regime detector not consulted by default
+  (test); BEFORE≡AFTER for the default gate; suitability is
+  execution/portfolio/thesis only.
+- **No adaptive sizing introduced:** ✅ `adaptive_parameters_used` empty on
+  every proposal; identical deployment/fees across regimes; flat-sizing tests.
+- **No selling behaviour introduced:** ✅ Never emits `SELL` (branch-sweep
+  test); Trades = 0 (no round trips) in every window.
+- **Portfolio governance remains external:** ✅ Enforced by the execution
+  pipeline (`PortfolioRiskService` resize/block, `StrategyCapacityService`),
+  not the strategy (Pillar 5).
+- **`StrategyProposal` migration behaviour-identical from the pipeline's
+  view:** ✅ BEFORE≡AFTER numbers (the proposal layer is present in both and
+  changes no outcome); the buy execution-outcome test; NO_TRADE holds preserve
+  their original reasons.
+
+## Certification Report (Phase 6.8)
+
+- **Was the implementation correct?** Yes. The full suite (1282 tests) passes
+  with zero regressions, the strategy runs cleanly across bull/bear/chop, and
+  results match the Pillar 9 expectations quantitatively. **No defect was
+  found and no strategy code was changed during certification.**
+- **Did the migration preserve the intended philosophy?** Yes. DCA remains
+  direction-agnostic, never-sell, flat-sized, and fully deterministic; the
+  reference-benchmark role is intact.
+- **What behaviour intentionally changed?** Exactly one thing: the trend
+  regime overlay is **off by default**, so a classic DCA accumulates through
+  downtrends instead of pausing (6.3). This is a **live-behaviour** change; it
+  is not visible in the backtest harness (regime stays `flat` there) and is
+  certified by unit tests. Secondary, non-behavioural: the return type is now
+  `StrategyProposal`, and diagnostics/edge-management are far richer.
+- **What behaviour intentionally did NOT change?** Chunk sizing (flat),
+  schedule (deterministic), never-sell, the execution outcome of a buy, and
+  the *location* of portfolio governance (external pipeline).
+- **What measurable benefits were obtained?** Not return. The benefits are:
+  (1) correct-axis edge management — thesis invalidation, never drawdown (6.4);
+  (2) full self-diagnostics — every decision point explained (6.6);
+  (3) `StrategyProposal`/governance integration (6.5/6.7); (4) honest,
+  documented performance expectations that the backtests confirm; (5) a
+  deterministic, benchmarkable baseline for future accumulation strategies.
+- **What limitations remain?** DCA **underperforms Buy & Hold in the bull
+  window (−1.12 pp, cash drag)** — stated plainly, and expected. It roughly
+  matches B&H in the bear (−0.19 pp) with **unbounded mark-to-market drawdown
+  by design** (no loss-cutting). It only *beats* B&H in the chop window
+  (+1.65 pp, the entry-averaging benefit). The backtests are single-window,
+  1-minute, not a walk-forward, and **DCA makes no positive-edge claim.** The
+  regime-removal difference is not observable in the harness (verified by unit
+  tests instead).
+
+**Honest bottom line.** DCA does **not** beat Buy & Hold in general — it loses
+to it in the bull run and ~ties in the bear, winning only in chop. That is the
+correct and expected result for a classic DCA, whose purpose is disciplined,
+low-variance, direction-agnostic deployment, not return maximisation. On that
+purpose the implementation is **behaving exactly as a professional
+implementation of classic DCA should**: identical fixed-chunk deployment across
+every regime, never selling, never timing, never adapting, fully deterministic,
+fully auditable, with governance external and edge management tied to the
+investment thesis rather than to price. **Certified.**
+
+## Certification Checklist
+
+- [x] Audit has no `UNDOCUMENTED` sections (Pillars 3/4 documented as
+      intentionally-absent-by-design).
+- [x] Market suitability re-scoped and enforced (execution/portfolio/thesis);
+      direction never gates (inverse-suitability test).
+- [x] Decision Score: intentionally absent by design, documented (no market
+      timing, no conviction sizing); frozen-contract field carried as a
+      descriptive, non-scoring evidence item.
+- [x] Every parameter classified fixed-with-reason (Pillar 4); no undocumented
+      constants; `adaptive_parameters_used` empty.
+- [x] Sizing flat/deterministic; portfolio exposure cap respected via the
+      external pipeline (Pillar 5).
+- [x] Trade management N/A by design (never-sell), documented (Pillar 6).
+- [x] Edge management wired on the accumulation-health axis; A/B/C classified;
+      never force-closes; drawdown cannot trip C (signature test).
+- [x] Self-diagnostics: every decision point has a `.check()`/`.metric()`,
+      passing paths included; Evidence Report renders.
+- [x] Returns `StrategyProposal`; adapter routes through the unchanged
+      pipeline; buy execution outcome behaviour-identical (test).
+- [x] `execution_intent` consistent with `direction`; `validity.valid_until`
+      set (buy interval); expired proposal discarded (test); assumptions
+      objective; proposal immutable + deterministic `proposal_id`;
+      `expected_edge_estimate` is `None`.
+- [x] Before/after backtest recorded across bull/bear/chop; behaviour change
+      (regime removal) certified by unit tests where the harness cannot show
+      it; honest report produced.
+- [x] Full suite passes (1282); new tests cover every pillar.
+
+**Status: certified — implementation complete, philosophy preserved, no defect
+found, success not overstated.**
