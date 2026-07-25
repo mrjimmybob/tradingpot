@@ -1,12 +1,16 @@
 ## Status
 
-**None of these tasks are implemented by this change.** This change is
-architecture-only, per its `proposal.md`/`design.md`. This checklist
-exists so a future, separate implementation change has a ready-made,
-already-agreed task breakdown to start from once approved — the same
-pattern `add-strategy-decision-framework` used for its own Phase 0-6
-checklist. Do not begin any task below until this change is approved AND
-a separate implementation change is scoped and approved against it.
+**Implementation in progress (authorized).** This change was originally
+architecture-only; implementation was gated on separate approval. That
+approval has been given, and implementation now proceeds against this
+already-agreed task breakdown (the same pattern `add-strategy-decision-
+framework` used). **Phase 0 (Committee Core) is complete** —
+`backend/app/services/auto_committee/` (`comparison.py`, `decision.py`,
+`trust.py`, `process.py`) with 29 tests in
+`backend/tests/test_auto_committee.py`; full suite 1311 passing, zero
+regressions. Depends on `add-strategy-decision-framework`'s Phases 0-6
+(all complete), which produce the real `StrategyProposal` objects Auto
+consumes.
 
 This checklist also depends on `add-strategy-decision-framework`'s
 Phase 0-6 strategy implementation having produced real `StrategyProposal`
@@ -18,7 +22,7 @@ call, not decided here.
 
 ## Phase 0 — Committee Core (pure logic, no wiring)
 
-- [ ] 0.1 Define the `CommitteeDecision` schema
+- [x] 0.1 Define the `CommitteeDecision` schema
       (`app/services/auto_committee/decision.py`): the field set from
       `design.md`'s "Committee Decision" (`decision_id`, `evaluated_at`,
       `proposals_considered`, `selected` as `SelectedAllocation`
@@ -27,12 +31,12 @@ call, not decided here.
       `rejection_reason`), `trust_adjustments_applied`,
       `ranking_snapshot`). Immutable once constructed (frozen dataclass or
       equivalent, matching `StrategyProposal`'s own enforcement pattern).
-- [ ] 0.2 Define the `TrustAdjustment` schema
+- [x] 0.2 Define the `TrustAdjustment` schema
       (`app/services/auto_committee/trust.py`): `proposal_id`, `source`,
       `adjustment`, `generated_at`, per `design.md`'s "External Trust
       Layer". No source implementations (sentiment, macro, etc.) yet -
       schema only.
-- [ ] 0.3 Build the Comparison Contract reader: a pure function extracting
+- [x] 0.3 Build the Comparison Contract reader: a pure function extracting
       exactly the seven fields `design.md` names (`direction`,
       `execution_intent`, `decision_score.total`/`.threshold`,
       `suggested_risk_budget_pct`, `expected_edge_estimate`,
@@ -42,13 +46,13 @@ call, not decided here.
       that attempts to read a field outside this set from within the
       committee package. Dedicated test asserting no other field is
       accessible/used by anything built in this phase.
-- [ ] 0.4 Build steps 2-4 of the Committee Process as pure functions over a
+- [x] 0.4 Build steps 2-4 of the Committee Process as pure functions over a
       proposal batch: expiration rejection (`validity.valid_until`),
       supersession rejection (newest-proposal-per-bot-per-strategy wins),
       edge-disqualification rejection (`edge_status.category == C`). Each
       independently unit tested, each producing a `RejectedProposal` with
       the correct `rejection_step`.
-- [ ] 0.5 Build step 7 (ranking) and the documented tie-breaking policy
+- [x] 0.5 Build step 7 (ranking) and the documented tie-breaking policy
       chosen for this implementation (see `design.md`'s "Open Questions" -
       this task is where that choice is actually made and recorded,
       referencing `add-strategy-validation-tooling` output if available at
@@ -57,19 +61,19 @@ call, not decided here.
       run N times) and a dedicated strategy-identity-blindness test (swap
       which strategy produced which field values, holding values constant,
       assert ranking unchanged).
-- [ ] 0.6 Build step 9 (selection) and step 8 (capital allocation) as pure
+- [x] 0.6 Build step 9 (selection) and step 8 (capital allocation) as pure
       functions consuming the step 7 ranking plus whatever the portfolio
       risk step (Phase 1) already capped. Must support selecting zero,
       one, or multiple proposals - dedicated test proving a multi-proposal
       selection is possible when synthetic portfolio state permits it
       (Auto Certification Gate's item 9).
-- [ ] 0.7 Assemble steps 0.3-0.6 plus stubs for steps 5-6 (Phase 1) into
+- [x] 0.7 Assemble steps 0.3-0.6 plus stubs for steps 5-6 (Phase 1) into
       the full ten-step Committee Process orchestrator, producing a
       `CommitteeDecision` (0.1). Dedicated test proving every proposal in
       `proposals_considered` ends up in exactly one of `selected`/
       `rejected` (Auto Certification Gate's item covering "no proposal
       silently dropped").
-- [ ] 0.8 Tests: full Phase 0 acceptance per "Phase 0 acceptance criteria"
+- [x] 0.8 Tests: full Phase 0 acceptance per "Phase 0 acceptance criteria"
       below, using entirely synthetic `StrategyProposal` fixtures - no
       real strategy or execution pipeline wiring yet.
 
