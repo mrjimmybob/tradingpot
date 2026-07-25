@@ -467,7 +467,7 @@ fundamentally different strategy shape.
       execution-quality distinction and the obligations it imposes on 6.2–
       6.8 in `audits/dca_accumulator.md`'s "Phase 6.1 Design Decision"
       section and `design.md`'s "Pure-accumulator exception."
-- [ ] 6.2 Author theory (P1) and performance expectations (P9), informed
+- [x] 6.2 Author theory (P1) and performance expectations (P9), informed
       by 6.1. Theory: DCA's value is **direction-agnostic entry-timing-
       variance reduction plus disciplined scheduled deployment and good
       execution quality** — it holds no directional view and by design does

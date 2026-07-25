@@ -160,13 +160,70 @@ proposal assumption must be objective and execution/portfolio/thesis-based
 (e.g. "spread within tolerance," "exposure below cap," "long-term thesis not
 invalidated"), never a direction forecast.
 
-## Pillar 1 — Theory: UNDOCUMENTED (partial)
+## Pillar 1 — Theory: DOCUMENTED (Phase 6)
 
-Docstring (1119-1149) describes mechanism and a coarse regime-filter
-rationale ("protects capital... during strong downtrends," 1132-1133) but
-never states *why* DCA has edge, when it should underperform lump-sum
-investing, or its core assumption (a long-run uptrend). No inefficiency is
-named. **Authoring real theory is a certification task, not done here.**
+**DCA is a capital-deployment discipline, not an alpha strategy.** It
+converts a fixed budget into a target asset in **fixed-size, fixed-interval
+chunks**, and it takes **no view on price direction** at any horizon. Its
+purpose is not to earn a trading edge; it is to deploy capital with low
+entry-timing variance and full behavioural discipline. Naming the
+"inefficiency" it exploits is therefore a category question: DCA does not
+exploit a market inefficiency — it neutralises a *behavioural and
+timing-variance* problem on the operator's side.
+
+**The one mechanical property, stated precisely.** Buying a fixed *dollar*
+amount at each interval mechanically purchases more units when price is low
+and fewer when price is high. The resulting average cost per unit is the
+**harmonic mean** of the purchase prices, which is always ≤ their arithmetic
+mean (equal only if every price is identical). This is a deterministic
+algebraic identity that holds for *every* price path — up, down, or
+sideways — and requires **no forecast whatsoever**. It is the whole of DCA's
+mechanical claim, and it is why the strategy can be fully deterministic and
+still defensible.
+
+**Why direction-agnosticism is load-bearing, not a limitation.** The
+harmonic-averaging benefit is produced *precisely by the low-price buys* —
+the purchases made when the market is weak. Any rule that skips or reduces
+buying in a downtrend (the pre-6.1 regime filter) removes exactly the buys
+that most improve the average cost, reintroduces the entry-timing risk DCA
+exists to remove, and converts the strategy into a (poor, lagging)
+market-timing model. This is the theoretical basis for 6.1's decision to
+strip the trend gate: **a classic DCA must buy the dip and the rip alike.**
+
+**What DCA deliberately gives up (honest failure modes).**
+- **Expected return vs. lump-sum.** For an asset with positive expected
+  drift, lump-sum deployment wins *in expectation* because it is invested
+  sooner; DCA carries idle cash while it deploys ("cash drag"). DCA trades
+  that expected return away in exchange for lower dispersion of outcomes and
+  removal of the timing decision. Underperforming lump-sum in a bull run is
+  **correct behaviour, not a defect.**
+- **No exit, no loss-cutting.** DCA never sells (Pillar 6, by design). In a
+  secular decline that never recovers it loses like buy-and-hold. Its *only*
+  protection is the long-term-thesis-invalidation stop (Pillar 7
+  Category C) — a structural, non-price condition (delisting, broken
+  fundamental premise, operator revocation), never a drawdown trigger.
+- **Assumption of eventual recovery / long-run participation.** DCA's
+  implicit premise is that the operator wants long-run exposure to this
+  asset and can hold through drawdowns. If that premise is false, DCA is the
+  wrong tool — but that is a *selection* decision made before the strategy
+  runs, not something DCA should try to detect and trade around.
+
+**Reference-benchmark role (a first-class design goal).** Because a classic
+DCA is fully determined by `(interval, chunk size, start time, price path)`
+and takes no directional view, it is the natural **null model** for
+accumulation: any adaptive or AI-assisted accumulation strategy must beat
+*this* on a risk-adjusted basis to justify its added complexity and
+non-determinism. Preserving DCA's simplicity and determinism is therefore an
+explicit objective of this migration — the framework wraps DCA in
+governance, auditability, and execution-quality discipline **without** making
+it "smarter." Where two implementations are equally correct, the simpler,
+more deterministic one is chosen precisely to protect this benchmark role.
+
+**Pre-Phase-6 finding**: docstring gave the mechanism and a coarse
+regime-filter rationale but never stated the harmonic-averaging property,
+the direction-agnosticism requirement, the honest lump-sum/drawdown
+trade-offs, or the benchmark role. Authoring that theory was this
+certification task.
 
 ## Pillar 2 — Market Suitability: Present, but mis-scoped for a classic DCA (see 6.1)
 
@@ -223,11 +280,58 @@ tick (1240-1271). Gap: no positive `check()` when the regime check
 (fixed vs. percent, capped, floored) surfaces only a single `buy_amount`
 metric (1355), not the branch logic itself.
 
-## Pillar 9 — Performance Expectations: UNDOCUMENTED
+## Pillar 9 — Performance Expectations: DOCUMENTED (Phase 6)
 
-No stated win rate, profit factor, drawdown, or over/underperformance
-conditions vs. buy-and-hold anywhere in the docstring. **To be authored at
-certification**, ideally after Pillar 6's design question is resolved.
+Stated honestly and up front: **DCA is not evaluated on return.** Several of
+the usual metrics are structurally undefined for it, and saying so is part of
+the honest specification.
+
+- **Trade frequency**: exactly **one buy per `interval_minutes`** while
+  budget remains and no execution/portfolio/thesis gate defers it —
+  **deterministic and regime-independent.** This is DCA's defining property
+  and the one that most distinguishes it from the other five strategies:
+  frequency does **not** rise or fall with market conditions. (Every other
+  migrated strategy's frequency collapses in an unsuitable regime; DCA's does
+  not, by design.)
+- **Regime behaviour**: **accumulates through every regime, including
+  `trend_down`** (the deliberate 6.1 change). The only events that
+  defer/trim/stop a scheduled buy are degraded execution quality, a portfolio
+  cap / budget exhaustion, or long-term-thesis invalidation — never price
+  direction.
+- **Holding time**: **infinite** (never sells). No time stop.
+- **Win rate**: **not a meaningful metric** — DCA has no round trips, so
+  there are no wins or losses to rate. Any win-rate figure reported for DCA
+  would be an artefact; the honest value is "N/A (no exits)."
+- **Profit factor**: **N/A** for the same reason — no realised losses. All
+  P&L is mark-to-market on an ever-growing position until the operator (or a
+  separate strategy/rebalancer) exits it outside DCA's scope.
+- **Drawdown**: **unbounded mark-to-market by design.** DCA accepts the full
+  drawdown of the underlying asset because it never cuts losses. There is no
+  drawdown target and no drawdown stop; a bear market shows up as a deepening
+  unrealised loss *while DCA keeps buying into it.* This is the explicit,
+  accepted cost of being direction-agnostic.
+- **Vs. lump-sum**: **underperforms in expectation** for an upward-drifting
+  asset (cash drag while deploying); **outperforms** on paths that fall after
+  the start and later recover (lower average cost via harmonic averaging);
+  **lower outcome variance** than lump-sum in all cases. DCA is deliberately
+  on the lower-return / lower-variance side of that trade-off.
+- **Vs. buy-and-hold**: during deployment it lags a fully-invested
+  buy-and-hold in a bull and cushions it in a bear (partial exposure); once
+  the budget is fully deployed it converges to buy-and-hold of the
+  accumulated position.
+- **Success criterion (what certification actually checks)**: faithful,
+  low-variance, **direction-agnostic scheduled deployment** with correct
+  governance — *not* a return figure. The 6.8 backtest certifies that DCA
+  accumulates on schedule across bull/bear/chop and that every
+  skipped/deferred/trimmed buy is attributable to execution quality,
+  portfolio limits, or thesis invalidation.
+- **Benchmark expectation**: as the project's reference accumulation strategy
+  (Pillar 1), DCA's numbers are the **baseline other accumulation strategies
+  are measured against**, so its expectations are stated as behaviour to be
+  reproduced exactly, not performance to be optimised.
+
+**Pre-Phase-6 finding**: undocumented; no metrics or over/underperformance
+conditions stated anywhere.
 
 ## Pillar 10 — Strategy Proposal Interface: Not present
 
