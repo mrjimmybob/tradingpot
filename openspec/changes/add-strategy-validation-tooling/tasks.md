@@ -1,43 +1,62 @@
-## 1. Parameter Optimization
-- [ ] 1.1 Define a parameter-space spec format per strategy (ranges/choices
-      per param, using each strategy's existing `params.get(...)` defaults
-      as the search space's center).
-- [ ] 1.2 Implement grid and random search over `BacktestEngine.run_candles`,
-      with no changes to the engine itself.
-- [ ] 1.3 Implement the default objective: expectancy subject to a
-      configurable max-drawdown constraint.
-- [ ] 1.4 CLI entry point (e.g. `python -m app.backtesting.optimize`)
-      printing top-N parameter sets with their metrics.
-- [ ] 1.5 Tests: deterministic small-grid search over a synthetic candle
-      fixture with a known best parameter set.
+## Premise (binding for every task)
+Measure objectively and explain — never optimise. No task below may search a
+parameter space, tune parameters, pick a "better" parameter set, or write
+`strategy_params` anywhere. Optimisation is a future, separate change.
 
-## 2. Walk-Forward Validation
-- [ ] 2.1 Implement rolling train/validate window splitting over a
-      historical date range.
-- [ ] 2.2 Run the optimizer (Section 1) on each train window; score the
-      chosen parameters on the held-out validate window only.
-- [ ] 2.3 Report in-sample vs out-of-sample metrics side by side per window,
-      flagging windows where out-of-sample expectancy is materially worse.
-- [ ] 2.4 Tests: a synthetic fixture where a parameter set is deliberately
-      overfit to noise in the train window, and the harness must flag it.
+## 1. Measurement Boundary (measurement ≠ optimisation)
+- [ ] 1.1 New read-only package `app/backtesting/validation/` that wraps
+      `BacktestEngine.run_candles` unmodified. It takes a strategy + a FIXED
+      parameter dict + a date range and returns measurements only; it exposes
+      no parameter-search or parameter-writeback API.
+- [ ] 1.2 Test: a structural/guard test asserting the package contains no
+      parameter-search path and never writes `strategy_params` (no DB/bot/config
+      write, no "try N param sets and rank" loop) — the measurement/optimisation
+      separation is enforced, not just documented.
 
-## 3. Regime-Conditioned Reporting
+## 2. Walk-Forward Measurement (fixed config, out-of-sample)
+- [ ] 2.1 Split a historical date range into rolling windows; measure the
+      SAME operator-supplied fixed parameters on each window (no train-time
+      search — the window split only makes the samples independent).
+- [ ] 2.2 Report per-window metrics (expectancy, win rate, profit factor,
+      drawdown, trade count) side by side so consistency (or its absence)
+      across time is visible; state the sample-size limitation honestly.
+- [ ] 2.3 CLI entry point (read-only; prints/writes a report, changes nothing).
+- [ ] 2.4 Tests: deterministic measurement over a synthetic candle fixture with
+      a known result; a fixture whose edge is present in one window and absent
+      in others is correctly shown as inconsistent (NOT "fixed" — just shown).
+
+## 3. Regime-Conditioned Reporting (measurement)
 - [ ] 3.1 Classify each trade's entry regime using the canonical detector
       (post `fix-regime-detection-consistency`).
-- [ ] 3.2 Bucket `BacktestResult.trades`/`equity_curve` by regime and
-      compute per-regime expectancy/win-rate/drawdown.
-- [ ] 3.3 CLI output or report file summarizing per-regime performance per
-      strategy.
-- [ ] 3.4 Feed findings back into `_strategy_auto`'s scoring table
-      (`trading_engine.py` `_get_strategy_capabilities`) as documented,
-      data-backed `allowed_regimes`/priority values instead of guesses —
-      track as a follow-up task, not a blocker for this change's
-      completion.
-- [ ] 3.5 Tests: regime bucketing correctness against a synthetic fixture
-      with known regime transitions.
+- [ ] 3.2 Bucket `BacktestResult.trades`/`equity_curve` by regime and compute
+      per-regime expectancy/win-rate/drawdown.
+- [ ] 3.3 CLI output / report summarising per-regime performance per strategy
+      (read-only).
+- [ ] 3.4 Tests: regime bucketing correctness against a synthetic fixture with
+      known regime transitions.
 
-## 4. Baseline Validation Run
-- [ ] 4.1 Once Sections 1-3 are usable, re-run all 6 strategies through
+## 4. Validated Measurement Record
+- [ ] 4.1 Aggregate the out-of-sample measurements (Section 2) into the
+      framework's `EdgeEstimate` shape (expectancy, win_rate, profit_factor,
+      sample_size), constructed with `VALIDATED_EDGE_SOURCE` — produced and
+      REPORTED only. Do NOT wire it into any live `StrategyProposal`
+      (`expected_edge_estimate` stays `None` at runtime until a separate change
+      wires it).
+- [ ] 4.2 Tests: the record is constructible/valid for a measured strategy; a
+      test confirms no runtime proposal path is modified by this change.
+
+## 5. Baseline Measurement Run
+- [ ] 5.1 Once Sections 1-4 are usable, measure all 6 strategies via
       walk-forward + regime-conditioned reporting across the full available
-      history (2020-2026) and record the results as the first real,
-      validated baseline this project has ever had.
+      history (2020-2026) and record the results as the first objective,
+      out-of-sample baseline this project has — a report a human reviews, with
+      its sample-size limitations stated. No parameters are changed as a result.
+
+## Explicitly Out of Scope (deferred to a future, separate change)
+- Parameter optimisation / search / sweep of any kind, and any objective that
+  ranks parameter sets (grid/random/latin-hypercube, drawdown-constrained
+  ranking, etc.).
+- Writing optimiser- or measurement-chosen parameters back into `strategy_params`
+  for any bot or config.
+- Wiring the validated `EdgeEstimate` into live `StrategyProposal.expected_edge_
+  estimate` at runtime (this change only produces/reports the record).

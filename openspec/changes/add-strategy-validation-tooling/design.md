@@ -4,67 +4,85 @@ returns a clean `BacktestResult` (expectancy, drawdown, win rate, equity
 curve, trade list — `backend/app/backtesting/results.py`) for a single
 strategy/param/date-range combination, with a proven no-lookahead guarantee
 (`test_decision_never_sees_a_future_candle`,
-`backend/tests/test_backtesting_engine.py:183-212`). The missing piece for
-optimization/walk-forward is purely an outer loop and an objective function —
-nothing in the engine needs to change.
+`backend/tests/test_backtesting_engine.py`). The missing piece is not a search
+loop — it is **objective, out-of-sample measurement and explanation** of a
+strategy as it is actually configured. `add-strategy-decision-framework`
+defined an `EdgeEstimate` (expectancy/win_rate/profit_factor/sample_size,
+constructible only with `source == VALIDATED_EDGE_SOURCE`) precisely so that a
+measurement tool — this one — can produce validated numbers a strategy may not
+self-compute.
+
+## Premise (binding)
+Measure, don't optimise. This tool measures a **fixed** strategy configuration
+and explains the result. It performs **no parameter search, no tuning, no
+selection of a "better" parameter set, and never writes parameters back**
+anywhere. Optimisation is a separate, future change. Every requirement and
+task below is written to keep measurement and optimisation strictly apart.
 
 ## Goals / Non-Goals
 - Goals:
-  - Let a strategy's parameter space be searched against real history and
-    ranked by an explicit, configurable objective.
-  - Make in-sample overfitting visible via out-of-sample (walk-forward)
-    scoring, instead of trusting a single full-period backtest.
-  - Make it possible to answer "is this strategy actually good in a
-    trend_down regime, or only in trend_up" from data already being
-    collected.
-- Non-Goals:
-  - Machine-learning-based signal generation (the intelligent-trading-bot
-    approach) — a much bigger bet, not proposed here.
-  - Multi-symbol/portfolio-level backtesting — still out of scope; each
-    optimizer/walk-forward run stays single-symbol, matching the existing
-    engine.
-  - Automatically deploying optimizer-chosen parameters to production bots —
-    this tooling produces a report a human reviews; it does not write
-    `strategy_params` back into the database.
+  - Measure a strategy's *given* parameters out-of-sample (rolling windows) so
+    a single lucky window can't masquerade as an edge.
+  - Explain the result: per-window and per-regime breakdowns, plus honest
+    sample-size/limitation notes, not a single headline number.
+  - Produce the validated `EdgeEstimate`-shaped record from those measurements
+    (report only; wiring into live proposals is a separate change).
+- Non-Goals (explicit):
+  - **Parameter optimisation / search / tuning of any kind** — deferred to a
+    future, separate change.
+  - Writing `strategy_params` to any bot or config.
+  - Machine-learning signal generation; multi-symbol/portfolio backtesting.
+  - Changing `BacktestEngine`, any strategy, or any production trading path.
 
 ## Decisions
-- Decision: implement the optimizer as a thin CLI wrapper
-  (`app/backtesting/optimize.py`) that calls `BacktestEngine.run_candles` in
-  a loop over a param grid/random sample, never modifying `engine.py`.
-  - Why: preserves the no-lookahead / no-strategy-logic-change guarantees
-    already proven for the engine; the optimizer is purely a caller.
-- Decision: walk-forward splits are simple fixed-size rolling windows
-  (e.g. N months train, M months validate, step forward by M), not
-  anchored/expanding windows initially.
-  - Why: simplest thing that catches "overfit to one window"; anchored/
-    expanding windows can be added later if rolling windows prove
-    insufficient.
-- Decision: regime-conditioned reporting reuses whichever regime detector
-  `fix-regime-detection-consistency` leaves as canonical, classifying regime
-  at each trade's entry timestamp from the already-loaded candle series (a
-  post-hoc bucketing of existing `BacktestResult.trades` /
-  `equity_curve`, no coupling to replay-time state needed).
+- Decision: the tool is a **read-only measurement wrapper** around
+  `BacktestEngine.run_candles`, run from a CLI, that never mutates engine,
+  strategy, or config state.
+  - Why: preserves the engine's proven no-lookahead / no-logic-change
+    guarantees; keeps the measurement/optimisation boundary structurally
+    obvious (there is simply no code path that changes a parameter).
+- Decision: walk-forward here means **out-of-sample measurement of one fixed
+  config**, not train-then-optimise-then-validate. Each rolling window runs
+  the SAME operator-supplied parameters; the "train" window is not used to
+  pick anything — it exists only so windows are independent and the report can
+  show consistency (or its absence) across time.
+  - Why: this is the honest measurement the premise asks for. Introducing a
+    train-time search would be optimisation, which is out of scope.
+- Decision: the validated record is the framework's `EdgeEstimate` shape,
+  constructed with `VALIDATED_EDGE_SOURCE`, aggregated across the out-of-sample
+  windows (not a single in-sample fit).
+  - Why: it is the one contract already designed for "validated, not
+    self-computed" numbers; producing it here is measurement, and it makes the
+    tool's output directly consumable by a later, separate wiring change.
+- Decision: regime-conditioned reporting reuses the canonical regime detector
+  (`fix-regime-detection-consistency`), classifying regime at each trade's
+  entry timestamp from the already-loaded candle series — a post-hoc bucketing
+  of existing `BacktestResult.trades`/`equity_curve`.
+  - Why: no coupling to replay-time state; it is pure measurement of results
+    already produced.
 
 ## Risks / Trade-offs
-- Grid search over multiple params is combinatorial; cap default grid size
-  and prefer random/latin-hypercube sampling for large spaces rather than a
-  full grid, to keep a full optimizer run tractable. Reuse the CSV-loader's
-  progress-reporting pattern (`backend/app/backtesting/progress.py`) so a
-  long optimizer/walk-forward run stays observable, not silent.
-- Walk-forward with only ~6 years of history (2020-2026) limits how many
-  independent out-of-sample windows are possible — document this limitation
-  rather than overstating statistical confidence.
+- With only ~6 years of history (2020-2026), the number of independent
+  out-of-sample windows is limited — the report SHALL state this and avoid
+  overstating statistical confidence, never presenting a small-sample result
+  as a strong edge.
+- Long measurement runs must stay observable: reuse the CSV-loader's
+  progress-reporting pattern (`backend/app/backtesting/progress.py`).
+- Temptation to "just also rank a few parameter variants" — explicitly
+  forbidden here; that is the future optimisation change. A test asserts the
+  tool exposes no parameter-search / param-writeback path.
 
 ## Migration Plan
-1. Ship the optimizer first (useful standalone).
-2. Ship walk-forward on top of it once the optimizer is stable.
-3. Ship regime-conditioned reporting last, after
-   `fix-regime-detection-consistency` lands.
-4. None of this touches production trading paths — no rollback plan needed
-   beyond not running the new CLI commands.
+1. Ship the measurement boundary + walk-forward (fixed-config OOS) first.
+2. Add regime-conditioned reporting (after `fix-regime-detection-consistency`).
+3. Produce the validated `EdgeEstimate` record from the OOS measurements.
+4. Run a baseline measurement of all six strategies as the first validated
+   record this project has. None of this touches production trading paths — no
+   rollback needed beyond not running the CLI.
 
 ## Open Questions
-- Default optimization objective: raw expectancy, Sharpe-like risk-adjusted
-  return, or expectancy constrained by a max-drawdown ceiling? Recommend the
-  latter (constrained expectancy) so the optimizer can't just find a
-  high-return/high-ruin-risk parameter set — confirm before implementation.
+- Default rolling-window sizes (train/validate span, step) for the baseline
+  run — pick sizes that yield at least a few independent windows over
+  2020-2026 and document them; not a contract, a run-time parameter.
+- Report format (stdout table vs a written artifact) — implementation detail;
+  must in all cases be read-only.
