@@ -631,6 +631,29 @@ confirms:
     step 5/8) or proposal content (forbidden outright, per Proposal
     Immutability).
 
+- Decision (resolved in Phase 1 implementation): the multi-selection
+  sequencing question — whether a second selected proposal's exposure check
+  must account for an earlier selection's not-yet-executed allocation — is
+  resolved by treating the max-total-exposure cap as a SINGLE SHARED BUDGET
+  evaluated across the complete committee decision, not per proposal. The
+  shared budget (the `PortfolioRiskService`'s own `remaining_capacity`, read
+  back rather than re-derived) is consumed by selected buys in deterministic
+  ranking order (higher rank = first claim); a rank-tie group that cannot be
+  fully funded splits the remaining budget PROPORTIONALLY to each proposal's
+  suggested size. This makes the committee outcome (which proposals selected,
+  and their allocated sizes) a pure function of the proposals, portfolio
+  state, and ranking — independent of batch/arrival/execution order and of
+  strategy identity. Auto only accepts, rejects, or trims a strategy's own
+  suggested size; it never invents an allocation or optimises a portfolio.
+  - Why: `check_portfolio_risk` is a per-order check that reads current
+    exposure from the DB, so calling it independently per proposal lets two
+    proposals that each fit the headroom jointly breach it. Modeling the cap
+    as one shared budget consumed once, in the single pure decision, is the
+    minimal correct fix that reuses the unchanged service and stays
+    order-independent. The async, stateful resolution of portfolio state is
+    isolated in `resolve_portfolio_constraints`, keeping the ten-step process
+    a pure, deterministic function.
+
 ## Risks / Trade-offs
 
 - A fixed ten-step order (see Decisions) means adding a genuinely new

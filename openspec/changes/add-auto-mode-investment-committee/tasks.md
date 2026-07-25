@@ -4,13 +4,17 @@
 architecture-only; implementation was gated on separate approval. That
 approval has been given, and implementation now proceeds against this
 already-agreed task breakdown (the same pattern `add-strategy-decision-
-framework` used). **Phase 0 (Committee Core) is complete** —
+framework` used). **Phases 0-1 complete.** Phase 0 (Committee Core):
 `backend/app/services/auto_committee/` (`comparison.py`, `decision.py`,
-`trust.py`, `process.py`) with 29 tests in
-`backend/tests/test_auto_committee.py`; full suite 1311 passing, zero
-regressions. Depends on `add-strategy-decision-framework`'s Phases 0-6
-(all complete), which produce the real `StrategyProposal` objects Auto
-consumes.
+`trust.py`, `process.py`). Phase 1 (Portfolio Risk Wiring): `portfolio.py`
+resolves the cycle's constraints via the unchanged `PortfolioRiskService`/
+`StrategyCapacityService`, and step 5/8 evaluate the max-total-exposure cap as
+a single shared budget across the complete decision (consumed in ranking order,
+tie-groups split proportionally) — order-independent, no reimplementation, no
+optimisation, trim-only. 41 tests in `backend/tests/test_auto_committee.py`;
+full suite 1323 passing, zero regressions. Depends on `add-strategy-decision-
+framework`'s Phases 0-6 (all complete), which produce the real
+`StrategyProposal` objects Auto consumes.
 
 This checklist also depends on `add-strategy-decision-framework`'s
 Phase 0-6 strategy implementation having produced real `StrategyProposal`
@@ -89,7 +93,7 @@ portfolio services, or the execution pipeline yet.
 
 ## Phase 1 — Portfolio Risk Wiring (step 5)
 
-- [ ] 1.1 Wire step 5 to the existing, unchanged
+- [x] 1.1 Wire step 5 to the existing, unchanged
       `PortfolioRiskService.check_portfolio_risk` and
       `StrategyCapacityService.check_capacity_for_trade`
       (`backend/app/services/portfolio_risk.py`,
@@ -98,7 +102,7 @@ portfolio services, or the execution pipeline yet.
       proposal (`rejection_step = "portfolio_risk"` or
       `"strategy_capacity"`); a resize carries the proposal forward with
       its allocation already capped.
-- [ ] 1.2 Resolve the multi-selection sequencing question flagged in
+- [x] 1.2 Resolve the multi-selection sequencing question flagged in
       `design.md`'s "Risks / Trade-offs": confirm and test whether/how
       `PortfolioRiskService`'s per-order exposure check must account for
       an earlier selection's not-yet-executed allocation within the same
@@ -106,7 +110,7 @@ portfolio services, or the execution pipeline yet.
       the same batch. Dedicated test with two simultaneously-eligible
       proposals whose combined exposure would breach the cap individually
       passing but jointly failing.
-- [ ] 1.3 Tests: proposals that would be blocked/resized by the existing
+- [x] 1.3 Tests: proposals that would be blocked/resized by the existing
       services are correctly rejected/capped through the committee's step
       5, using the SAME test fixtures/scenarios
       `add-trading-safety-boundaries`'s own test suite already uses for

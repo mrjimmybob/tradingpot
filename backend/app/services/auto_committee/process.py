@@ -13,13 +13,14 @@ and 3 wire the real services without touching this orchestrator's shape.
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 from app.services.strategy_framework.edge_management import EdgeCategory
 from app.services.strategy_framework.proposal import ExecutionIntent, StrategyProposal
 
 from .comparison import ComparisonView, read_comparison
 from .decision import CommitteeDecision, RejectedProposal, SelectedAllocation
+from .portfolio import BUY_INTENTS, PortfolioConstraints
 from .trust import TrustAdjustment
 
 # execution_intent values that produce a real order (mirrors the Standalone
@@ -60,33 +61,27 @@ def rank_key(view: ComparisonView) -> Tuple[float, float, float, float]:
 # The orchestrator (steps 1-10)
 # ---------------------------------------------------------------------------
 
-# Step 5 stub signature: given a proposal and its tentative allocation, return
-# (ok, capped_size, reason). ok=False rejects (portfolio_risk); a smaller
-# capped_size resizes. Default no-op passes everything unchanged.
-PortfolioRiskCheck = Callable[[StrategyProposal, Optional[float]], Tuple[bool, Optional[float], str]]
-
-
-def _default_portfolio_risk_check(
-    proposal: StrategyProposal, tentative_size: Optional[float]
-) -> Tuple[bool, Optional[float], str]:
-    return True, tentative_size, ""
-
-
 def run_committee(
     proposals: Sequence[StrategyProposal],
     *,
     now: datetime,
-    portfolio_risk_check: Optional[PortfolioRiskCheck] = None,
+    portfolio: Optional[PortfolioConstraints] = None,
     trust_adjustments: Optional[Sequence[TrustAdjustment]] = None,
 ) -> CommitteeDecision:
     """Run the full ten-step Committee Process over one batch of (Alpha)
     proposals and produce an immutable `CommitteeDecision`.
 
+    Pure and deterministic: given the same proposals, `now`, and `portfolio`
+    constraints, it always produces the same decision — the async, stateful
+    portfolio-service calls are resolved beforehand into `portfolio` (see
+    `portfolio.resolve_portfolio_constraints`). `portfolio=None` means no
+    constraints (unconstrained), used by Phase 0 pure-logic tests.
+
     `proposals` is assumed already filtered to Alpha strategies (Allocation
     strategies never enter the committee — see design.md "Strategy
     Categories"); this function does not re-filter by category.
     """
-    portfolio_risk_check = portfolio_risk_check or _default_portfolio_risk_check
+    portfolio = portfolio or PortfolioConstraints()
     trust_adjustments = list(trust_adjustments or [])
 
     # Step 1 — collect.
@@ -145,20 +140,28 @@ def run_committee(
             kept.append(pid)
     survivors = kept
 
-    # Step 5 — apply portfolio risk constraints (injected; no-op by default in
-    # Phase 0). Produces the tentative allocated size for each survivor.
+    # Step 5 — apply portfolio risk constraints (Phase 1, from the pre-resolved
+    # `portfolio` snapshot). The order-independent hard blocks (loss/drawdown)
+    # reject every actionable order; per-strategy capacity blocks/caps apply per
+    # proposal. The SHARED max-total-exposure budget is NOT applied per-proposal
+    # here — it is a portfolio-wide budget evaluated across the whole decision at
+    # allocation (steps 8-9), so combined exposure is correct rather than each
+    # proposal seeing the same pre-cycle exposure in isolation.
     tentative_size: Dict[str, Optional[float]] = {}
     kept = []
     for pid in survivors:
-        p = by_id[pid]
-        ok, capped, reason = portfolio_risk_check(p, p.suggested_position_size)
-        if not ok:
-            rejected.append(RejectedProposal(
-                pid, "portfolio_risk", reason or "blocked by portfolio risk/capacity",
-            ))
-        else:
-            tentative_size[pid] = capped
-            kept.append(pid)
+        actionable = views[pid].execution_intent in _ORDER_INTENTS
+        if actionable and portfolio.hard_block_reason:
+            rejected.append(RejectedProposal(pid, "portfolio_risk", portfolio.hard_block_reason))
+            continue
+        if pid in portfolio.capacity_block:
+            rejected.append(RejectedProposal(pid, "strategy_capacity", portfolio.capacity_block[pid]))
+            continue
+        size = by_id[pid].suggested_position_size
+        if pid in portfolio.capacity_cap:
+            size = portfolio.capacity_cap[pid]
+        tentative_size[pid] = size
+        kept.append(pid)
     survivors = kept
 
     # Step 6 — apply external trust adjustments (injected; empty by default).
@@ -175,28 +178,74 @@ def run_committee(
     ranked = sorted(survivors, key=lambda pid: rank_key(views[pid]), reverse=True)
     ranking_snapshot = list(ranked)
 
-    # Steps 8 & 9 — allocate capital and select. Actionable proposals (their
-    # execution_intent produces an order) are selected in ranked order, each
-    # carrying its step-5 allocation and a 1-based execution priority. A
-    # survivor whose intent produces no order is recorded rejected
-    # ("not_actionable"), so every considered proposal lands in exactly one of
-    # selected/rejected. Selecting zero, one, or many are all valid outcomes.
+    # Step 8 — allocate capital across the COMPLETE committee decision. The
+    # max-total-exposure cap is a single shared budget that all selected buys
+    # draw from together, consumed in deterministic ranking order (higher rank =
+    # first claim). When a rank-tie group cannot be fully funded, the remaining
+    # budget is split PROPORTIONALLY to each proposal's suggested size — a
+    # symmetric, batch-order-independent, strategy-identity-blind rule (never an
+    # arbitrary pick, never a new/invented allocation, never optimisation). This
+    # is what makes the committee outcome independent of execution order.
+    final_size: Dict[str, Optional[float]] = {}
+    exposure_rejected: Dict[str, str] = {}
+    remaining = portfolio.exposure_headroom_usd  # None == unlimited
+    idx = 0
+    while idx < len(ranked):
+        end = idx
+        key = rank_key(views[ranked[idx]])
+        while end < len(ranked) and rank_key(views[ranked[end]]) == key:
+            end += 1
+        group = ranked[idx:end]
+        # Non-buy actionable orders (sells/closes) do not draw the buy-exposure
+        # budget; they pass through with their tentative size.
+        for pid in group:
+            if views[pid].execution_intent in _ORDER_INTENTS and views[pid].execution_intent not in BUY_INTENTS:
+                final_size[pid] = tentative_size.get(pid)
+        buys = [pid for pid in group if views[pid].execution_intent in BUY_INTENTS]
+        if remaining is None:
+            for pid in buys:
+                final_size[pid] = tentative_size.get(pid)
+        else:
+            wants = {pid: (tentative_size.get(pid) or 0.0) for pid in buys}
+            total_want = sum(wants.values())
+            if total_want <= remaining:
+                for pid in buys:
+                    final_size[pid] = wants[pid]
+                remaining -= total_want
+            else:
+                for pid in buys:
+                    share = remaining * (wants[pid] / total_want) if total_want > 0 else 0.0
+                    if share < portfolio.min_order_usd:
+                        exposure_rejected[pid] = (
+                            f"combined exposure budget exhausted: allocated share "
+                            f"${share:.2f} < min order ${portfolio.min_order_usd:.2f}"
+                        )
+                    else:
+                        final_size[pid] = share
+                remaining = 0.0
+        idx = end
+
+    # Step 9 — select actionable survivors in rank order with their final
+    # allocation; every non-selected considered proposal is recorded rejected,
+    # so nothing is silently dropped. Selecting zero, one, or many are all valid.
     selected: List[SelectedAllocation] = []
     priority = 1
     for pid in ranked:
         view = views[pid]
-        if view.execution_intent in _ORDER_INTENTS:
-            selected.append(SelectedAllocation(
-                proposal_id=pid,
-                allocated_size=tentative_size.get(pid),
-                execution_priority=priority,
-            ))
-            priority += 1
-        else:
+        if view.execution_intent not in _ORDER_INTENTS:
             rejected.append(RejectedProposal(
                 pid, "not_actionable",
                 f"execution_intent {view.execution_intent.value} produces no order",
             ))
+        elif pid in exposure_rejected:
+            rejected.append(RejectedProposal(pid, "portfolio_risk", exposure_rejected[pid]))
+        else:
+            selected.append(SelectedAllocation(
+                proposal_id=pid,
+                allocated_size=final_size.get(pid),
+                execution_priority=priority,
+            ))
+            priority += 1
 
     # Deterministic ordering of the rejected list (identity-based sort is fine
     # here — this is audit ordering, not ranking).

@@ -14,6 +14,7 @@ execution pipeline.
 """
 from .comparison import ComparisonView, read_comparison
 from .decision import CommitteeDecision, RejectedProposal, SelectedAllocation
+from .portfolio import PortfolioConstraints, resolve_portfolio_constraints
 from .process import run_committee
 from .trust import TrustAdjustment
 
@@ -24,5 +25,7 @@ __all__ = [
     "RejectedProposal",
     "SelectedAllocation",
     "TrustAdjustment",
+    "PortfolioConstraints",
+    "resolve_portfolio_constraints",
     "run_committee",
 ]

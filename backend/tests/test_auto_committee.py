@@ -281,18 +281,18 @@ class TestOrchestratorInvariants:
         d = run_committee([p], now=_NOW, trust_adjustments=[ta])
         assert d.trust_adjustments_applied == (f"fear_greed:{p.proposal_id}",)
 
-    def test_portfolio_risk_stub_can_block(self):
+    def test_portfolio_hard_block_rejects_actionable(self):
+        from app.services.auto_committee import PortfolioConstraints
         p = _proposal()
-        def block(_proposal, _size):
-            return False, None, "synthetic exposure cap breach"
-        d = run_committee([p], now=_NOW, portfolio_risk_check=block)
+        d = run_committee([p], now=_NOW,
+                          portfolio=PortfolioConstraints(hard_block_reason="portfolio drawdown cap"))
         assert _rejected_by_step(d)[p.proposal_id] == "portfolio_risk"
 
-    def test_portfolio_risk_stub_can_resize(self):
+    def test_shared_exposure_budget_trims_a_buy(self):
+        from app.services.auto_committee import PortfolioConstraints
         p = _proposal(size=1000.0)
-        def cap(_proposal, _size):
-            return True, 250.0, ""
-        d = run_committee([p], now=_NOW, portfolio_risk_check=cap)
+        d = run_committee([p], now=_NOW,
+                          portfolio=PortfolioConstraints(exposure_headroom_usd=250.0))
         assert d.selected[0].allocated_size == 250.0
 
 
@@ -338,3 +338,162 @@ class TestCertificationProperties:
                          intent=ExecutionIntent.CLOSE_POSITION, total=80.0)
         d = run_committee([buy, sell], now=_NOW)
         assert len(d.selected) == 2  # resolved by ranking/allocation, not a freeze
+
+
+# ---------------------------------------------------------------------------
+# Phase 1 — portfolio risk wiring (step 5) evaluated across the whole decision
+# ---------------------------------------------------------------------------
+
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
+
+from app.services.auto_committee import PortfolioConstraints, resolve_portfolio_constraints
+from app.services.auto_committee.portfolio import _HEADROOM_PROBE_USD
+
+
+def _alloc(decision):
+    return {s.proposal_id: s.allocated_size for s in decision.selected}
+
+
+class TestCombinedExposureAllocation:
+    """The exposure cap is a single shared budget evaluated across the complete
+    committee decision, deterministically and independent of execution order."""
+
+    def test_combined_exposure_capped_across_the_decision(self):
+        # Two buys, each $600, individually fit a $1000 budget but JOINTLY
+        # ($1200) exceed it — the design's multi-selection sequencing case.
+        hi = _proposal(strategy_id="hi", total=90.0, size=600.0)
+        lo = _proposal(strategy_id="lo", total=50.0, size=600.0)
+        d = run_committee([hi, lo], now=_NOW,
+                          portfolio=PortfolioConstraints(exposure_headroom_usd=1000.0, min_order_usd=10.0))
+        alloc = _alloc(d)
+        # Higher rank gets its full 600; the lower-ranked gets the remaining 400.
+        assert alloc[hi.proposal_id] == 600.0
+        assert alloc[lo.proposal_id] == 400.0
+        assert sum(v for v in alloc.values()) == pytest.approx(1000.0)  # never exceeds budget
+
+    def test_lower_ranked_rejected_when_budget_exhausted(self):
+        hi = _proposal(strategy_id="hi", total=90.0, size=1000.0)
+        lo = _proposal(strategy_id="lo", total=50.0, size=1000.0)
+        d = run_committee([hi, lo], now=_NOW,
+                          portfolio=PortfolioConstraints(exposure_headroom_usd=1000.0, min_order_usd=10.0))
+        assert _alloc(d)[hi.proposal_id] == 1000.0
+        assert _rejected_by_step(d)[lo.proposal_id] == "portfolio_risk"
+
+    def test_outcome_independent_of_batch_order(self):
+        # Distinct ranks + a binding shared budget: shuffling the input batch
+        # must not change which proposals are selected or their allocations.
+        a = _proposal(strategy_id="a", total=90.0, size=600.0)
+        b = _proposal(strategy_id="b", total=70.0, size=600.0)
+        c = _proposal(strategy_id="c", total=50.0, size=600.0)
+        pc = PortfolioConstraints(exposure_headroom_usd=1000.0, min_order_usd=10.0)
+        results = []
+        for batch in ([a, b, c], [c, a, b], [b, c, a], [c, b, a]):
+            results.append(_alloc(run_committee(batch, now=_NOW, portfolio=pc)))
+        assert all(r == results[0] for r in results)
+        # a full (600), b trimmed to remaining (400), c rejected (0 left).
+        assert results[0] == {a.proposal_id: 600.0, b.proposal_id: 400.0}
+
+    def test_exact_tie_group_splits_proportionally(self):
+        # Two buys with identical Comparison Contract values compete for a $600
+        # budget: split proportionally to suggested size (identity-blind, order-
+        # independent), never an arbitrary pick.
+        x = _proposal(strategy_id="x", total=50.0, size=300.0, risk_budget=1.0)
+        y = _proposal(strategy_id="y", total=50.0, size=100.0, risk_budget=1.0)
+        d = run_committee([x, y], now=_NOW,
+                          portfolio=PortfolioConstraints(exposure_headroom_usd=200.0, min_order_usd=10.0))
+        alloc = _alloc(d)
+        # 200 split 3:1 by suggested size -> 150 / 50.
+        assert alloc[x.proposal_id] == pytest.approx(150.0)
+        assert alloc[y.proposal_id] == pytest.approx(50.0)
+
+    def test_sells_do_not_consume_buy_exposure_budget(self):
+        buy = _proposal(strategy_id="buy", total=60.0, size=1000.0,
+                        intent=ExecutionIntent.OPEN_POSITION)
+        sell = _proposal(strategy_id="sell", total=90.0, size=1000.0,
+                         direction=Direction.SELL, intent=ExecutionIntent.CLOSE_POSITION)
+        d = run_committee([buy, sell], now=_NOW,
+                          portfolio=PortfolioConstraints(exposure_headroom_usd=500.0, min_order_usd=10.0))
+        alloc = _alloc(d)
+        assert alloc[sell.proposal_id] == 1000.0   # sell unaffected by buy budget
+        assert alloc[buy.proposal_id] == 500.0     # buy trimmed to the budget
+
+    def test_capacity_block_and_cap(self):
+        blocked = _proposal(strategy_id="blk", total=80.0, size=500.0)
+        capped = _proposal(strategy_id="cap", total=60.0, size=500.0)
+        pc = PortfolioConstraints(
+            capacity_block={blocked.proposal_id: "trend_following at capacity"},
+            capacity_cap={capped.proposal_id: 200.0},
+        )
+        d = run_committee([blocked, capped], now=_NOW, portfolio=pc)
+        assert _rejected_by_step(d)[blocked.proposal_id] == "strategy_capacity"
+        assert _alloc(d)[capped.proposal_id] == 200.0
+
+    def test_none_headroom_is_unlimited(self):
+        p = _proposal(size=10_000.0)
+        d = run_committee([p], now=_NOW, portfolio=PortfolioConstraints(exposure_headroom_usd=None))
+        assert _alloc(d)[p.proposal_id] == 10_000.0
+
+
+class TestResolvePortfolioConstraints:
+    """resolve_portfolio_constraints reuses the unchanged services; it reads
+    back exactly what they compute (no reimplementation, no behavior drift)."""
+
+    def _risk(self, monkeypatch, check_result):
+        from app.services.auto_committee import portfolio as pmod
+        inst = SimpleNamespace(check_portfolio_risk=AsyncMock(return_value=check_result))
+        monkeypatch.setattr(pmod, "PortfolioRiskService", lambda session: inst)
+        return inst
+
+    def _capacity(self, monkeypatch, cap_result):
+        from app.services.auto_committee import portfolio as pmod
+        inst = SimpleNamespace(check_capacity_for_trade=AsyncMock(return_value=cap_result))
+        monkeypatch.setattr(pmod, "StrategyCapacityService", lambda session: inst)
+        return inst
+
+    @pytest.mark.asyncio
+    async def test_extracts_exposure_headroom_from_resize(self, monkeypatch):
+        from app.services.portfolio_risk import PortfolioRiskCheck
+        from app.services.strategy_capacity import CapacityCheck
+        self._risk(monkeypatch, PortfolioRiskCheck(
+            ok=True, violated_cap="exposure", details={}, action="resize", adjusted_amount=750.0))
+        self._capacity(monkeypatch, CapacityCheck(ok=True, reason="", adjusted_amount=None))
+        pc = await resolve_portfolio_constraints([_proposal(size=100.0)], session=object())
+        assert pc.exposure_headroom_usd == 750.0
+        assert pc.hard_block_reason is None
+
+    @pytest.mark.asyncio
+    async def test_hard_block_from_drawdown(self, monkeypatch):
+        from app.services.portfolio_risk import PortfolioRiskCheck
+        from app.services.strategy_capacity import CapacityCheck
+        self._risk(monkeypatch, PortfolioRiskCheck(
+            ok=False, violated_cap="drawdown", details={}, action="block", adjusted_amount=None))
+        self._capacity(monkeypatch, CapacityCheck(ok=True, reason="", adjusted_amount=None))
+        pc = await resolve_portfolio_constraints([_proposal()], session=object())
+        assert pc.hard_block_reason == "portfolio drawdown cap"
+
+    @pytest.mark.asyncio
+    async def test_allow_means_unlimited_headroom(self, monkeypatch):
+        from app.services.portfolio_risk import PortfolioRiskCheck
+        from app.services.strategy_capacity import CapacityCheck
+        self._risk(monkeypatch, PortfolioRiskCheck(
+            ok=True, violated_cap=None, details={}, action="allow", adjusted_amount=_HEADROOM_PROBE_USD))
+        self._capacity(monkeypatch, CapacityCheck(ok=True, reason="", adjusted_amount=None))
+        pc = await resolve_portfolio_constraints([_proposal()], session=object())
+        assert pc.exposure_headroom_usd is None
+
+    @pytest.mark.asyncio
+    async def test_capacity_block_recorded(self, monkeypatch):
+        from app.services.portfolio_risk import PortfolioRiskCheck
+        from app.services.strategy_capacity import CapacityCheck
+        self._risk(monkeypatch, PortfolioRiskCheck(
+            ok=True, violated_cap=None, details={}, action="allow", adjusted_amount=_HEADROOM_PROBE_USD))
+        self._capacity(monkeypatch, CapacityCheck(ok=False, reason="at capacity", adjusted_amount=None))
+        p = _proposal(intent=ExecutionIntent.OPEN_POSITION)
+        pc = await resolve_portfolio_constraints([p], session=object())
+        assert pc.capacity_block[p.proposal_id] == "at capacity"
+
+    @pytest.mark.asyncio
+    async def test_empty_batch_unconstrained(self):
+        pc = await resolve_portfolio_constraints([], session=object())
+        assert pc.hard_block_reason is None and pc.exposure_headroom_usd is None
