@@ -42,9 +42,40 @@ applying portfolio context or external trust adjustments.
   referencing the proposal by `proposal_id`, never written onto the
   proposal itself
 
+### Requirement: Alpha and Allocation Strategy Categories
+Strategies SHALL be classified into two categories by purpose: Alpha
+strategies (which generate positive risk-adjusted returns and participate in
+the Investment Committee) and Allocation strategies (which deploy capital
+according to an investment policy and do NOT participate in Committee
+ranking). The Investment Committee SHALL evaluate only Alpha
+`StrategyProposal` objects. Allocation strategies SHALL execute independently
+according to portfolio policy, subject to the same portfolio risk and
+capacity services as any order. This classification SHALL be Auto-side
+metadata keyed by strategy identity and SHALL NOT modify the
+`StrategyProposal` contract or any Strategy Decision Framework interface.
+
+#### Scenario: Allocation proposals are excluded from the committee
+- **WHEN** an Allocation strategy (e.g. `dca_accumulator`) produces a
+  `StrategyProposal` in the same cycle as Alpha strategies
+- **THEN** the Allocation proposal is not collected at Committee Process step
+  1, is never ranked against an Alpha proposal, and does not appear in any
+  `CommitteeDecision.proposals_considered`
+
+#### Scenario: Allocation strategies still execute under portfolio governance
+- **WHEN** an Allocation strategy's proposal is ready to execute
+- **THEN** it reaches the execution pipeline via its own Standalone-Adapter
+  path and is still gated by `PortfolioRiskService` and
+  `StrategyCapacityService`, without being subject to comparative ranking
+
+#### Scenario: Categorization changes no contract
+- **WHEN** a strategy is classified as Alpha or Allocation, or reclassified
+- **THEN** only Auto-side registry metadata keyed by strategy identity
+  changes; the `StrategyProposal` contract, the Comparison Contract, and
+  every Strategy Decision Framework interface remain unchanged
+
 ### Requirement: Auto Input Contract
 Every evaluation cycle, Auto SHALL receive exactly one `StrategyProposal`
-per enabled strategy that produced one, evaluated independently against
+per enabled Alpha strategy that produced one, evaluated independently against
 the same market state, with no strategy aware of any other strategy's
 existence or output.
 

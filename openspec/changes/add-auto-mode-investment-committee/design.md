@@ -131,6 +131,56 @@ Every evaluation cycle:
   batch — it does not evaluate them one at a time or in strategy-defined
   order (see "Proposal Ranking").
 
+## Strategy Categories (Alpha vs Allocation)
+
+Not every strategy exists to compete for the same capital on the same
+question. There are two categories, distinguished by *purpose*, and only one
+of them participates in the Investment Committee.
+
+**1. Alpha strategies.** Purpose: generate positive risk-adjusted returns by
+recommending specific trades. They compete for capital against one another on
+the question "which recommendation deserves funding right now," so they **are
+the Committee's input** — every proposal they produce is ranked, allocated,
+and selected against every other Alpha proposal. Current Alpha strategies:
+
+- `trend_following`
+- `mean_reversion`
+- `volatility_breakout`
+- `dip_recovery`
+- `adaptive_grid`
+
+**2. Allocation strategies.** Purpose: deploy capital according to an
+investment *policy*, not a market edge. They do not compete for capital
+against Alpha strategies and make no claim of comparative edge, so ranking
+them against Alpha proposals is a category error — a classic DCA's scheduled
+buy is not "better" or "worse" than a breakout entry; it answers a different
+question entirely. Allocation strategies therefore **do not participate in
+Committee ranking**. They execute independently, on their own schedule,
+according to portfolio policy, via the same Standalone Adapter path they use
+today. Current Allocation strategy:
+
+- `dca_accumulator`
+
+**Consequence for the Committee Process.** Step 1 ("Collect every
+`StrategyProposal` produced this cycle") collects **only Alpha proposals**.
+An Allocation strategy's proposal never enters the ten-step process, is never
+ranked against an Alpha proposal, and is never listed in a
+`CommitteeDecision`'s `proposals_considered`. It reaches `_execute_trade`
+through its own independent Standalone-Adapter path, governed by the same
+portfolio risk/capacity services (`PortfolioRiskService`,
+`StrategyCapacityService`) that gate every order — so an Allocation strategy
+is still subject to portfolio-level risk, it simply is not subject to
+comparative *ranking*.
+
+**This clarification changes no contract.** The Alpha/Allocation category is
+**Auto-side static metadata keyed by `strategy_id`** (the same registry style
+as the existing `_get_strategy_capabilities()`), NOT a `StrategyProposal`
+field. It does not modify the `StrategyProposal` contract, the Comparison
+Contract, any Strategy Decision Framework interface, or any strategy's
+implementation — all of which remain frozen. It only scopes *which* proposals
+Step 1 collects. Adding or reclassifying a strategy is a change to this
+Auto-side registry alone.
+
 ## Auto Reaffirms Proposal Immutability
 
 `add-strategy-decision-framework` already established that a
@@ -218,8 +268,11 @@ rejected at an earlier step is never evaluated by a later one, so
 rejection reasons are unambiguous and the process is reproducible.
 
 1. **Collect every `StrategyProposal`** produced this cycle by every
-   enabled strategy. This is the complete candidate set for the cycle;
-   nothing is added or removed from it except by the steps below.
+   enabled **Alpha** strategy (see "Strategy Categories" — Allocation
+   strategies like `dca_accumulator` are excluded here and execute
+   independently via their own Standalone-Adapter path). This is the
+   complete candidate set for the cycle; nothing is added or removed from it
+   except by the steps below.
 2. **Reject expired proposals.** Any proposal with
    `now >= validity.valid_until` is discarded — a pure timestamp
    comparison, per `add-strategy-decision-framework`'s Proposal Validity
