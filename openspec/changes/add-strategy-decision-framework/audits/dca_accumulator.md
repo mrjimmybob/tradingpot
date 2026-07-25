@@ -474,14 +474,57 @@ the honest specification.
 **Pre-Phase-6 finding**: undocumented; no metrics or over/underperformance
 conditions stated anywhere.
 
-## Pillar 10 — Strategy Proposal Interface: Not present
+## Pillar 10 — Strategy Proposal Interface: Present (Phase 6.7)
 
-Returns `TradeSignal` directly (`trading_engine.py:1357`,
-`return TradeSignal(action="buy", ...)`), the same as every other
-strategy — no `StrategyProposal` concept exists yet anywhere in the
-codebase. Migration note: DCA's "never sells" shape makes its
-`HOLD`-vs-`NO_TRADE` mapping for non-buying ticks a genuine open question
-once it has accumulated holdings — see `../tasks.md` Phase 6.7. This
-strategy's migration should happen only after Phase 6.1's design decision
-(does never-sell remain correct) is resolved, since that decision affects
-whether `SELL`/`HOLD` are ever meaningful directions for it at all.
+**Pre-Phase-6 state:** returned `TradeSignal` directly, like every strategy
+before migration; no `StrategyProposal` concept.
+
+**Implemented (Phase 6.7):** `_strategy_dca` now builds a `StrategyProposal`
+per evaluation and routes it through the `StandaloneAdapter` (the executor
+still returns `TradeSignal`, exactly as the other five migrated strategies
+do — the proposal is the internal decision object, the adapter translates it
+into the unchanged `_execute_trade` pipeline).
+
+The open `HOLD`-vs-`NO_TRADE` question from the pre-migration note is
+**resolved by the 6.1 design decision**: a pure accumulator has no
+actively-managed open position, so a non-buying tick is `NO_TRADE` +
+`NO_ACTION`, never `HOLD`/`HOLD_POSITION`. Intent mapping:
+
+- **Scheduled buy, first ever (`order_count == 0`)** → `BUY` +
+  `OPEN_POSITION`.
+- **Scheduled buy, subsequent** → `BUY` + `ADD_TO_POSITION` (accumulation is
+  incremental).
+- **Every non-buying tick** — thesis invalidated (Category C), interval not
+  elapsed, budget exhausted (Category A), or the opt-in overlay pausing —
+  → `NO_TRADE` + `NO_ACTION`. The adapter returns `None` for these no-order
+  intents, so the original explicit hold reason is preserved unchanged.
+- DCA **never emits `SELL`** (never-sell), verified by a test sweeping every
+  branch.
+
+Other contract details:
+
+- **`validity.valid_until`** is tied to the **buy interval** (`generated_at +
+  interval_minutes*60`, floored at 1s for the zero-interval backtest config),
+  not a candle timeframe.
+- **Assumptions** are objective / falsifiable and execution/portfolio/thesis-
+  based — "long-term investment thesis remains valid", "buy clears the $10
+  minimum order size", "buy fits within available balance after fees" — with
+  a test asserting no directional word appears.
+- **`decision_score`**: DCA has no conviction score (6.3/6.5), but the frozen
+  contract requires the field, so — exactly as adaptive_grid does for its
+  non-scored branches — each proposal carries a single *descriptive*,
+  deterministic evidence item restating the schedule/thesis decision (weight
+  100, threshold 0). It introduces no scoring intelligence and never scales
+  sizing.
+- **`adaptive_parameters_used`** is empty (flat by design); **`expected_edge_
+  estimate`** is `None` (never self-computed).
+- **Behaviour preserved**: the buy is routed with `is_accumulation=True`, so
+  the execution outcome (action `buy`, amount = the flat chunk, market order,
+  accumulation flag) is identical to the pre-migration `TradeSignal` path — a
+  dedicated test asserts this. Proposal immutability and deterministic
+  `proposal_id` are tested; an expired-proposal test confirms discard.
+
+14 Pillar-10 tests in `backend/tests/test_dca_framework_migration.py` (53 in
+the file). Full suite 1282 passing, zero regressions; three pre-existing
+auto-mode DCA tests updated from the old `"DCA buy #N"` reason string to the
+mechanically-derived accumulation reason (execution outcome unchanged).

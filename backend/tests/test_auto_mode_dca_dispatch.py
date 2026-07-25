@@ -101,7 +101,10 @@ class TestAutoSelectsDca:
             f"Auto-selected DCA did not execute a real buy: {signal.reason}"
         )
         assert "Not intended" not in (signal.reason or "")
-        assert "DCA buy" in (signal.reason or "")
+        # Post-Phase-6.7 the DCA buy reason is mechanically derived from the
+        # StrategyProposal (adapter joins reasons_for), not the old "DCA buy #N"
+        # string. The stable content is the scheduled-accumulation evidence.
+        assert "accumulation" in (signal.reason or "").lower()
         # Diagnostics show the real selected sub-strategy, not the bot's
         # top-level "auto_mode" configuration.
         assert "[Auto:dca_accumulator|" in signal.reason
@@ -164,7 +167,7 @@ class TestEmergencyFallbackToDca:
         assert signal.action == "buy", (
             f"Emergency fallback to DCA did not produce a real buy: {signal.reason}"
         )
-        assert "DCA buy" in (signal.reason or "")
+        assert "accumulation" in (signal.reason or "").lower()
 
         state_after = engine._get_auto_state(bot.id)
         assert state_after["current_strategy"] == "dca_accumulator"
@@ -240,7 +243,7 @@ class TestStandaloneDcaUnchanged:
 
         assert signal is not None
         assert signal.action == "buy"
-        assert "DCA buy" in signal.reason
+        assert "accumulation" in signal.reason.lower()
 
     @pytest.mark.asyncio
     async def test_direct_unsupervised_call_on_auto_mode_bot_still_blocked(self):

@@ -518,7 +518,7 @@ fundamentally different strategy shape.
       execution-quality / portfolio / thesis checks, and explain the
       buy-amount branching logic (fixed vs. percent, capped, floored,
       portfolio-trimmed) rather than only the final `buy_amount` metric.
-- [ ] 6.7 Migrate this strategy's return type from `TradeSignal` to
+- [x] 6.7 Migrate this strategy's return type from `TradeSignal` to
       `StrategyProposal`. DCA never emits `SELL` (6.1 keeps never-sell), so
       `direction` is only ever `BUY` (scheduled buy) or a non-buying tick.
       A non-buying tick (schedule not due, or an execution/portfolio/thesis

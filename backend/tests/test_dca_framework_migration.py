@@ -28,6 +28,8 @@ from app.services.strategy_framework.edge_management import (
     DcaEdgeManager,
     EdgeCategory,
 )
+from app.services.strategy_framework.proposal import Direction, ExecutionIntent, StrategyProposal
+from app.services.strategy_framework.standalone_adapter import StandaloneAdapter
 from app.services.trading_engine import _BUY_BALANCE_FRACTION, MIN_ORDER_USD, TradingEngine
 
 
@@ -350,13 +352,25 @@ class TestDcaFlatSizing:
         sig = await engine._strategy_dca(bot, 50_000.0, {"amount_percent": 100}, AsyncMock())
         assert sig.amount <= 1_000.0 * _BUY_BALANCE_FRACTION + 1e-9
 
-    def test_strategy_source_has_no_decision_score_sizing(self):
-        """Structural guarantee: _strategy_dca contains no Decision-Score /
-        conviction-weighted sizing path at all."""
-        src = inspect.getsource(TradingEngine._strategy_dca)
-        lowered = src.lower()
-        assert "decision_score" not in lowered
-        assert "decisionscore" not in lowered
+    def test_strategy_source_has_no_score_weighted_sizing(self):
+        """Structural guarantee: _strategy_dca contains no Decision-Score- /
+        conviction-weighted SIZING path. (The proposal's decision_score field
+        exists per the frozen contract - 6.7 - but sizing must never be scaled
+        by it or by a conviction multiplier the way adaptive_grid's is.)"""
+        lowered = inspect.getsource(TradingEngine._strategy_dca).lower()
+        for anti in ("size_multiplier", "score_size", "* score", "score *",
+                     "* decision_score", "decision_score *", "* decision_score.total",
+                     "decision_score.total *"):
+            assert anti not in lowered, f"score-weighted sizing pattern found: {anti!r}"
+
+    @pytest.mark.asyncio
+    async def test_buy_amount_is_the_flat_chunk_not_score_scaled(self):
+        """The proposal's suggested_position_size (and the emitted buy amount) is
+        exactly the flat chunk, never scaled by the decision score."""
+        engine = _engine(regime_state="down")
+        bot = _bot(balance=1_000.0)
+        sig = await engine._strategy_dca(bot, 50_000.0, {"amount_percent": 10}, AsyncMock())
+        assert sig.amount == pytest.approx(100.0)  # 10% flat, not score-weighted
 
 
 # ---------------------------------------------------------------------------
@@ -425,3 +439,168 @@ class TestDcaSelfDiagnostics:
         checks = _checks_by_name(engine, bot.id)
         assert checks["Buy clears minimum order size"].passed is False
         assert engine._explain(bot.id).exp.state == "ACCUMULATION_PAUSED"
+
+
+# ---------------------------------------------------------------------------
+# 8. StrategyProposal interface (Pillar 10) — the return-type migration
+# ---------------------------------------------------------------------------
+
+from datetime import datetime, timedelta
+from dataclasses import FrozenInstanceError
+
+
+def _freeze(engine, dt):
+    engine.clock = SimpleNamespace(now=lambda: dt)
+
+
+def _capture(monkeypatch):
+    captured: list = []
+    real = StandaloneAdapter.to_trade_signal
+
+    def spy(proposal, **kw):
+        captured.append(proposal)
+        return real(proposal, **kw)
+
+    monkeypatch.setattr(StandaloneAdapter, "to_trade_signal", staticmethod(spy))
+    return captured
+
+
+async def _tick(engine, bot, params, monkeypatch, *, price=50_000.0):
+    captured = _capture(monkeypatch)
+    sig = await engine._strategy_dca(bot, price, params, AsyncMock())
+    return sig, (captured[-1] if captured else None)
+
+
+class TestDcaStrategyProposal:
+    @pytest.mark.asyncio
+    async def test_first_scheduled_buy_is_open_position(self, monkeypatch):
+        engine = _engine(regime_state="down")
+        engine._get_order_count = AsyncMock(return_value=0)
+        bot = _bot(balance=1_000.0)
+        sig, prop = await _tick(engine, bot, {"amount_percent": 10}, monkeypatch)
+        assert prop.direction is Direction.BUY
+        assert prop.execution_intent is ExecutionIntent.OPEN_POSITION
+        assert sig.action == "buy" and sig.is_accumulation is True
+
+    @pytest.mark.asyncio
+    async def test_subsequent_buy_is_add_to_position(self, monkeypatch):
+        engine = _engine(regime_state="down")
+        engine._get_order_count = AsyncMock(return_value=5)
+        bot = _bot(balance=1_000.0)
+        sig, prop = await _tick(engine, bot, {"amount_percent": 10}, monkeypatch)
+        assert prop.direction is Direction.BUY
+        assert prop.execution_intent is ExecutionIntent.ADD_TO_POSITION
+        assert sig.action == "buy"
+
+    @pytest.mark.asyncio
+    async def test_non_buying_tick_is_no_trade_no_action(self, monkeypatch):
+        fixed = datetime(2026, 1, 1, 12, 0, 0)
+        engine = _engine(regime_state="down")
+        _freeze(engine, fixed)
+        engine._get_last_order = AsyncMock(return_value=SimpleNamespace(created_at=fixed))
+        engine._get_order_count = AsyncMock(return_value=2)
+        bot = _bot(balance=1_000.0)
+        sig, prop = await _tick(engine, bot, {"interval_minutes": 60}, monkeypatch)
+        assert prop.direction is Direction.NO_TRADE
+        assert prop.execution_intent is ExecutionIntent.NO_ACTION
+        assert sig.action == "hold"
+
+    @pytest.mark.asyncio
+    async def test_thesis_halt_is_no_trade_no_action(self, monkeypatch):
+        engine = _engine(regime_state="up")
+        bot = _bot()
+        sig, prop = await _tick(engine, bot, {"thesis_invalidated": True}, monkeypatch)
+        assert prop.direction is Direction.NO_TRADE
+        assert prop.execution_intent is ExecutionIntent.NO_ACTION
+
+    @pytest.mark.asyncio
+    async def test_never_emits_sell(self, monkeypatch):
+        """DCA is never-sell: no proposal it can produce is a SELL."""
+        engine = _engine(regime_state="down")
+        seen = set()
+        for oc, bal, params in [
+            (0, 1_000.0, {}), (5, 1_000.0, {}), (0, 5.0, {}),
+            (0, 50.0, {}), (0, 1_000.0, {"thesis_invalidated": True}),
+        ]:
+            engine._get_order_count = AsyncMock(return_value=oc)
+            _, prop = await _tick(engine, _bot(balance=bal), params, monkeypatch)
+            seen.add(prop.direction)
+        assert Direction.SELL not in seen
+
+    @pytest.mark.asyncio
+    async def test_validity_tied_to_buy_interval(self, monkeypatch):
+        fixed = datetime(2026, 1, 1, 12, 0, 0)
+        engine = _engine(regime_state="down")
+        _freeze(engine, fixed)
+        bot = _bot(balance=1_000.0)
+        _, prop = await _tick(engine, bot, {"interval_minutes": 30}, monkeypatch)
+        assert prop.generated_at == fixed
+        assert prop.validity.valid_until == fixed + timedelta(minutes=30)
+
+    @pytest.mark.asyncio
+    async def test_expired_proposal_is_discarded(self, monkeypatch):
+        engine = _engine(regime_state="down")
+        bot = _bot(balance=1_000.0)
+        _, prop = await _tick(engine, bot, {"interval_minutes": 60}, monkeypatch)
+        assert prop.is_expired(prop.validity.valid_until + timedelta(seconds=1))
+        assert not prop.is_expired(prop.generated_at)
+
+    @pytest.mark.asyncio
+    async def test_proposal_deterministic_id(self, monkeypatch):
+        fixed = datetime(2026, 1, 1, 12, 0, 0)
+        ids = []
+        for _ in range(2):
+            engine = _engine(regime_state="down")
+            _freeze(engine, fixed)
+            engine._get_order_count = AsyncMock(return_value=0)
+            _, prop = await _tick(engine, _bot(balance=1_000.0), {"amount_percent": 10}, monkeypatch)
+            ids.append(prop.proposal_id)
+        assert ids[0] == ids[1] and ids[0] != ""
+
+    @pytest.mark.asyncio
+    async def test_proposal_is_immutable(self, monkeypatch):
+        engine = _engine(regime_state="down")
+        bot = _bot(balance=1_000.0)
+        _, prop = await _tick(engine, bot, {"amount_percent": 10}, monkeypatch)
+        with pytest.raises(FrozenInstanceError):
+            prop.direction = Direction.SELL  # type: ignore[misc]
+
+    @pytest.mark.asyncio
+    async def test_buy_assumptions_are_objective_not_directional(self, monkeypatch):
+        engine = _engine(regime_state="down")
+        bot = _bot(balance=1_000.0)
+        _, prop = await _tick(engine, bot, {"amount_percent": 10}, monkeypatch)
+        blob = " ".join(prop.assumptions).lower()
+        for directional in ("up", "down", "bull", "bear", "trend", "rise", "fall",
+                            "rally", "momentum", "oversold", "overbought", "dip"):
+            assert directional not in blob, f"directional word in assumptions: {directional!r}"
+        assert prop.assumptions  # non-empty
+
+    @pytest.mark.asyncio
+    async def test_expected_edge_estimate_is_none(self, monkeypatch):
+        engine = _engine(regime_state="down")
+        bot = _bot(balance=1_000.0)
+        _, prop = await _tick(engine, bot, {"amount_percent": 10}, monkeypatch)
+        assert prop.expected_edge_estimate is None
+
+    @pytest.mark.asyncio
+    async def test_buy_execution_outcome_behavior_identical(self, monkeypatch):
+        """The migration itself is a no-op on execution outcome: the adapter-
+        routed buy is action=buy, amount=flat chunk, market order, accumulation
+        flag set - exactly the pre-migration TradeSignal shape."""
+        engine = _engine(regime_state="down")
+        engine._get_order_count = AsyncMock(return_value=0)
+        bot = _bot(balance=1_000.0)
+        sig, prop = await _tick(engine, bot, {"amount_percent": 10}, monkeypatch)
+        assert sig.action == "buy"
+        assert sig.amount == pytest.approx(100.0)
+        assert sig.order_type == "market"
+        assert sig.is_accumulation is True
+        assert prop.suggested_position_size == pytest.approx(100.0)
+
+    @pytest.mark.asyncio
+    async def test_no_adaptive_parameters(self, monkeypatch):
+        engine = _engine(regime_state="down")
+        bot = _bot(balance=1_000.0)
+        _, prop = await _tick(engine, bot, {"amount_percent": 10}, monkeypatch)
+        assert dict(prop.adaptive_parameters_used) == {}

@@ -49,7 +49,7 @@ from .strategy_framework.explanation_persistence import (
     extract_edge_management_category,
     summarize_decision_explanation,
 )
-from .strategy_framework.market_suitability import MarketSuitabilityGate
+from .strategy_framework.market_suitability import MarketSuitabilityGate, MarketSuitabilityResult
 from .strategy_framework.decision_score import DecisionScoreEngine, EvidenceItem
 from .strategy_framework.adaptive_params import AdaptiveParameterResolver
 from .strategy_framework.trade_management import TradeManagementMonitor
@@ -1211,6 +1211,15 @@ class TradingEngine:
         MIN_ORDER_USD floor below - never re-implemented here, and never an
         increase or a directional adjustment.
 
+        PROPOSAL (Pillar 10, Phase 6.7): builds a StrategyProposal per tick and
+        routes it through the StandaloneAdapter (still returns TradeSignal). A
+        scheduled buy is BUY + OPEN_POSITION (first ever) or ADD_TO_POSITION
+        (subsequent); every non-buying tick is NO_TRADE + NO_ACTION (a pure
+        accumulator has no managed position, so HOLD_POSITION would misrepresent
+        it). DCA never emits SELL. validity is tied to the buy interval;
+        assumptions are objective execution/portfolio/thesis conditions, never a
+        direction forecast.
+
         Auto Mode may select this strategy (it is the designated fallback -
         see _get_strategy_capabilities): that is a SUPERVISED call, routed
         through _strategy_auto's own eligibility/regime/scoring gate, and is
@@ -1263,6 +1272,16 @@ class TradingEngine:
         regime_filter_enabled = params.get("regime_filter_enabled", False)
         allowed_regimes = params.get("allowed_regimes", ["trend_up", "trend_flat"])
 
+        now = self.clock.now()
+        # validity.valid_until is tied to the BUY INTERVAL (not a candle
+        # timeframe) - a proposal is meaningful until the next scheduled buy
+        # (Pillar 10, Phase 6.7). The validity window is floored at 1s so a
+        # zero-interval config (interval_minutes=0, used by backtests to buy
+        # every tick) still yields a strictly-positive validity the frozen
+        # ProposalValidity contract requires.
+        interval_seconds = interval_minutes * 60
+        _validity_interval_seconds = max(interval_seconds, 1)
+
         # === STRATEGY EDGE MANAGEMENT + SUITABILITY GATE (Pillars 7 & 2) ===
         # A classic DCA does NOT fail because the market falls - it fails ONLY
         # when its accumulation thesis is objectively invalidated. DcaEdgeManager
@@ -1285,7 +1304,7 @@ class TradingEngine:
             "portfolio_withdrawn": bool(params.get("portfolio_withdrawn", False)),
         }
         edge_status = self._dca_edge_manager.evaluate(
-            thesis_invalidation=thesis_conditions, now=self.clock.now(),
+            thesis_invalidation=thesis_conditions, now=now,
         )
         _edge_exp = self._explain(bot.id)
         _edge_exp.metric("edge_status_category", edge_status.category.value)
@@ -1294,16 +1313,82 @@ class TradingEngine:
             f"!= {EdgeCategory.C.value}", edge_status.category != EdgeCategory.C,
             detail=edge_status.reason,
         )
+
+        # DCA is direction-agnostic (Pillar 2 re-scoped in 6.3): regime is NOT a
+        # suitability input, so the default MarketSuitabilityResult is permissive
+        # (allowed=["all"]). The non-classic overlay below can replace it when an
+        # operator opts in. Every proposal still carries a real
+        # MarketSuitabilityResult (mirrors adaptive_grid's regime_filter_enabled
+        # =False -> allowed=["all"] convention).
+        suitability = MarketSuitabilityGate().evaluate({}, ["all"])
+
+        # === Proposal helpers (Pillar 10, Phase 6.7) ===
+        # DCA has no conviction/Decision Score (6.3/6.5). The frozen
+        # StrategyProposal contract nonetheless requires a decision_score field,
+        # so - exactly as adaptive_grid does for its non-scored branches - each
+        # proposal carries a single DESCRIPTIVE, deterministic evidence item that
+        # restates the schedule/thesis/operational decision DCA already made. It
+        # is NOT a price/conviction factor and introduces no scoring intelligence.
+        def _dca_proposal(
+            *, direction: "Direction", execution_intent: "ExecutionIntent",
+            evidence_name: str, evidence_value: float, evidence_reason: str,
+            suggested_position_size: Optional[float] = None, assumptions: tuple = (),
+            edge: Optional["EdgeStatus"] = None,
+            market_suitability: Optional["MarketSuitabilityResult"] = None,
+            expected_holding_horizon: Optional[str] = None,
+        ) -> StrategyProposal:
+            item = EvidenceItem(
+                name=evidence_name, measurement=lambda d: evidence_value,
+                normalization=lambda r: r, weight=100.0, reason=evidence_reason,
+            )
+            score = DecisionScoreEngine().score("dca_accumulator", [item], {}, threshold=0.0)
+            reasons_for, reasons_against = derive_reasons(score)
+            return StrategyProposal(
+                strategy_id="dca_accumulator", bot_id=bot.id, generated_at=now,
+                direction=direction, execution_intent=execution_intent,
+                validity=ProposalValidity(
+                    generated_at=now, valid_until=now + timedelta(seconds=_validity_interval_seconds),
+                ),
+                decision_score=score,
+                market_suitability=(market_suitability if market_suitability is not None else suitability),
+                edge_status=(edge if edge is not None else edge_status),
+                assumptions=assumptions, reasons_for=reasons_for, reasons_against=reasons_against,
+                suggested_position_size=suggested_position_size,
+                suggested_risk_budget_pct=(None if (amount_usd and amount_usd > 0) else amount_percent * 100.0),
+                expected_holding_horizon=expected_holding_horizon,
+                adaptive_parameters_used={},  # flat by design - DCA has no adaptive params
+                explanation=self._explain(bot.id).to_dict(),
+            )
+
+        def _no_trade(
+            evidence_name: str, evidence_reason: str, reason: str, *,
+            assumptions: tuple = (), edge: Optional["EdgeStatus"] = None,
+            market_suitability: Optional["MarketSuitabilityResult"] = None,
+        ) -> TradeSignal:
+            # A non-buying tick makes no ENTRY decision this interval -> NO_TRADE
+            # + NO_ACTION (a pure accumulator has no actively-managed position, so
+            # HOLD/HOLD_POSITION would misrepresent it - tasks.md 6.7). The adapter
+            # returns None for a no-order intent, so the explicit hold reason is
+            # preserved unchanged.
+            proposal = _dca_proposal(
+                direction=Direction.NO_TRADE, execution_intent=ExecutionIntent.NO_ACTION,
+                evidence_name=evidence_name, evidence_value=0.0, evidence_reason=evidence_reason,
+                assumptions=assumptions, edge=edge, market_suitability=market_suitability,
+            )
+            sig = StandaloneAdapter.to_trade_signal(proposal)
+            return sig if sig is not None else TradeSignal(action="hold", amount=0, reason=reason)
+
         if edge_status.should_stop:  # Category C - objective thesis invalidation
             logger.info(
                 f"Bot {bot.id}: DCA HALTED (Pillar 7 Category C) - {edge_status.reason}. "
                 f"Structural stop, not a price-direction signal; requires re-certification."
             )
             _edge_exp.state("THESIS_INVALIDATED").update({"current_price": current_price})
-            return TradeSignal(
-                action="hold",
-                amount=0,
-                reason=f"DCA: Halted - {edge_status.reason} (thesis invalidated, structural stop)",
+            return _no_trade(
+                "Accumulation thesis intact", f"thesis invalidated: {edge_status.reason}",
+                f"DCA: Halted - {edge_status.reason} (thesis invalidated, structural stop)",
+                assumptions=("Long-term investment thesis remains valid",),
+                edge=edge_status,
             )
 
         # === REGIME FILTER (NON-CLASSIC market-timing overlay, off by default) ===
@@ -1347,10 +1432,19 @@ class TradingEngine:
                     "Regime allows DCA", trend_regime_name,
                     f"in [{', '.join(allowed_regimes)}]", False,
                 )
-                return TradeSignal(
-                    action="hold",
-                    amount=0,
-                    reason=f"DCA: Paused (regime={trend_regime_name}, waiting for {allowed_regimes})"
+                # The overlay's regime block carries a real (non-permissive)
+                # MarketSuitabilityResult on this proposal so the opt-in pause is
+                # explainable; still NO_TRADE + NO_ACTION.
+                overlay_suitability = MarketSuitabilityResult(
+                    is_suitable=False, regime_tags=[trend_regime_name],
+                    allowed_regimes=list(allowed_regimes), matched_tags=[],
+                    reason=f"non-classic overlay: {trend_regime_name} not in {allowed_regimes}",
+                )
+                return _no_trade(
+                    "Regime allows DCA (non-classic overlay)",
+                    f"overlay paused buying in {trend_regime_name}",
+                    f"DCA: Paused (regime={trend_regime_name}, waiting for {allowed_regimes})",
+                    market_suitability=overlay_suitability,
                 )
 
         # Get order history for this bot
@@ -1359,8 +1453,6 @@ class TradingEngine:
 
         # === TIME-BASED INTERVAL LOGIC (hardened) ===
         # Ensures clock-stable behavior: one buy max per interval, no catch-up
-        interval_seconds = interval_minutes * 60
-        now = self.clock.now()
 
         if last_order:
             # Defensive: If last order timestamp is in the future, treat as no last order
@@ -1417,10 +1509,9 @@ class TradingEngine:
             if seconds_since_last < interval_seconds:
                 remaining_seconds = interval_seconds - seconds_since_last
                 next_buy_time = last_order.created_at + timedelta(seconds=interval_seconds)
-                return TradeSignal(
-                    action="hold",
-                    amount=0,
-                    reason=f"DCA: Next buy in {remaining_seconds/60:.1f} min (at {next_buy_time.strftime('%H:%M:%S')})"
+                return _no_trade(
+                    "Interval elapsed", "buy interval not yet elapsed - no entry decision this tick",
+                    f"DCA: Next buy in {remaining_seconds/60:.1f} min (at {next_buy_time.strftime('%H:%M:%S')})",
                 )
         elif not immediate_first_buy:
             # No orders yet but not immediate - check time since bot started
@@ -1430,10 +1521,9 @@ class TradingEngine:
                 if time_since_start.total_seconds() < interval_seconds:
                     remaining_seconds = interval_seconds - time_since_start.total_seconds()
                     first_buy_time = bot.started_at + timedelta(seconds=interval_seconds)
-                    return TradeSignal(
-                        action="hold",
-                        amount=0,
-                        reason=f"DCA: First buy in {remaining_seconds/60:.1f} min (at {first_buy_time.strftime('%H:%M:%S')})"
+                    return _no_trade(
+                        "Interval elapsed", "first-buy interval not yet elapsed - no entry decision this tick",
+                        f"DCA: First buy in {remaining_seconds/60:.1f} min (at {first_buy_time.strftime('%H:%M:%S')})",
                     )
             else:
                 # Edge case: bot.started_at is missing - allow immediate buy
@@ -1511,13 +1601,14 @@ class TradingEngine:
                     f"${bot.current_balance:.2f} balance", f">= ${MIN_ORDER_USD:.0f}", False,
                     detail="capital unavailable - accumulation paused (Category A, operational)",
                 )
-                return TradeSignal(
-                    action="hold",
-                    amount=0,
-                    reason=(
+                return _no_trade(
+                    "Buy clears minimum order size",
+                    "capital unavailable this cycle - accumulation paused (operational)",
+                    (
                         f"DCA: balance ${bot.current_balance:.2f} below "
                         f"${MIN_ORDER_USD:.0f} minimum order (accumulation complete)"
                     ),
+                    edge=_a_edge,
                 )
 
         # Defensive: Cap at fee-adjusted balance ceiling so cost + fee cannot
@@ -1555,12 +1646,36 @@ class TradingEngine:
                     else f"flat {_sizing_basis} chunk within budget"),
         )
 
-        return TradeSignal(
-            action="buy",
-            amount=buy_amount,
-            order_type="market",
-            reason=f"DCA buy #{order_count + 1}: ${buy_amount:.2f} @ ${current_price:.2f}",
-            is_accumulation=True,
+        # Pillar 10 (Phase 6.7): a due, ungated buy is an accumulation deployment.
+        # The FIRST buy opens the position (OPEN_POSITION); every subsequent buy
+        # adds to it (ADD_TO_POSITION) - DCA never emits SELL (never-sell). The
+        # assumptions are objective/falsifiable and execution/portfolio/thesis-
+        # based (never a direction forecast). Routed through the Standalone
+        # Adapter with is_accumulation=True so the execution outcome (action,
+        # amount, accumulation flag, market order type) is identical to the
+        # pre-migration TradeSignal path.
+        _buy_intent = (
+            ExecutionIntent.OPEN_POSITION if order_count == 0
+            else ExecutionIntent.ADD_TO_POSITION
+        )
+        buy_proposal = _dca_proposal(
+            direction=Direction.BUY, execution_intent=_buy_intent,
+            evidence_name="Scheduled accumulation due", evidence_value=1.0,
+            evidence_reason=(
+                "buy interval elapsed and long-term thesis valid - deploy the "
+                "scheduled fixed chunk (direction-agnostic)"
+            ),
+            suggested_position_size=buy_amount,
+            assumptions=(
+                "Long-term investment thesis remains valid",
+                f"Buy clears the ${MIN_ORDER_USD:.0f} minimum order size",
+                "Buy fits within available balance after fees",
+            ),
+            expected_holding_horizon="indefinite",
+        )
+        sig = StandaloneAdapter.to_trade_signal(buy_proposal, is_accumulation=True)
+        return sig if sig is not None else TradeSignal(
+            action="hold", amount=0, reason="DCA: adapter produced no order",
         )
 
     async def _strategy_grid(
