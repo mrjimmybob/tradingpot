@@ -512,7 +512,7 @@ fundamentally different strategy shape.
       with the one permitted modulation being a **portfolio-cap trim**
       (never an increase, never direction-driven). Verify sizing still
       respects the `PortfolioRiskService` exposure cap.
-- [ ] 6.6 Close Pillar 8 gaps: add a positive `.check()` when the new
+- [x] 6.6 Close Pillar 8 gaps: add a positive `.check()` when the new
       execution/portfolio/thesis suitability gate PASSES (today only the
       old regime failure path is explained), surface the individual
       execution-quality / portfolio / thesis checks, and explain the

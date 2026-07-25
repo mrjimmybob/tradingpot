@@ -357,3 +357,71 @@ class TestDcaFlatSizing:
         lowered = src.lower()
         assert "decision_score" not in lowered
         assert "decisionscore" not in lowered
+
+
+# ---------------------------------------------------------------------------
+# 7. Self-Diagnostics (Pillar 8) — suitability pass + buy-amount branching
+# ---------------------------------------------------------------------------
+
+def _checks_by_name(engine, bot_id):
+    return {c.name: c for c in engine._explain(bot_id).exp.checks}
+
+
+class TestDcaSelfDiagnostics:
+    """Every decision point is explained: a passing suitability gate (not only
+    failures), the sizing basis, and the buy-amount branching (floored/capped)
+    with its execution-feasibility checks."""
+
+    @pytest.mark.asyncio
+    async def test_passing_suitability_is_explained_on_a_buy(self):
+        engine = _engine(regime_state="down")
+        bot = _bot(balance=1_000.0)
+        sig = await engine._strategy_dca(bot, 50_000.0, {"amount_percent": 10}, AsyncMock())
+        assert sig.action == "buy"
+        checks = _checks_by_name(engine, bot.id)
+        # Positive thesis (suitability) check, not just the failure path.
+        assert checks["Accumulation thesis intact"].passed is True
+        # Execution-feasibility checks surfaced at buy time.
+        assert checks["Buy clears minimum order size"].passed is True
+        assert checks["Buy within fee-adjusted budget"].passed is True
+
+    @pytest.mark.asyncio
+    async def test_buy_amount_branching_metrics_flat(self):
+        engine = _engine(regime_state="down")
+        bot = _bot(balance=1_000.0)
+        await engine._strategy_dca(bot, 50_000.0, {"amount_percent": 10}, AsyncMock())
+        m = engine._explain(bot.id).exp.metrics
+        assert m["sizing_basis"] == "percent"
+        assert m["chunk_raw"] == pytest.approx(100.0)
+        assert m["sizing_floored"] is False
+        assert m["sizing_capped"] is False
+        assert m["buy_amount"] == pytest.approx(100.0)
+        assert engine._explain(bot.id).exp.state == "BUYING"
+
+    @pytest.mark.asyncio
+    async def test_buy_amount_branching_explains_floor(self):
+        # $5 chunk floored to $10 - the branch must be visible, not just the number.
+        engine = _engine(regime_state="down")
+        bot = _bot(balance=50.0)
+        await engine._strategy_dca(bot, 50_000.0, {"amount_percent": 10}, AsyncMock())
+        m = engine._explain(bot.id).exp.metrics
+        assert m["sizing_floored"] is True
+        assert m["chunk_raw"] == pytest.approx(5.0)
+        assert m["buy_amount"] == pytest.approx(MIN_ORDER_USD)
+
+    @pytest.mark.asyncio
+    async def test_fixed_usd_basis_surfaced(self):
+        engine = _engine(regime_state="down")
+        bot = _bot(balance=1_000.0)
+        await engine._strategy_dca(bot, 50_000.0, {"amount_usd": 200}, AsyncMock())
+        assert engine._explain(bot.id).exp.metrics["sizing_basis"] == "fixed_usd"
+
+    @pytest.mark.asyncio
+    async def test_budget_exhaustion_explains_failed_min_order_check(self):
+        engine = _engine(regime_state="down")
+        bot = _bot(balance=MIN_ORDER_USD - 1.0)
+        sig = await engine._strategy_dca(bot, 50_000.0, {}, AsyncMock())
+        assert sig.action == "hold"
+        checks = _checks_by_name(engine, bot.id)
+        assert checks["Buy clears minimum order size"].passed is False
+        assert engine._explain(bot.id).exp.state == "ACCUMULATION_PAUSED"

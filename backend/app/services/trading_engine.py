@@ -1453,12 +1453,18 @@ class TradingEngine:
         # full balance) so the simulated fee (cost * 0.1 %) + bid/ask spread
         # cannot push the total deduction over available funds.
         max_buy = bot.current_balance * _BUY_BALANCE_FRACTION
+        # Track the sizing branch taken so Pillar 8 can explain HOW the amount
+        # was reached, not just the final number (Phase 6.6).
+        _sizing_basis = "fixed_usd" if (amount_usd and amount_usd > 0) else "percent"
         if amount_usd and amount_usd > 0:
             # Use fixed USD amount
             buy_amount = min(amount_usd, max_buy)
         else:
             # Use percentage of current balance
             buy_amount = bot.current_balance * amount_percent
+        _chunk_raw = buy_amount  # pre-floor/cap chunk, for diagnostics
+        _sizing_floored = False
+        _sizing_capped = False
 
         # === MINIMUM ORDER FLOOR (executable, shared $10 minimum) ===
         # A DCA buy must clear the same MIN_ORDER_USD the execution layer enforces
@@ -1473,6 +1479,7 @@ class TradingEngine:
                 # configured chunk is below the executable minimum, so adapt it
                 # up to MIN_ORDER_USD. Operational, not directional.
                 buy_amount = MIN_ORDER_USD
+                _sizing_floored = True
                 _b_edge = self._dca_edge_manager.evaluate(
                     operational_adaptation=(
                         f"chunk floored to ${MIN_ORDER_USD:.0f} executable minimum"
@@ -1495,7 +1502,15 @@ class TradingEngine:
                     f"Bot {bot.id}: DCA infinite accumulation complete - "
                     f"Balance ${bot.current_balance:.2f} < ${MIN_ORDER_USD:.0f} minimum order"
                 )
-                self._explain(bot.id).metric("edge_status_category", _a_edge.category.value)
+                self._explain(bot.id).state("ACCUMULATION_PAUSED").update({
+                    "edge_status_category": _a_edge.category.value,
+                    "sizing_basis": _sizing_basis,
+                    "chunk_raw": round(_chunk_raw, 2),
+                }).check(
+                    "Buy clears minimum order size",
+                    f"${bot.current_balance:.2f} balance", f">= ${MIN_ORDER_USD:.0f}", False,
+                    detail="capital unavailable - accumulation paused (Category A, operational)",
+                )
                 return TradeSignal(
                     action="hold",
                     amount=0,
@@ -1509,6 +1524,7 @@ class TradingEngine:
         # exceed available funds regardless of the amount_percent path above.
         if buy_amount > max_buy:
             buy_amount = max_buy
+            _sizing_capped = True
 
         # === EXECUTE BUY (infinite accumulation continues) ===
         logger.info(
@@ -1518,7 +1534,26 @@ class TradingEngine:
             f"Balance: ${bot.current_balance:.2f} → ${bot.current_balance - buy_amount:.2f}"
         )
 
-        self._explain(bot.id).metric("buy_amount", buy_amount)
+        # Pillar 8 (Phase 6.6): explain the buy-amount branching, not just the
+        # final number - which sizing basis, the raw chunk, whether it was
+        # floored to the minimum or capped to the fee-adjusted budget, and the
+        # two execution-feasibility gates the buy clears.
+        self._explain(bot.id).state("BUYING").update({
+            "sizing_basis": _sizing_basis,
+            "chunk_raw": round(_chunk_raw, 2),
+            "sizing_floored": _sizing_floored,
+            "sizing_capped": _sizing_capped,
+            "buy_amount": round(buy_amount, 2),
+        }).check(
+            "Buy clears minimum order size", round(buy_amount, 2),
+            f">= ${MIN_ORDER_USD:.0f}", buy_amount >= MIN_ORDER_USD,
+            detail=("floored up to minimum" if _sizing_floored else "chunk above minimum"),
+        ).check(
+            "Buy within fee-adjusted budget", round(buy_amount, 2),
+            f"<= ${max_buy:.2f}", buy_amount <= max_buy + 1e-9,
+            detail=("capped to fee-adjusted budget" if _sizing_capped
+                    else f"flat {_sizing_basis} chunk within budget"),
+        )
 
         return TradeSignal(
             action="buy",

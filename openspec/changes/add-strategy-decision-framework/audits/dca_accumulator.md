@@ -385,13 +385,41 @@ guarantee, the no-price/performance-input signature test, and integration
 tests proving a down-regime drawdown stays NONE while each thesis condition
 halts with Category C). Full suite 1257 passing, zero regressions.
 
-## Pillar 8 — Self-Diagnostics: Partial
+## Pillar 8 — Self-Diagnostics: Full (Phase 6.6)
 
-Regime-block state explained (1204-1210) and interval timer state every
-tick (1240-1271). Gap: no positive `check()` when the regime check
-*passes* (only the failure path is explained); the buy-amount branching
-(fixed vs. percent, capped, floored) surfaces only a single `buy_amount`
-metric (1355), not the branch logic itself.
+**Pre-Phase-6 state:** regime-block state and interval-timer state were
+explained, but only the *failure* paths were — there was no positive
+`check()` when the gate passed, and the buy-amount branching (fixed vs.
+percent, capped, floored) surfaced only a single `buy_amount` metric, not the
+branch logic.
+
+**Implemented (Phases 6.3–6.6):** every decision point now has a `.check()`/
+`.metric()`, passing paths included:
+
+- **Suitability / thesis (Pillars 2/7)**: the `"Accumulation thesis intact"`
+  check is emitted on *every* tick — passing when the thesis is valid, not
+  only on a Category-C halt — alongside the `edge_status_category` metric
+  (6.4). The optional non-classic overlay still explains its `WAITING_REGIME`
+  pause when opted in.
+- **Schedule (Pillar 2)**: the `"Interval elapsed"` check and interval-timer
+  metrics every tick, with `INTERVAL_DUE` / `WAITING_INTERVAL` state.
+- **Buy-amount branching (Pillar 8's specific gap, closed in 6.6)**: the buy
+  path now records `sizing_basis` (fixed_usd vs percent), `chunk_raw` (the
+  pre-floor/cap chunk), `sizing_floored`, `sizing_capped`, and the final
+  `buy_amount`, plus two execution-feasibility checks — `"Buy clears minimum
+  order size"` and `"Buy within fee-adjusted budget"` — with a `BUYING`
+  state. The two operational branches are explained too: the chunk-floor
+  (Category B) records the adaptation, and the budget-exhaustion (Category A)
+  emits a *failed* `"Buy clears minimum order size"` check with an
+  `ACCUMULATION_PAUSED` state.
+
+Portfolio-cap adjustments are intentionally *not* re-explained here — they
+happen in the execution pipeline (Pillar 5 / 6.5), which has its own
+diagnostics, keeping the strategy's single source of truth. 5 diagnostics
+tests in `backend/tests/test_dca_framework_migration.py` (passing-suitability
+explained on a buy, flat/floored/fixed-USD branching metrics, and the failed
+min-order check on budget exhaustion). Full suite 1268 passing, zero
+regressions.
 
 ## Pillar 9 — Performance Expectations: DOCUMENTED (Phase 6)
 
