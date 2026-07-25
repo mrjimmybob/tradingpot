@@ -18,7 +18,13 @@ from .execution import execute_committee_decision
 from .flag import is_committee_enabled
 from .portfolio import PortfolioConstraints, resolve_portfolio_constraints
 from .process import run_committee
-from .trust import TrustAdjustment
+from .ranking import NEUTRAL_RANKING_POLICY, NeutralRankingPolicy, RankingAdjustmentPolicy
+from .trust import (
+    NeutralTrustProvider,
+    TrustAdjustment,
+    TrustProvider,
+    resolve_trust_adjustments,
+)
 
 __all__ = [
     "ComparisonView",
@@ -27,6 +33,12 @@ __all__ = [
     "RejectedProposal",
     "SelectedAllocation",
     "TrustAdjustment",
+    "TrustProvider",
+    "NeutralTrustProvider",
+    "resolve_trust_adjustments",
+    "RankingAdjustmentPolicy",
+    "NeutralRankingPolicy",
+    "NEUTRAL_RANKING_POLICY",
     "PortfolioConstraints",
     "resolve_portfolio_constraints",
     "run_committee",

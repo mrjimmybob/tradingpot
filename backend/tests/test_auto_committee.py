@@ -619,3 +619,153 @@ class TestCommitteeFeatureFlag:
         monkeypatch.setenv("AUTO_COMMITTEE_ENABLED", "1")
         bot = SimpleNamespace(strategy_params={"auto_committee_enabled": False})
         assert is_committee_enabled(bot) is False
+
+
+# ---------------------------------------------------------------------------
+# Phase 3 — External Trust Layer (step 6): infrastructure only
+# ---------------------------------------------------------------------------
+
+import inspect as _inspect
+
+from app.services.auto_committee import (
+    NEUTRAL_RANKING_POLICY,
+    NeutralTrustProvider,
+    resolve_trust_adjustments,
+)
+from app.services.auto_committee import process as _process_mod
+
+
+class _MultiplierTestPolicy:
+    """TEST-ONLY ranking-adjustment policy demonstrating the seam. It is NOT
+    shipped and embeds no production math — it scales the base primary
+    component by the product of a proposal's trust adjustments, purely to prove
+    the committee consumes an effective value the policy supplies."""
+
+    def effective_ranking_value(self, base_value, adjustments):
+        mult = 1.0
+        for ta in adjustments:
+            mult *= ta.adjustment
+        return (base_value[0] * mult,) + tuple(base_value[1:])
+
+
+class _StubProvider:
+    def __init__(self, adjustments):
+        self._adj = tuple(adjustments)
+
+    async def get_adjustments(self, proposal_ids):
+        return self._adj
+
+
+class TestTrustProviderAndResolver:
+    @pytest.mark.asyncio
+    async def test_neutral_provider_returns_nothing(self):
+        assert await NeutralTrustProvider().get_adjustments(["a", "b"]) == ()
+
+    @pytest.mark.asyncio
+    async def test_resolver_default_is_empty(self):
+        assert await resolve_trust_adjustments([_proposal()]) == ()
+
+    @pytest.mark.asyncio
+    async def test_resolver_uses_a_mocked_provider(self):
+        p = _proposal()
+        ta = TrustAdjustment(p.proposal_id, "fear_greed", 1.5, _GEN)
+        out = await resolve_trust_adjustments([p], provider=_StubProvider([ta]))
+        assert out == (ta,)
+
+
+class TestNeutralIsBehaviourIdenticalToPhase2:
+    def test_production_default_has_no_trust_effect(self):
+        # Default run: no trust source, neutral policy -> empty applied list and
+        # base-order ranking (identical to Phase 2).
+        batch = [_proposal(strategy_id="a", total=90.0),
+                 _proposal(strategy_id="b", total=40.0)]
+        d = run_committee(batch, now=_NOW)
+        assert d.trust_adjustments_applied == ()
+        assert _ranked_scores(d, batch) == [90.0, 40.0]
+
+    def test_neutral_policy_ignores_supplied_adjustments(self):
+        # Even if adjustments are supplied, the shipped neutral policy leaves
+        # ranking and allocation unchanged versus supplying none.
+        hi = _proposal(strategy_id="hi", total=90.0)
+        lo = _proposal(strategy_id="lo", total=40.0)
+        boost_lo = TrustAdjustment(lo.proposal_id, "fear_greed", 100.0, _GEN)
+        d_none = run_committee([hi, lo], now=_NOW)
+        d_adj = run_committee([hi, lo], now=_NOW, trust_adjustments=[boost_lo])  # neutral policy
+        assert d_none.ranking_snapshot == d_adj.ranking_snapshot
+        assert d_none.selected == d_adj.selected
+
+
+class TestTrustConsumptionViaPolicySeam:
+    def test_mock_policy_measurably_changes_ranking(self):
+        hi = _proposal(strategy_id="hi", total=90.0)
+        lo = _proposal(strategy_id="lo", total=40.0)
+        boost_lo = TrustAdjustment(lo.proposal_id, "fear_greed", 10.0, _GEN)  # 40*10=400 > 90
+        base = run_committee([hi, lo], now=_NOW)
+        trusted = run_committee([hi, lo], now=_NOW,
+                                trust_adjustments=[boost_lo], ranking_policy=_MultiplierTestPolicy())
+        assert base.ranking_snapshot[0] == hi.proposal_id          # base: hi first
+        assert trusted.ranking_snapshot[0] == lo.proposal_id       # trust promotes lo
+
+    def test_trust_adjustments_applied_lists_consulted(self):
+        hi = _proposal(strategy_id="hi", total=90.0)
+        lo = _proposal(strategy_id="lo", total=40.0)
+        ta = TrustAdjustment(lo.proposal_id, "fear_greed", 10.0, _GEN)
+        d = run_committee([hi, lo], now=_NOW,
+                          trust_adjustments=[ta], ranking_policy=_MultiplierTestPolicy())
+        assert d.trust_adjustments_applied == (f"fear_greed:{lo.proposal_id}",)
+
+    def test_adjustment_for_a_rejected_proposal_is_not_consulted(self):
+        alive = _proposal(strategy_id="alive", total=60.0)
+        dead = _proposal(strategy_id="dead", edge_cat=EdgeCategory.C)  # rejected at step 4
+        ta = TrustAdjustment(dead.proposal_id, "fear_greed", 5.0, _GEN)
+        d = run_committee([alive, dead], now=_NOW,
+                          trust_adjustments=[ta], ranking_policy=_MultiplierTestPolicy())
+        assert d.trust_adjustments_applied == ()  # dead didn't survive to step 6
+
+    def test_effective_value_drives_allocation_grouping(self):
+        # Two base-tied buys under a limited budget: a trust boost on one makes
+        # it out-rank the other, so it is funded first (proving step 8 groups by
+        # the effective value, not the base key).
+        x = _proposal(strategy_id="x", total=50.0, size=800.0)
+        y = _proposal(strategy_id="y", total=50.0, size=800.0)
+        boost_y = TrustAdjustment(y.proposal_id, "fear_greed", 2.0, _GEN)
+        d = run_committee([x, y], now=_NOW,
+                          portfolio=PortfolioConstraints(exposure_headroom_usd=800.0, min_order_usd=10.0),
+                          trust_adjustments=[boost_y], ranking_policy=_MultiplierTestPolicy())
+        alloc = {s.proposal_id: s.allocated_size for s in d.selected}
+        assert alloc.get(y.proposal_id) == 800.0                    # trusted y funded first
+        assert _rejected_by_step(d).get(x.proposal_id) == "portfolio_risk"
+
+
+class TestTrustCertificationProperties:
+    def test_trust_never_mutates_a_proposal(self):
+        hi = _proposal(strategy_id="hi", total=90.0)
+        lo = _proposal(strategy_id="lo", total=40.0)
+        ta = TrustAdjustment(lo.proposal_id, "fear_greed", 10.0, _GEN)
+        before = [read_comparison(p) for p in (hi, lo)]
+        run_committee([hi, lo], now=_NOW, trust_adjustments=[ta],
+                      ranking_policy=_MultiplierTestPolicy())
+        after = [read_comparison(p) for p in (hi, lo)]
+        assert before == after
+
+    def test_deterministic_with_trust(self):
+        hi = _proposal(strategy_id="hi", total=90.0)
+        lo = _proposal(strategy_id="lo", total=40.0)
+        ta = TrustAdjustment(lo.proposal_id, "fear_greed", 10.0, _GEN)
+        snaps = {
+            tuple(run_committee([hi, lo], now=_NOW, trust_adjustments=[ta],
+                                ranking_policy=_MultiplierTestPolicy()).ranking_snapshot)
+            for _ in range(20)
+        }
+        assert len(snaps) == 1
+
+    def test_neutral_policy_returns_base_unchanged(self):
+        base = (90.0, 0.0, 0.0, 1.0)
+        ta = TrustAdjustment("p", "fear_greed", 999.0, _GEN)
+        assert NEUTRAL_RANKING_POLICY.effective_ranking_value(base, [ta]) == base
+
+    def test_committee_embeds_no_trust_mathematics(self):
+        # The orchestrator must never read the numeric `.adjustment` — the math
+        # lives only behind the ranking_policy seam, not in the committee.
+        src = _inspect.getsource(_process_mod)
+        assert ".adjustment" not in src

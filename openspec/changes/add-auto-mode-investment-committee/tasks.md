@@ -4,7 +4,7 @@
 architecture-only; implementation was gated on separate approval. That
 approval has been given, and implementation now proceeds against this
 already-agreed task breakdown (the same pattern `add-strategy-decision-
-framework` used). **Phases 0-2 complete.** Phase 0 (Committee Core):
+framework` used). **Phases 0-3 complete.** Phase 0 (Committee Core):
 `backend/app/services/auto_committee/` (`comparison.py`, `decision.py`,
 `trust.py`, `process.py`). Phase 1 (Portfolio Risk Wiring): `portfolio.py`
 resolves the cycle's constraints via the unchanged `PortfolioRiskService`/
@@ -18,10 +18,18 @@ Adapter's exact translation (amount scaled to `allocated_size`); `flag.py`
 (`is_committee_enabled`) gates it, OFF by default, coexisting with the
 Standalone path. The required regression proves a single Alpha strategy through
 Auto is byte-identical to the Standalone Adapter path (same bot/exchange/price/
-session and field-identical `TradeSignal`). 50 tests; full suite 1332 passing,
-zero regressions. Depends on `add-strategy-decision-framework`'s Phases 0-6
-(all complete), which produce the real `StrategyProposal` objects Auto
-consumes.
+session and field-identical `TradeSignal`). Phase 3 (External Trust Layer,
+step 6): infrastructure only — `trust.py` adds a `TrustProvider` interface, a
+`NeutralTrustProvider` (default: yields nothing), and an async
+`resolve_trust_adjustments` resolver; `ranking.py` adds a
+`RankingAdjustmentPolicy` seam with the single shipped `NeutralRankingPolicy`
+(returns the base ranking value unchanged). The committee consumes an effective
+ranking value the policy supplies and embeds NO trust mathematics (a test
+asserts the orchestrator never reads `TrustAdjustment.adjustment`); production
+default is behaviour-identical to Phase 2. No external sources, no learning, no
+calibration. 63 tests; full suite 1345 passing, zero regressions. Depends on
+`add-strategy-decision-framework`'s Phases 0-6 (all complete), which produce the
+real `StrategyProposal` objects Auto consumes.
 
 This checklist also depends on `add-strategy-decision-framework`'s
 Phase 0-6 strategy implementation having produced real `StrategyProposal`
@@ -165,12 +173,12 @@ coexisting with the Standalone Adapter rather than replacing it outright.
 
 ## Phase 3 — External Trust Layer (step 6) — deferred, no source implementations here
 
-- [ ] 3.1 Wire step 6 to consult any persisted `TrustAdjustment` records
+- [x] 3.1 Wire step 6 to consult any persisted `TrustAdjustment` records
       for proposals surviving steps 2-5, applying `adjustment` only within
       ranking (step 7) - no proposal field is touched. If no
       `TrustAdjustment` records exist yet (expected at this phase), step 6
       is a no-op and ranking proceeds unaffected.
-- [ ] 3.2 Tests: a synthetic `TrustAdjustment` measurably changes ranking
+- [x] 3.2 Tests: a synthetic `TrustAdjustment` measurably changes ranking
       order versus the same proposal batch with no adjustment applied,
       and `CommitteeDecision.trust_adjustments_applied` correctly lists
       every consulted adjustment.

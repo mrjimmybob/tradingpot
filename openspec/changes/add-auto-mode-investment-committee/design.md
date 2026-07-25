@@ -654,6 +654,29 @@ confirms:
     isolated in `resolve_portfolio_constraints`, keeping the ten-step process
     a pure, deterministic function.
 
+- Decision (Phase 3 implementation): the committee embeds NO trust
+  mathematics. How a `TrustAdjustment` modifies ranking (a Decision-Score
+  multiplier, an additive delta, a regime-conditioned weighting, anything
+  else) is a calibration problem for a future change, not part of this
+  architecture. Phase 3 implements infrastructure only: a `TrustProvider`
+  interface (default `NeutralTrustProvider`, which yields nothing), an async
+  `resolve_trust_adjustments` resolver (keeping `run_committee` a pure
+  function), and a `RankingAdjustmentPolicy` seam. At step 7 the committee
+  hands the policy its base Comparison-Contract ranking value plus a
+  proposal's trust adjustments and orders by the EFFECTIVE VALUE the policy
+  returns — it never computes the adjustment itself (a test asserts the
+  orchestrator never reads `TrustAdjustment.adjustment`). The single shipped
+  policy, `NeutralRankingPolicy`, returns the base value unchanged, so the
+  production default is behaviour-identical to Phase 2. A future change can
+  supply real `TrustAdjustment` sources and a non-neutral policy to alter
+  ranking WITHOUT modifying the committee orchestrator, the Committee Process
+  steps, or the `StrategyProposal` / `CommitteeDecision` contracts.
+  - Why: this keeps the External Trust Layer's mechanism frozen while leaving
+    its mathematics open (the same "freeze the shape, calibrate later" split
+    the design applies elsewhere). Encoding any specific formula now would bake
+    an uncalibrated ranking model into the architecture; the policy seam lets
+    the model change without an architectural change.
+
 ## Risks / Trade-offs
 
 - A fixed ten-step order (see Decisions) means adding a genuinely new

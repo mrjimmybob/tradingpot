@@ -21,6 +21,7 @@ from app.services.strategy_framework.proposal import ExecutionIntent, StrategyPr
 from .comparison import ComparisonView, read_comparison
 from .decision import CommitteeDecision, RejectedProposal, SelectedAllocation
 from .portfolio import BUY_INTENTS, PortfolioConstraints
+from .ranking import NEUTRAL_RANKING_POLICY, RankingAdjustmentPolicy
 from .trust import TrustAdjustment
 
 # execution_intent values that produce a real order (mirrors the Standalone
@@ -67,15 +68,23 @@ def run_committee(
     now: datetime,
     portfolio: Optional[PortfolioConstraints] = None,
     trust_adjustments: Optional[Sequence[TrustAdjustment]] = None,
+    ranking_policy: RankingAdjustmentPolicy = NEUTRAL_RANKING_POLICY,
 ) -> CommitteeDecision:
     """Run the full ten-step Committee Process over one batch of (Alpha)
     proposals and produce an immutable `CommitteeDecision`.
 
-    Pure and deterministic: given the same proposals, `now`, and `portfolio`
-    constraints, it always produces the same decision — the async, stateful
-    portfolio-service calls are resolved beforehand into `portfolio` (see
-    `portfolio.resolve_portfolio_constraints`). `portfolio=None` means no
-    constraints (unconstrained), used by Phase 0 pure-logic tests.
+    Pure and deterministic: given the same proposals, `now`, `portfolio`
+    constraints, `trust_adjustments`, and `ranking_policy`, it always produces
+    the same decision — the async, stateful portfolio/trust source calls are
+    resolved beforehand (see `portfolio.resolve_portfolio_constraints` and
+    `trust.resolve_trust_adjustments`). `portfolio=None` means no constraints.
+
+    Trust (step 6) is consumed via `ranking_policy` (default
+    `NEUTRAL_RANKING_POLICY`): the committee hands the policy its base ranking
+    value plus a proposal's trust adjustments and orders by the effective value
+    the policy returns — it never embeds the trust mathematics itself. The
+    neutral policy ignores adjustments, so with no trust source the outcome is
+    behaviour-identical to Phase 2.
 
     `proposals` is assumed already filtered to Alpha strategies (Allocation
     strategies never enter the committee — see design.md "Strategy
@@ -164,18 +173,30 @@ def run_committee(
         kept.append(pid)
     survivors = kept
 
-    # Step 6 — apply external trust adjustments (injected; empty by default).
-    # Phase 0 records which adjustments reference surviving proposals for audit;
-    # their effect on ranking is wired in Phase 3.
+    # Step 6 — consult external trust adjustments. Gather the adjustments
+    # referencing each surviving proposal and record them for audit. The neutral
+    # provider yields none in production; a future source plugs in HERE, still
+    # only via `ranking_policy` at step 7. No proposal field is touched.
     survivor_set = set(survivors)
-    trust_applied = [
-        f"{ta.source}:{ta.proposal_id}" for ta in trust_adjustments
-        if ta.proposal_id in survivor_set
-    ]
+    adjustments_for: Dict[str, List[TrustAdjustment]] = {}
+    trust_applied: List[str] = []
+    for ta in trust_adjustments:
+        if ta.proposal_id in survivor_set:
+            adjustments_for.setdefault(ta.proposal_id, []).append(ta)
+            trust_applied.append(f"{ta.source}:{ta.proposal_id}")
 
-    # Step 7 — rank (Comparison Contract values only; stable sort keeps exact
-    # ties in input order, which is reproducible and identity-blind).
-    ranked = sorted(survivors, key=lambda pid: rank_key(views[pid]), reverse=True)
+    # Step 7 — rank by the EFFECTIVE ranking value the ranking_policy returns
+    # from (base Comparison-Contract key, this proposal's trust adjustments).
+    # The committee embeds no trust mathematics; the neutral policy returns the
+    # base key unchanged (identical to Phase 2). Stable sort keeps exact ties in
+    # input order (reproducible, identity-blind). The same effective value is
+    # reused for tie-grouping at allocation, so trust and allocation stay
+    # consistent.
+    effective: Dict[str, object] = {
+        pid: ranking_policy.effective_ranking_value(rank_key(views[pid]), adjustments_for.get(pid, ()))
+        for pid in survivors
+    }
+    ranked = sorted(survivors, key=lambda pid: effective[pid], reverse=True)
     ranking_snapshot = list(ranked)
 
     # Step 8 — allocate capital across the COMPLETE committee decision. The
@@ -192,8 +213,8 @@ def run_committee(
     idx = 0
     while idx < len(ranked):
         end = idx
-        key = rank_key(views[ranked[idx]])
-        while end < len(ranked) and rank_key(views[ranked[end]]) == key:
+        key = effective[ranked[idx]]
+        while end < len(ranked) and effective[ranked[end]] == key:
             end += 1
         group = ranked[idx:end]
         # Non-buy actionable orders (sells/closes) do not draw the buy-exposure
