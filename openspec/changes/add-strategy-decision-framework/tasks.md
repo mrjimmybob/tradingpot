@@ -477,7 +477,7 @@ fundamentally different strategy shape.
       bear drawdown with no pause and no loss-cutting**; its claim is
       discipline + execution + governance, not a return figure. No P6 exit
       thesis is authored (Not Applicable by design — 6.1).
-- [ ] 6.3 **Re-scope Pillar 2 away from market timing.** Remove the trend
+- [x] 6.3 **Re-scope Pillar 2 away from market timing.** Remove the trend
       `allowed_regimes` gate as DCA's default (retain only as an explicit,
       clearly-labelled non-classic operator override, `regime_filter_
       enabled` defaulting to `False`). In its place build the accumulator-

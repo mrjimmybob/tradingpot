@@ -27,14 +27,15 @@ STRATEGIES = [
     StrategyInfo(
         name="dca_accumulator",
         display_name="DCA Accumulator (Institutional Grade)",
-        description="Infinite accumulation: clock-driven buys at regular intervals with regime-aware pausing - continues until balance exhausted or manually stopped",
+        description="Classic direction-agnostic accumulation: clock-driven buys of fixed chunks at regular intervals, no matter the market conditions - continues until balance exhausted, the long-term thesis is invalidated, or manually stopped",
         parameters={
             "interval_minutes": {"type": "number", "default": 60, "min": 1, "description": "Buy interval in minutes"},
             "amount_percent": {"type": "number", "default": 10, "min": 1, "max": 100, "description": "Percent of balance per buy"},
             "amount_usd": {"type": "number", "default": None, "min": 1, "description": "Fixed USD amount per buy (overrides percent)"},
             "immediate_first_buy": {"type": "boolean", "default": True, "description": "Execute first buy immediately on start"},
-            "regime_filter_enabled": {"type": "boolean", "default": True, "description": "Pause accumulation during unfavorable market regimes"},
-            "allowed_regimes": {"type": "array", "default": ["trend_up", "trend_flat"], "description": "Allowed trend regimes for buying (trend_up, trend_down, trend_flat)"},
+            "thesis_invalidated": {"type": "boolean", "default": False, "description": "Structural stop: set True when the long-term investment thesis is no longer valid (e.g. delisting, broken fundamentals). Halts all accumulation. NOT a price-direction signal."},
+            "regime_filter_enabled": {"type": "boolean", "default": False, "description": "NON-CLASSIC market-timing overlay (off by default). When True, pauses buying in disallowed trend regimes - this is market timing and departs from classic DCA; a classic accumulator buys through downtrends."},
+            "allowed_regimes": {"type": "array", "default": ["trend_up", "trend_flat"], "description": "Only used when regime_filter_enabled=True (the non-classic overlay). Trend regimes in which buying is permitted (trend_up, trend_down, trend_flat)."},
         }
     ),
     StrategyInfo(

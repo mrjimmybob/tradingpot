@@ -1164,19 +1164,39 @@ class TradingEngine:
     ) -> Optional[TradeSignal]:
         """DCA (Dollar Cost Averaging) strategy - Institutional Grade.
 
-        Infinite accumulation strategy: Buys at regular clock-driven intervals
-        regardless of price. Continues indefinitely until balance is exhausted
-        or bot is manually stopped.
+        CLASSIC, DIRECTION-AGNOSTIC accumulation: buys fixed-size chunks at
+        regular clock-driven intervals *no matter the market conditions*. It
+        takes NO view on short- or medium-term price direction and buys the dip
+        and the rip alike. Continues indefinitely until balance is exhausted,
+        the long-term thesis is invalidated, or the bot is manually stopped.
+
+        This is the project's REFERENCE accumulation strategy and long-term
+        benchmark (see audits/dca_accumulator.md, Strategy Decision Framework
+        Phase 6). Its value is deterministic: fixed dollar chunks make the
+        average entry cost the harmonic mean of purchase prices (<= arithmetic
+        mean, for every price path, no forecast required). Keep it simple and
+        deterministic on purpose - do NOT make it "smarter".
 
         IMPORTANT: This strategy is INFINITE by design. It will keep buying until:
-        - Balance falls below minimum order size
+        - Balance falls below minimum order size (accumulation complete)
+        - The long-term investment thesis is invalidated (thesis_invalidated)
         - Bot is manually stopped by operator
         This is intentional, not a bug.
 
         DCA NEVER SELLS. Exits are handled by other strategies or manual intervention.
 
-        Regime-aware by default: Can pause during unfavorable market conditions
-        (e.g., strong downtrends) to protect capital.
+        SUITABILITY (Pillar 2, Phase 6): DCA does NOT gate on market direction.
+        The only things that may stop/defer/limit a scheduled buy are:
+          (a) execution feasibility - enforced downstream by the shared
+              MIN_ORDER_USD floor and the fee/spread-adjusted balance cap below;
+          (b) portfolio constraints - enforced downstream by the execution
+              pipeline's PortfolioRiskService.check_portfolio_risk and by the
+              budget-exhaustion floor below;
+          (c) long-term-thesis invalidation - the thesis_invalidated structural
+              stop below (a non-price condition; NEVER a direction forecast).
+        A trend-regime pause is deliberately NOT part of classic DCA - it is
+        market timing. It survives only as an explicit, off-by-default,
+        non-classic operator overlay (regime_filter_enabled), see below.
 
         Auto Mode may select this strategy (it is the designated fallback -
         see _get_strategy_capabilities): that is a SUPERVISED call, routed
@@ -1190,8 +1210,13 @@ class TradingEngine:
             amount_percent: Percent of budget per buy (default: 10)
             amount_usd: Fixed USD amount per buy (overrides amount_percent if set)
             immediate_first_buy: Execute first buy immediately (default: True)
-            regime_filter_enabled: Enable regime filter to pause during bad conditions (default: True)
-            allowed_regimes: List of allowed trend states (default: ["trend_up", "trend_flat"])
+            thesis_invalidated: Structural stop - halt all accumulation when the
+                long-term thesis is no longer valid (default: False). Not a price signal.
+            regime_filter_enabled: NON-CLASSIC market-timing overlay (default: False).
+                When True, pauses buying in disallowed trend regimes - departs from
+                classic DCA. Off by default; classic DCA buys through downtrends.
+            allowed_regimes: Only used when regime_filter_enabled=True
+                (default: ["trend_up", "trend_flat"])
         """
         # Defensive check: block DIRECT/unsupervised use of DCA on an
         # auto_mode bot. bot.strategy alone can't tell us that - it reads
@@ -1217,12 +1242,56 @@ class TradingEngine:
         amount_percent = params.get("amount_percent", 10) / 100
         amount_usd = params.get("amount_usd")  # Fixed amount in USD
         immediate_first_buy = params.get("immediate_first_buy", True)
-        regime_filter_enabled = params.get("regime_filter_enabled", True)
+        thesis_invalidated = params.get("thesis_invalidated", False)
+        # NON-CLASSIC market-timing overlay - OFF by default (see docstring
+        # SUITABILITY note and audits/dca_accumulator.md Phase 6.1). A classic
+        # DCA is direction-agnostic; this only exists as an explicit operator
+        # opt-in.
+        regime_filter_enabled = params.get("regime_filter_enabled", False)
         allowed_regimes = params.get("allowed_regimes", ["trend_up", "trend_flat"])
 
-        # === REGIME FILTER (pause during unfavorable conditions) ===
-        # Protects capital by not buying during strong downtrends or adverse regimes
+        # === ACCUMULATION-SUITABILITY GATE (Pillar 2 for a classic DCA) ===
+        # DCA does NOT gate on market direction. The ONLY structural condition
+        # that halts accumulation here is invalidation of the long-term
+        # investment thesis - a non-price, operator/edge-manager-set condition
+        # (Pillar 7 Category C, wired in Phase 6.4). Execution-feasibility (a)
+        # and portfolio-constraint (b) suitability are enforced downstream (the
+        # MIN_ORDER_USD floor + fee-adjusted cap below, and the execution
+        # pipeline's PortfolioRiskService), not duplicated here - keeping this
+        # gate simple and deterministic is deliberate (reference-benchmark role).
+        if thesis_invalidated:
+            logger.info(
+                f"Bot {bot.id}: DCA HALTED - long-term investment thesis invalidated. "
+                f"Accumulation stops (structural, not a price-direction signal)."
+            )
+            self._explain(bot.id).state("THESIS_INVALIDATED").update({
+                "current_price": current_price,
+            }).check(
+                "Long-term thesis valid", "invalidated", "valid", False,
+                detail="structural stop - not a price/direction signal",
+            )
+            return TradeSignal(
+                action="hold",
+                amount=0,
+                reason="DCA: Halted - long-term investment thesis invalidated (structural stop)",
+            )
+        # Suitability passes: DCA is a direction-agnostic accumulator, so a
+        # valid long-term thesis is the whole of its entry-side suitability.
+        self._explain(bot.id).check(
+            "Long-term thesis valid", "valid", "valid", True,
+            detail="classic DCA accumulates through all regimes",
+        )
+
+        # === REGIME FILTER (NON-CLASSIC market-timing overlay, off by default) ===
+        # This is market timing - it pauses buying on expected short-term
+        # weakness - and departs from classic DCA. Retained ONLY as an explicit
+        # operator opt-in (regime_filter_enabled=True). A classic accumulator
+        # buys through downtrends; do not enable this to "improve" DCA.
         if regime_filter_enabled:
+            logger.info(
+                f"Bot {bot.id}: DCA non-classic market-timing overlay is ENABLED "
+                f"(regime_filter_enabled=True) - this departs from classic DCA."
+            )
             # Get price history for regime detection
             price_history = self._get_price_history(bot.id)
 

@@ -225,22 +225,48 @@ the direction-agnosticism requirement, the honest lump-sum/drawdown
 trade-offs, or the benchmark role. Authoring that theory was this
 certification task.
 
-## Pillar 2 — Market Suitability: Present, but mis-scoped for a classic DCA (see 6.1)
+## Pillar 2 — Market Suitability: Re-scoped away from market timing (Phase 6.3)
 
-Real, enforced refusal-to-trade gate (1179-1216): computes regime via
-`_detect_market_regime`, blocks buying when `trend_state` isn't in
-`allowed_regimes` (default `["trend_up","trend_flat"]`, line 1175).
-`regime_filter_enabled` defaults `True` but is user-disableable.
-
-**Re-assessment under the Phase 6.1 Design Decision:** this trend-regime
-gate is *market timing* — it skips scheduled accumulation because of
+**Pre-Phase-6 state:** a real, enforced refusal-to-trade gate that computed
+regime via `_detect_market_regime` and blocked buying when `trend_state`
+wasn't in `allowed_regimes` (default `["trend_up","trend_flat"]`), with
+`regime_filter_enabled` defaulting `True`. Under the 6.1 decision this was
+re-assessed as **market timing** — it skipped scheduled accumulation on
 expected short-term weakness (`trend_down`), which is precisely what a
-classic DCA must not do. It is therefore **not** a strength to preserve but
-a mis-scoped gate to correct. Phase 6.3 removes it as the default (retained
-only as an explicit non-classic operator override, off by default) and
-redefines Pillar 2 for DCA as an **execution-quality / portfolio-constraint
-/ long-term-thesis** gate — never a direction gate. See the 6.1 section
-above and `../design.md`'s "Pure-accumulator exception."
+classic DCA must not do — so it was a mis-scoped gate to correct, not a
+strength to preserve.
+
+**Implemented (Phase 6.3):** Pillar 2 for DCA is now an
+**execution-quality / portfolio-constraint / long-term-thesis** gate, never
+a direction gate:
+
+- The trend-regime filter is **removed as the default**
+  (`regime_filter_enabled` now defaults `False` in both `_strategy_dca` and
+  the `config.py` schema) and survives only as an explicit, clearly-labelled
+  **non-classic market-timing overlay** an operator can opt into. When
+  disabled (the default) the regime detector is never consulted — direction
+  is not an input to the decision (test: `test_regime_detector_not_
+  consulted_by_default`).
+- The one structural halt on suitability grounds is the new
+  **`thesis_invalidated`** stop — a non-price, operator/edge-manager-set
+  condition (Pillar 7 Category C, wired in 6.4) that stops all accumulation
+  with a `THESIS_INVALIDATED` explain state. It is not a direction forecast.
+- **Execution feasibility (a)** and **portfolio constraints (b)** are left to
+  the existing downstream mechanisms — the `MIN_ORDER_USD` floor and
+  fee-adjusted balance cap (below), and the execution pipeline's
+  `PortfolioRiskService.check_portfolio_risk` plus the budget-exhaustion
+  floor — rather than duplicated here. Leaning on the single downstream
+  source of truth keeps this gate simple and deterministic, protecting DCA's
+  reference-benchmark role.
+
+The defining test is the **inverse** of the other five strategies' suitability
+tests: `test_trend_down_does_not_block_scheduled_buy` asserts a scheduled buy
+still fires in a pure downtrend absent any execution/portfolio/thesis problem.
+The non-classic overlay's pause behaviour is preserved under explicit opt-in
+(`test_overlay_opt_in_still_pauses_in_downtrend`). 8 tests in
+`backend/tests/test_dca_framework_migration.py`; full suite 1237 passing,
+zero regressions. See the 6.1 section above and `../design.md`'s
+"Pure-accumulator exception."
 
 ## Pillar 3 — Evidence-Based Decision Score: Not present
 
