@@ -5705,13 +5705,39 @@ class TradingEngine:
         BUY fires - see _DipRecoveryState for why it is never itself persisted.
 
         All thresholds adapt to current volatility via an ATR-percent proxy
-        (_calc_price_atr_proxy) computed from the bot's own tick price
-        history - the same shared source trend_following uses. No OHLC candles
-        are available for tick-driven bots, so True Range is approximated as
-        the absolute tick-to-tick price change, exactly like trend_following.
+        (_calc_price_atr_proxy) computed from the bot's own tick price history:
+        True Range is approximated as the absolute tick-to-tick price change.
         This makes every threshold pair-and-volatility agnostic (no BTC-
         specific assumptions): a 2% move only matters relative to what THIS
         pair's recent ATR% says is normal for it.
+
+        !! CADENCE SENSITIVITY - READ BEFORE CHANGING ANY DEFAULT HERE !!
+        This ATR proxy is denominated in EVALUATION TICKS, not wall-clock time,
+        so its value changes with the cadence the strategy is called at, while
+        the fee hurdle it must clear does not. This method is now the ONLY
+        caller of _calc_price_atr_proxy: trend_following used to compute ATR the
+        same way and was deliberately changed to 60-second bar ranges (see the
+        "BAR ATR ACCUMULATION" comment in _strategy_trend_following) because at
+        the live ~1 Hz loop cadence tick-to-tick deltas give ATR ~= $1-3 on BTC,
+        placing every ATR-derived distance inside the round-trip fee hurdle.
+        An earlier version of this docstring claimed the approximation matched
+        trend_following "exactly"; that has not been true since that fix.
+
+        Consequence, measured on real BTCUSDT data (see
+        DIP_RECOVERY_CADENCE_INVESTIGATION.md at the repo root): at the ~1s
+        cadence the live loop actually runs at, the take-profit target
+        (3 x ATR) is ~0.02% against a 0.25% fee hurdle, so the fee-viability
+        gate below refuses EVERY entry - even through Feb 2022. The parameter
+        defaults are calibrated for one tick per MINUTE (14-tick ATR = 14 min,
+        60-tick lookback = 60 min, setup_expiry 240 min = 4x that lookback).
+        Unlike every other strategy, this one does not aggregate ticks into
+        bars, so it never reaches that cadence on its own.
+
+        Usable range as it stands: roughly 5m-1h between evaluations - bounded
+        below by fee viability and above by setup_expiry_minutes (at 4h a setup
+        gets exactly one evaluation and can never be confirmed). Correcting
+        this properly means bar-aggregating like every other strategy, which is
+        a behaviour change and is not done here.
 
         Parameters (sane crypto defaults; also documented in
         validate_dip_recovery_params and app/routers/config.py STRATEGIES):
