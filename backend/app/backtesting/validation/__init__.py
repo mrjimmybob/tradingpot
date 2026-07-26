@@ -4,8 +4,9 @@ This package answers one question and only one question: *how does a strategy
 behave when it is run, unchanged, with the exact parameters it is actually
 configured with?* It measures and explains; it does not improve.
 
-The boundary is binding (see
-``openspec/changes/add-strategy-validation-tooling/proposal.md``):
+The boundary is binding (see the ``strategy-validation-measurement`` capability
+in ``openspec/specs/``, and the change that introduced it,
+``openspec/changes/archive/2026-07-26-add-strategy-validation-tooling/``):
 
 - It SHALL NOT search a parameter space, tune parameters, or select a "better"
   parameter set.

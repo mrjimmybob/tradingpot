@@ -24,8 +24,8 @@ no code path that could.
 
   Full raw reports (per-window tables, per-regime breakdowns, every limitation
   in full) are committed at
-  `openspec/changes/add-strategy-validation-tooling/baseline-raw-4h.txt` and
-  `…/baseline-raw-1d.txt`.
+  `openspec/changes/archive/2026-07-26-add-strategy-validation-tooling/baseline-raw-4h.txt`
+  and `…/baseline-raw-1d.txt`.
 
 ---
 
