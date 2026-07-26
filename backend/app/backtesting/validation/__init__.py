@@ -28,11 +28,29 @@ from .measurement import (
     measure_fixed_config,
     select_candles,
 )
+from .walk_forward import (
+    MS_PER_DAY,
+    SkippedWindow,
+    WalkForwardMeasurement,
+    format_walk_forward_report,
+    plan_windows,
+    resolve_span,
+    run_walk_forward,
+)
 
 __all__ = [
+    # measurement primitive
     "FixedConfig",
     "Measurement",
     "MeasurementSpan",
     "measure_fixed_config",
     "select_candles",
+    # out-of-sample measurement across rolling windows
+    "MS_PER_DAY",
+    "SkippedWindow",
+    "WalkForwardMeasurement",
+    "format_walk_forward_report",
+    "plan_windows",
+    "resolve_span",
+    "run_walk_forward",
 ]

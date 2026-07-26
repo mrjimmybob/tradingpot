@@ -40,16 +40,75 @@ parameter space, tune parameters, pick a "better" parameter set, or write
       equals what `BacktestEngine` itself reported (no recomputation).
 
 ## 2. Walk-Forward Measurement (fixed config, out-of-sample)
-- [ ] 2.1 Split a historical date range into rolling windows; measure the
+- [x] 2.1 Split a historical date range into rolling windows; measure the
       SAME operator-supplied fixed parameters on each window (no train-time
       search — the window split only makes the samples independent).
-- [ ] 2.2 Report per-window metrics (expectancy, win rate, profit factor,
+      `app/backtesting/validation/walk_forward.py`: `plan_windows()` tiles a
+      bounded span into successive windows (inclusive spans, so window k+1
+      starts exactly 1ms after window k ends; the final window is clipped to
+      the requested end so the windows cover the range with no overhang).
+      `step_ms` defaults to `window_ms` — non-overlapping, i.e. genuinely
+      independent samples. A smaller step is allowed but reported as
+      non-independent; a step *larger* than the window is rejected outright
+      because it would leave unmeasured gaps in the requested range.
+      `run_walk_forward()` measures one `FixedConfig` on every window.
+- [x] 2.2 Report per-window metrics (expectancy, win rate, profit factor,
       drawdown, trade count) side by side so consistency (or its absence)
       across time is visible; state the sample-size limitation honestly.
-- [ ] 2.3 CLI entry point (read-only; prints/writes a report, changes nothing).
-- [ ] 2.4 Tests: deterministic measurement over a synthetic candle fixture with
+      `format_walk_forward_report()` emits the per-window table *and* its
+      limitations from one function, so the numbers are hard to copy anywhere
+      without the caveats. Consistency is reported as
+      `not_assessable`/`consistently_positive`/`consistently_negative`/`mixed`
+      rather than a boolean — see the design note below. Limitations cover:
+      < 5 windows, < 30 trades, windows that produced no trades, windows that
+      could not be measured at all, window overlap, cold-start warm-up,
+      modelled-not-observed fees, unrealised mark-to-market in Return%/MaxDD%
+      when a window has no closed round trips, and an explicit "this is a
+      measurement, not a profitability claim".
+- [x] 2.3 CLI entry point (read-only; prints/writes a report, changes nothing).
+      `python -m app.backtesting.validation.cli` (also runnable as
+      `python -m backend.app.backtesting.validation.cli` from the repo root),
+      mirroring `app/backtesting/run.py`'s flags plus `--window-days` /
+      `--step-days`. Loads the whole range once via the engine's own loader so
+      the timeframe-resampling fallback behaves identically to a hand-run
+      backtest, then windows it in memory. Prints only — a test snapshots the
+      data root's file sizes and mtimes before and after a run and asserts
+      they are unchanged.
+- [x] 2.4 Tests: deterministic measurement over a synthetic candle fixture with
       a known result; a fixture whose edge is present in one window and absent
       in others is correctly shown as inconsistent (NOT "fixed" — just shown).
+      `backend/tests/test_validation_walk_forward.py` (35) and
+      `backend/tests/test_validation_cli.py` (18). The inconsistent-edge case
+      is driven by a scripted stand-in for `BacktestEngine` returning
+      exactly-known per-window results: the claims under test are about
+      aggregation and reporting ("every window used identical parameters", "a
+      sign flip is reported, not repaired"), and only known per-window numbers
+      can prove them. Coaxing a real strategy into a chosen win/loss pattern
+      would test the strategy, not this layer, and would break whenever the
+      strategy changed. Real-engine tests then cover the integration
+      end-to-end: determinism run-to-run, windows partitioning the candle
+      series exactly once, and a single full-range window reproducing a
+      directly-run backtest metric for metric.
+
+### Design notes for Section 2 (decisions made during implementation)
+- **Consistency is not a boolean.** The first implementation returned
+  `is_edge_consistent: bool`, which called an all-losing strategy
+  "inconsistent" — it is in fact perfectly consistent, and perfectly bad —
+  while a bare `True` would have read as good news for either sign. Replaced
+  with a four-valued `consistency` plus a narrowly-named
+  `has_positive_edge_in_every_traded_window`.
+- **Windows are measured cold; there is no train/warm-up span.** design.md
+  left window sizing open and mentioned a "train" span. Since nothing is
+  trained, a separate train span would only serve as indicator warm-up — and
+  excluding its trades would mean recomputing metrics outside the engine,
+  which risks drifting from what `BacktestEngine` itself reports. Each window
+  is therefore measured cold and the warm-up cost is stated as a limitation
+  instead of being silently absorbed. `--window-days` defaults to 180 so
+  warm-up is a small fraction of each window.
+- **Windows that cannot be measured are recorded, not dropped.** A skipped
+  window (fewer than 2 candles in range) appears in the report and in the
+  limitations; silently dropping them would shrink the denominator and present
+  a partial run as a complete one.
 
 ## 3. Regime-Conditioned Reporting (measurement)
 - [ ] 3.1 Classify each trade's entry regime using the canonical detector
