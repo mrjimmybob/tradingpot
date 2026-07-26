@@ -259,6 +259,16 @@ class TestEndToEnd:
         assert "counted more than once" in capsys.readouterr().out
 
     @pytest.mark.asyncio
+    async def test_the_validated_record_section_is_printed(self, data_root, capsys):
+        assert await cli._run(_args(data_root)) == 0
+        out = capsys.readouterr().out
+
+        assert "Validated measurement record" in out
+        # Either a record or a plain statement of why there isn't one - never
+        # silence, and never a number without its provenance.
+        assert ("NOT PRODUCED" in out) or ("Sample size" in out)
+
+    @pytest.mark.asyncio
     async def test_the_regime_report_writes_nothing_either(self, data_root):
         before = _tree_snapshot(data_root)
         args = _args(data_root)

@@ -28,6 +28,13 @@ from .measurement import (
     measure_fixed_config,
     select_candles,
 )
+from .edge_record import (
+    MIN_TRADING_WINDOWS_FOR_A_RECORD,
+    ValidatedEdgeRecord,
+    build_validated_edge_record,
+    edge_record_blockers,
+    format_edge_record_report,
+)
 from .regime import (
     UNCLASSIFIED,
     RegimeBreakdown,
@@ -76,4 +83,10 @@ __all__ = [
     "format_regime_report",
     "regime_label_full",
     "regime_label_trend",
+    # validated measurement record (reported only, never wired into runtime)
+    "MIN_TRADING_WINDOWS_FOR_A_RECORD",
+    "ValidatedEdgeRecord",
+    "build_validated_edge_record",
+    "edge_record_blockers",
+    "format_edge_record_report",
 ]

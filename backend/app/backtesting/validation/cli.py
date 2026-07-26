@@ -37,6 +37,7 @@ from datetime import datetime, timezone
 from app.backtesting.data_provider import CsvHistoricalDataProvider, DataIntegrityError
 from app.backtesting.engine import BacktestEngine
 from app.backtesting.execution_model import BacktestExecutionModel
+from app.backtesting.validation.edge_record import format_edge_record_report
 from app.backtesting.validation.measurement import FixedConfig, MeasurementSpan
 from app.backtesting.validation.regime import (
     bucket_trades_by_regime,
@@ -217,6 +218,7 @@ async def _run(args: argparse.Namespace) -> int:
     if not args.skip_regime_report:
         _print_regime_reports(candles, result, quiet=args.quiet)
 
+    print(format_edge_record_report(result))
     return 0
 
 

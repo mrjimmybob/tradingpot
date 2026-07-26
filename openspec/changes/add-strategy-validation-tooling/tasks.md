@@ -167,14 +167,40 @@ parameter space, tune parameters, pick a "better" parameter set, or write
       reconstructs the measurement's own total.
 
 ## 4. Validated Measurement Record
-- [ ] 4.1 Aggregate the out-of-sample measurements (Section 2) into the
+- [x] 4.1 Aggregate the out-of-sample measurements (Section 2) into the
       framework's `EdgeEstimate` shape (expectancy, win_rate, profit_factor,
       sample_size), constructed with `VALIDATED_EDGE_SOURCE` — produced and
       REPORTED only. Do NOT wire it into any live `StrategyProposal`
       (`expected_edge_estimate` stays `None` at runtime until a separate change
       wires it).
-- [ ] 4.2 Tests: the record is constructible/valid for a measured strategy; a
+      `app/backtesting/validation/edge_record.py`:
+      `build_validated_edge_record()` pools the walk-forward windows' trades
+      and routes them through the engine's own `compute_result`, so expectancy,
+      win rate and profit factor are the same quantities computed the same way
+      as everywhere else in this tooling. `win_rate` is converted from
+      `BacktestResult`'s percentage to the fraction `EdgeEstimate` validates.
+      `ValidatedEdgeRecord` wraps the estimate with the provenance a human
+      needs (configuration fingerprint, range, window counts, consistency) and
+      the caveats the four-number contract has no room for.
+      **The record is refused, not caveated, when it would mislead**
+      (`edge_record_blockers()`): a single measured window, trades confined to
+      a single window (in-sample by another name), overlapping windows (would
+      pool shared trades twice), no trades, or windows that did not share one
+      configuration. Producing a "validated" number from one window would
+      launder a single backtest into a stamp of approval — the exact failure
+      this change exists to prevent.
+- [x] 4.2 Tests: the record is constructible/valid for a measured strategy; a
       test confirms no runtime proposal path is modified by this change.
+      `backend/tests/test_validation_edge_record.py` (21 tests). Pooled
+      arithmetic is hand-checked against scripted per-window results; each
+      blocker has its own test; and `TestRuntimeProposalsAreUnaffected` walks
+      the AST of **every module under `app/`** asserting that no code outside
+      `app/backtesting/validation/` constructs an `EdgeEstimate` and that no
+      call passes a non-`None` `expected_edge_estimate` (a pass-through of an
+      already-`None` field, as the Auto committee's read-only view does, is
+      correctly distinguished from populating one). Also confirms the schema
+      still defaults the field to `None` and that the framework still rejects a
+      forged source marker — the gate that makes this record legitimate.
 
 ## 5. Baseline Measurement Run
 - [ ] 5.1 Once Sections 1-4 are usable, measure all 6 strategies via
