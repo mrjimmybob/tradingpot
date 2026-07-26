@@ -4,14 +4,40 @@ parameter space, tune parameters, pick a "better" parameter set, or write
 `strategy_params` anywhere. Optimisation is a future, separate change.
 
 ## 1. Measurement Boundary (measurement ≠ optimisation)
-- [ ] 1.1 New read-only package `app/backtesting/validation/` that wraps
+- [x] 1.1 New read-only package `app/backtesting/validation/` that wraps
       `BacktestEngine.run_candles` unmodified. It takes a strategy + a FIXED
       parameter dict + a date range and returns measurements only; it exposes
       no parameter-search or parameter-writeback API.
-- [ ] 1.2 Test: a structural/guard test asserting the package contains no
+      Implemented as `app/backtesting/validation/measurement.py`:
+      `FixedConfig` (strategy + trading pair + params + starting balance),
+      `MeasurementSpan` (inclusive ms date range, `None` = unbounded),
+      `Measurement` (immutable projection of `BacktestResult` + provenance),
+      `measure_fixed_config()` and `select_candles()`. `FixedConfig`
+      deep-copies the operator's dict at construction and exposes it only via
+      `MappingProxyType`; `params_for_run()` hands the engine a *fresh* deep
+      copy per run, so no strategy mutation can leak across windows. Every
+      `Measurement` carries a `params_fingerprint` (sha256 of canonical JSON),
+      making "identical parameters on every window" mechanically provable
+      rather than merely asserted in prose.
+- [x] 1.2 Test: a structural/guard test asserting the package contains no
       parameter-search path and never writes `strategy_params` (no DB/bot/config
       write, no "try N param sets and rank" loop) — the measurement/optimisation
       separation is enforced, not just documented.
+      `backend/tests/test_validation_measurement_boundary.py` (35 tests). Six
+      AST detectors run against *every* module discovered by walking the
+      package directory (so a module added later cannot be added *around* the
+      guard): no write through an object to `strategy_params`/`params`, no
+      `setattr(..., "strategy_params", ...)`, no import of any persistence
+      layer (`sqlalchemy`, `app.models`, `app.core.config`, …), no file opened
+      for writing, no definition or argument using optimisation vocabulary
+      (`optimi*`/`tune`/`sweep`/`param_grid`/`candidate`/…), and only
+      `engine.run_candles` ever called on the engine. A `TestTheGuardsActually
+      Bite` meta-suite runs each detector against deliberately-offending
+      synthetic source, so a silently-broken detector fails the suite instead
+      of reporting a boundary it stopped checking. Behavioural half proves the
+      same from outside: the operator's dict and candle list come back
+      byte-identical, repeated measurement is deterministic, and every metric
+      equals what `BacktestEngine` itself reported (no recomputation).
 
 ## 2. Walk-Forward Measurement (fixed config, out-of-sample)
 - [ ] 2.1 Split a historical date range into rolling windows; measure the
