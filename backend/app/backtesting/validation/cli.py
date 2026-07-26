@@ -38,6 +38,13 @@ from app.backtesting.data_provider import CsvHistoricalDataProvider, DataIntegri
 from app.backtesting.engine import BacktestEngine
 from app.backtesting.execution_model import BacktestExecutionModel
 from app.backtesting.validation.measurement import FixedConfig, MeasurementSpan
+from app.backtesting.validation.regime import (
+    bucket_trades_by_regime,
+    build_regime_timeline,
+    format_regime_report,
+    regime_label_full,
+    regime_label_trend,
+)
 from app.backtesting.validation.walk_forward import (
     MS_PER_DAY,
     format_walk_forward_report,
@@ -97,6 +104,12 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--data-root", default=str(_DEFAULT_DATA_ROOT),
         help=f"Root of the data/backtest directory tree (default: {_DEFAULT_DATA_ROOT})",
+    )
+    parser.add_argument(
+        "--skip-regime-report", action="store_true",
+        help="Skip the per-regime breakdown. Regime labelling costs roughly one "
+             "detector pass per candle, which is noticeable on minute-resolution "
+             "multi-year ranges.",
     )
     parser.add_argument(
         "--quiet", action="store_true",
@@ -200,7 +213,51 @@ async def _run(args: argparse.Namespace) -> int:
         return 1
 
     print(format_walk_forward_report(result))
+
+    if not args.skip_regime_report:
+        _print_regime_reports(candles, result, quiet=args.quiet)
+
     return 0
+
+
+def _print_regime_reports(candles, result, quiet: bool) -> None:
+    """Per-regime breakdown over every trade the walk-forward run produced.
+
+    Pools trades across windows because a per-window *and* per-regime split
+    would leave a handful of trades in each cell - too few to read. Pooling is
+    only sound while the windows are disjoint, so overlapping runs say plainly
+    that some trades are counted more than once rather than presenting a
+    double-counted table as if it were clean.
+    """
+    trades = [trade for window in result.windows for trade in window.trades]
+    if not trades:
+        print("\nNo closed trades to break down by regime.")
+        return
+
+    if not quiet:
+        print("\nClassifying market regimes...", flush=True)
+    timeline = build_regime_timeline(candles)
+    equity_curve = [point for window in result.windows for point in window.equity_curve]
+
+    if result.windows_overlap:
+        print(
+            "\nNOTE: windows overlap, so trades from shared candles appear in more than "
+            "one window and are counted more than once below."
+        )
+
+    print(format_regime_report(
+        bucket_trades_by_regime(
+            trades, timeline, equity_curve, regime_label_trend, label_kind="trend regime",
+        ),
+        title="Performance by trend regime (rollup)",
+    ))
+    print(format_regime_report(
+        bucket_trades_by_regime(
+            trades, timeline, equity_curve, regime_label_full,
+            label_kind="full regime (trend/volatility/liquidity)",
+        ),
+        title="Performance by full regime (trend/volatility/liquidity)",
+    ))
 
 
 def main() -> int:

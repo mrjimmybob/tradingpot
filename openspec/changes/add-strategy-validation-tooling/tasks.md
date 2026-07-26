@@ -111,14 +111,60 @@ parameter space, tune parameters, pick a "better" parameter set, or write
   a partial run as a complete one.
 
 ## 3. Regime-Conditioned Reporting (measurement)
-- [ ] 3.1 Classify each trade's entry regime using the canonical detector
+- [x] 3.1 Classify each trade's entry regime using the canonical detector
       (post `fix-regime-detection-consistency`).
-- [ ] 3.2 Bucket `BacktestResult.trades`/`equity_curve` by regime and compute
+      `app/backtesting/validation/regime.py`: `build_regime_timeline()` walks
+      the candle series forward once, driving
+      `TradingEngine._detect_market_regime_bar_based` — the exact bound method
+      `_strategy_auto` calls — the same way `_strategy_auto` drives it: the
+      same 100-bar rolling window, the same 20-bar minimum before any regime
+      is reported, and the previous regime carried forward so the 3-bar
+      persistence hysteresis sees an identical input sequence. A test asserts
+      the default detector *is* that function (`detector.__func__ is
+      TradingEngine._detect_market_regime_bar_based`), so a second ad hoc
+      classifier cannot quietly replace it.
+      Labels are causal: the regime at candle *i* uses candles 0..i only,
+      proved by a test that truncates the series and asserts no already-
+      assigned label changes. Candles before the 20-bar minimum are
+      `UNCLASSIFIED`, never "flat" — labelling them with a real regime would
+      invent data.
+- [x] 3.2 Bucket `BacktestResult.trades`/`equity_curve` by regime and compute
       per-regime expectancy/win-rate/drawdown.
-- [ ] 3.3 CLI output / report summarising per-regime performance per strategy
+      `bucket_trades_by_regime()` groups trades by the regime at each trade's
+      ENTRY and routes every trade metric through the engine's own
+      `compute_result`, so no number in this report has a second definition
+      that could drift. Buckets exist for every regime the *market* was in,
+      not only those traded, so "never entered during a downtrend" shows as an
+      empty row rather than a missing one; each bucket carries its candle
+      exposure so a row's weight is visible.
+      Per-regime drawdown is computed per contiguous stretch of that regime
+      and the worst taken — concatenating disjoint stretches would carry a
+      peak from March into a trough in September. Each stretch is anchored on
+      the equity mark immediately preceding it so a drop occurring on the move
+      *into* a regime is attributed to it instead of falling into the crack
+      between two stretches; the anchor is one point, not a running peak, so
+      peaks still cannot leak between disjoint stretches. Both properties have
+      dedicated tests.
+- [x] 3.3 CLI output / report summarising per-regime performance per strategy
       (read-only).
-- [ ] 3.4 Tests: regime bucketing correctness against a synthetic fixture with
+      Two tables after the walk-forward report: a trend-only rollup (keeps
+      per-bucket samples large enough to read) and the full
+      trend/volatility/liquidity regime (what `_is_strategy_eligible` actually
+      gates on). Trades are pooled across windows because a per-window *and*
+      per-regime split would leave a handful of trades per cell; pooling is
+      only sound while windows are disjoint, so an overlapping run states
+      plainly that trades are counted more than once. `--skip-regime-report`
+      opts out (labelling costs ~one detector pass per candle).
+- [x] 3.4 Tests: regime bucketing correctness against a synthetic fixture with
       known regime transitions.
+      `backend/tests/test_validation_regime.py` (23 tests). Bucketing is
+      proved against a synthetic series with deliberately constructed
+      transitions (warm-up → "up" → "down") driven by a scripted detector, so
+      a failure points at this module rather than at a change in the live
+      detector's thresholds — the detector's own behaviour is covered by its
+      tests. Real-engine tests then confirm every trade of an actual
+      measurement lands in exactly one bucket and the per-bucket P&L
+      reconstructs the measurement's own total.
 
 ## 4. Validated Measurement Record
 - [ ] 4.1 Aggregate the out-of-sample measurements (Section 2) into the

@@ -231,6 +231,42 @@ class TestEndToEnd:
         assert "NOT independent" in out
 
     @pytest.mark.asyncio
+    async def test_per_regime_breakdown_is_printed(self, data_root, capsys):
+        assert await cli._run(_args(data_root)) == 0
+        out = capsys.readouterr().out
+
+        assert "Performance by trend regime (rollup)" in out
+        assert "Performance by full regime (trend/volatility/liquidity)" in out
+        assert "Exposure" in out
+        assert "Total trades bucketed:" in out
+        assert "at its ENTRY" in out
+
+    @pytest.mark.asyncio
+    async def test_the_regime_report_can_be_skipped(self, data_root, capsys):
+        args = _args(data_root)
+        args.skip_regime_report = True
+        assert await cli._run(args) == 0
+        out = capsys.readouterr().out
+
+        assert "Walk-forward measurement" in out
+        assert "Performance by trend regime" not in out
+
+    @pytest.mark.asyncio
+    async def test_overlapping_windows_disclose_double_counted_trades(self, data_root, capsys):
+        args = _args(data_root)
+        args.step_days = 1
+        assert await cli._run(args) == 0
+        assert "counted more than once" in capsys.readouterr().out
+
+    @pytest.mark.asyncio
+    async def test_the_regime_report_writes_nothing_either(self, data_root):
+        before = _tree_snapshot(data_root)
+        args = _args(data_root)
+        assert args.skip_regime_report is False
+        assert await cli._run(args) == 0
+        assert _tree_snapshot(data_root) == before
+
+    @pytest.mark.asyncio
     async def test_insufficient_candles_fails_cleanly(self, tmp_path, capsys):
         root = tmp_path / "data" / "backtest"
         _write_hourly_csv(

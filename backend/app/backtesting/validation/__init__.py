@@ -28,6 +28,18 @@ from .measurement import (
     measure_fixed_config,
     select_candles,
 )
+from .regime import (
+    UNCLASSIFIED,
+    RegimeBreakdown,
+    RegimeBucket,
+    RegimeTimeline,
+    bucket_trades_by_regime,
+    build_regime_timeline,
+    canonical_regime_detector,
+    format_regime_report,
+    regime_label_full,
+    regime_label_trend,
+)
 from .walk_forward import (
     MS_PER_DAY,
     SkippedWindow,
@@ -53,4 +65,15 @@ __all__ = [
     "plan_windows",
     "resolve_span",
     "run_walk_forward",
+    # regime-conditioned breakdown of measured trades
+    "UNCLASSIFIED",
+    "RegimeBreakdown",
+    "RegimeBucket",
+    "RegimeTimeline",
+    "bucket_trades_by_regime",
+    "build_regime_timeline",
+    "canonical_regime_detector",
+    "format_regime_report",
+    "regime_label_full",
+    "regime_label_trend",
 ]
