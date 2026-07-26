@@ -203,6 +203,30 @@ class TestSummaryIsAComparisonNotARanking:
         assert "+0.00" not in summary
 
     @pytest.mark.asyncio
+    async def test_benchmark_columns_are_counts_not_scores(self):
+        """"8/13" invites reading the other five; a single ratio invites
+        reading nothing else."""
+        summary = format_baseline_summary(await self._entries())
+        assert "> B&H" in summary and "> DCA" in summary
+        assert "a count, not a score" in summary
+
+    @pytest.mark.asyncio
+    async def test_exposure_is_explained_as_the_reason_bandh_may_be_unfair(self):
+        summary = format_baseline_summary(await self._entries())
+        assert "less exposed than" in summary
+        assert "DCA column is the fairer comparison" in summary
+
+    @pytest.mark.asyncio
+    async def test_a_zero_trade_row_points_at_the_benchmark_section(self):
+        """The whole point of this change: a zero-trade strategy is no longer a
+        dead end, it is measured elsewhere in the report."""
+        entries = await measure_baseline(
+            _RecordingEngine([[]] * 40), _candles(400), "TEST/USD", window_ms=25 * DAY,
+        )
+        summary = format_baseline_summary(entries)
+        assert "benchmark-relative section instead" in summary
+
+    @pytest.mark.asyncio
     async def test_a_zero_trade_row_is_not_presented_as_an_inactive_strategy(self):
         """Closed round trips are the denominator; a strategy that scales in and
         out without fully flattening trades all window and still shows 0."""

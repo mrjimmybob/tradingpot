@@ -42,6 +42,11 @@ from app.backtesting.validation.baseline import (
     BaselineEntry,
     format_baseline_summary,
 )
+from app.backtesting.validation.benchmark_relative import (
+    format_windows_benchmark_report,
+    measure_windows_against_benchmarks,
+)
+from app.backtesting.validation.benchmarks import DEFAULT_DCA_CADENCE_MS
 from app.backtesting.validation.edge_record import (
     build_validated_edge_record,
     edge_record_blockers,
@@ -73,6 +78,8 @@ _DEFAULT_WINDOW_DAYS = 180
 # --strategy all: measure every concrete strategy over one range in one pass,
 # loading the candle series only once.
 ALL_STRATEGIES = "all"
+
+_DEFAULT_DCA_CADENCE_DAYS = DEFAULT_DCA_CADENCE_MS // MS_PER_DAY
 
 
 def _parse_date(value: str) -> int:
@@ -123,6 +130,13 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--data-root", default=str(_DEFAULT_DATA_ROOT),
         help=f"Root of the data/backtest directory tree (default: {_DEFAULT_DATA_ROOT})",
+    )
+    parser.add_argument(
+        "--dca-cadence-days", type=int, default=_DEFAULT_DCA_CADENCE_DAYS,
+        help="Cadence of the periodic-DCA benchmark, the fair reference for a "
+             f"gradually deploying strategy (default: {_DEFAULT_DCA_CADENCE_DAYS}). "
+             "Reported with every result. Do not vary it to flatter a strategy - that "
+             "would be optimisation, which this tool does not do.",
     )
     parser.add_argument(
         "--skip-regime-report", action="store_true",
@@ -250,6 +264,17 @@ async def _run(args: argparse.Namespace) -> int:
             return 1
 
         print(format_walk_forward_report(result))
+
+        # Benchmark-relative measures come before the edge record on purpose:
+        # for a strategy that closes no round trips they ARE the measurement,
+        # and the edge record below will only say why it produced nothing.
+        benchmark_rows = measure_windows_against_benchmarks(
+            result.windows, candles,
+            cadence_ms=args.dca_cadence_days * MS_PER_DAY,
+            model=engine.execution_model,
+        )
+        print(format_windows_benchmark_report(name, benchmark_rows))
+
         if not args.skip_regime_report:
             _print_regime_reports(candles, result, quiet=args.quiet)
         print(format_edge_record_report(result))
@@ -259,6 +284,7 @@ async def _run(args: argparse.Namespace) -> int:
             walk_forward=result,
             record=build_validated_edge_record(result),
             blockers=edge_record_blockers(result),
+            benchmark_windows=benchmark_rows,
         ))
 
     if len(entries) > 1:

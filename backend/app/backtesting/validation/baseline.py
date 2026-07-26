@@ -20,6 +20,12 @@ from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 from app.backtesting.candle import Candle
 
+from .benchmark_relative import (
+    WindowBenchmarkRow,
+    count_windows_beating,
+    measure_windows_against_benchmarks,
+)
+from .benchmarks import BUY_AND_HOLD, PERIODIC_DCA
 from .edge_record import (
     ValidatedEdgeRecord,
     build_validated_edge_record,
@@ -49,6 +55,10 @@ class BaselineEntry:
     walk_forward: WalkForwardMeasurement
     record: Optional[ValidatedEdgeRecord]
     blockers: Tuple[str, ...]
+    # Per-window benchmark standing. Optional so a caller measuring only closed
+    # trades still gets a valid entry, but it is what makes a zero-round-trip
+    # strategy legible at all.
+    benchmark_windows: Tuple[WindowBenchmarkRow, ...] = ()
 
 
 async def measure_baseline(
@@ -63,6 +73,8 @@ async def measure_baseline(
     span: Optional[MeasurementSpan] = None,
     quiet: bool = True,
     on_strategy: Optional[Callable[[int, int, str], None]] = None,
+    dca_cadence_ms: Optional[int] = None,
+    benchmark_model=None,
 ) -> Tuple[BaselineEntry, ...]:
     """Measure each strategy over the same candles, windows, and execution model.
 
@@ -92,6 +104,9 @@ async def measure_baseline(
             walk_forward=result,
             record=build_validated_edge_record(result),
             blockers=edge_record_blockers(result),
+            benchmark_windows=measure_windows_against_benchmarks(
+                result.windows, candles, cadence_ms=dca_cadence_ms, model=benchmark_model,
+            ),
         ))
 
     return tuple(entries)
@@ -104,44 +119,57 @@ def format_baseline_summary(entries: Sequence[BaselineEntry]) -> str:
     lines.append("Cross-strategy summary (comparison, NOT a ranking)")
 
     header = (
-        f"{'Strategy':<22}{'Windows':>9}{'Traded':>8}{'Trades':>8}"
-        f"{'Consistency':>24}{'Pooled exp.':>14}{'Record':>10}"
+        f"{'Strategy':<22}{'Windows':>9}{'Trades':>8}{'Consistency':>24}"
+        f"{'Pooled exp.':>13}{'Expo':>7}{'> B&H':>9}{'> DCA':>9}"
     )
     lines.append(header)
     lines.append("-" * len(header))
     for entry in entries:
         result = entry.walk_forward
         pooled = f"{entry.record.estimate.expectancy:+.2f}" if entry.record else "-"
+        exposures = [
+            row.relative.exposure for row in entry.benchmark_windows
+            if row.relative.exposure is not None
+        ]
+        exposure = f"{sum(exposures) / len(exposures):.2f}" if exposures else "-"
+        bh_beat, bh_total = count_windows_beating(entry.benchmark_windows, BUY_AND_HOLD)
+        dca_beat, dca_total = count_windows_beating(entry.benchmark_windows, PERIODIC_DCA)
         lines.append(
             f"{entry.strategy:<22}"
             f"{result.num_windows:>9}"
-            f"{len(result.windows_with_trades):>8}"
             f"{result.total_trades:>8}"
             f"{result.consistency:>24}"
-            f"{pooled:>14}"
-            f"{('yes' if entry.record else 'no'):>10}"
+            f"{pooled:>13}"
+            f"{exposure:>7}"
+            f"{(f'{bh_beat}/{bh_total}' if bh_total else '-'):>9}"
+            f"{(f'{dca_beat}/{dca_total}' if dca_total else '-'):>9}"
         )
     lines.append("-" * len(header))
     lines.append("")
     lines.append(
         "Rows are in declaration order and are NOT sorted by performance. This table "
         "compares what was measured; it does not recommend a strategy, and the sample "
-        "sizes here would not support one. 'Record' is whether the measurement met the "
-        "bar for a validated out-of-sample record - see each strategy's section for why "
-        "not, where it did not."
+        "sizes here would not support one."
     )
     lines.append(
         "'Pooled exp.' is expectancy per closed trade in quote currency, pooled across "
-        "out-of-sample windows, and is blank where no record could be produced."
+        "out-of-sample windows. It is blank where the measurement did not meet the bar "
+        "for a validated out-of-sample record - each strategy's own section states why."
     )
     lines.append(
         "IMPORTANT: 'Trades' counts CLOSED round trips only. A strategy that scales in "
         "and out without ever fully flattening - an accumulator, or a grid - can trade "
         "throughout a window and still show 0 here. A zero row therefore does NOT mean "
-        "the strategy was inactive: read its Return%/MaxDD% columns above, which mark "
-        "open positions to market. Expectancy per closed trade is simply not a "
-        "meaningful measure for those strategies, which is why no record is produced "
-        "for them rather than a misleading one."
+        "the strategy was inactive, and expectancy is simply not the right instrument "
+        "for it: read the '> B&H' and '> DCA' columns and that strategy's "
+        "benchmark-relative section instead."
+    )
+    lines.append(
+        "'> B&H' / '> DCA' count the windows in which the strategy's return exceeded "
+        "that benchmark's - a count, not a score. 'Expo' is mean realised exposure "
+        "(beta to the asset): a strategy well below 1.00 was less exposed than "
+        "buy-and-hold, so part of any shortfall against B&H is exposure rather than "
+        "selection, and the DCA column is the fairer comparison for it."
     )
     lines.append("")
     return "\n".join(lines)

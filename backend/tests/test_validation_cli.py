@@ -259,6 +259,33 @@ class TestEndToEnd:
         assert "counted more than once" in capsys.readouterr().out
 
     @pytest.mark.asyncio
+    async def test_the_benchmark_relative_section_is_printed(self, data_root, capsys):
+        assert await cli._run(_args(data_root)) == 0
+        out = capsys.readouterr().out
+
+        assert "Benchmark-relative measurement by window" in out
+        assert "vs buy-and-hold" in out
+        assert "vs periodic DCA" in out
+        assert "Windows with higher return than buy-and-hold" in out
+        assert "NOT skill when exposure differs" in out
+
+    @pytest.mark.asyncio
+    async def test_the_dca_cadence_is_reported_with_the_result(self, data_root, capsys):
+        """A periodic-DCA number means nothing without its cadence."""
+        args = _args(data_root)
+        args.dca_cadence_days = 3
+        assert await cli._run(args) == 0
+        assert "cadence 3d" in capsys.readouterr().out
+
+    @pytest.mark.asyncio
+    async def test_there_is_no_flag_to_tune_the_benchmark_for_a_strategy(self):
+        """--dca-cadence-days sets a disclosed benchmark parameter. Nothing may
+        search over it."""
+        help_text = cli._build_arg_parser().format_help()
+        assert "--dca-cadence-days" in help_text
+        assert "would be optimisation" in help_text
+
+    @pytest.mark.asyncio
     async def test_the_validated_record_section_is_printed(self, data_root, capsys):
         assert await cli._run(_args(data_root)) == 0
         out = capsys.readouterr().out

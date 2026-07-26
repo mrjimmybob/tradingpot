@@ -6,9 +6,13 @@ a **measurement of the shipped defaults**, not a recommendation, and **no
 strategy parameter was changed as a result of producing it** — the tooling has
 no code path that could.
 
-- **Date run:** 2026-07-26
+- **Date run:** 2026-07-26 (re-run the same day with benchmark-relative measures,
+  which closed the "three strategies unmeasurable" gap this document originally
+  recorded as open — see *Benchmark-relative measurement* below)
 - **Data:** `binance/BTCUSDT`, local CSV, 2020-01-01 → 2026-01-01
 - **Windows:** 13 × 180 days, non-overlapping (step = window), each measured cold
+- **Benchmarks:** buy-and-hold and periodic DCA (weekly cadence), both paying the
+  same 0.1% per-side fee the strategies paid
 - **Parameters:** none supplied, so every strategy fell back to its own internal
   defaults — the ones that had never been checked against data. Fingerprint
   `44136fa355b3678a` (the empty parameter dict) on every window of every run.
@@ -102,17 +106,19 @@ such claim that omits its timeframe is unfalsifiable.
 ### 3. Three of six strategies cannot be measured by expectancy at all
 
 `dca_accumulator`, `adaptive_grid`, and `dip_recovery` closed **zero round
-trips** in all 13 windows at both resolutions. They were not inactive — their
-per-window Return% and MaxDD% move substantially and diverge from buy-and-hold
-(`adaptive_grid` returned −1.64% in a window where buy-and-hold returned
-+26.89%). They scale in and out without ever fully flattening a position, so the
-closed-round-trip counter never increments.
+trips** in all 13 windows at both resolutions, so expectancy per closed trade is
+not a meaningful measure for them and the tooling refuses to produce a validated
+record rather than printing a misleading zero.
 
-Expectancy per closed trade is simply not a meaningful measure for these
-strategies. The tooling refuses to produce a validated record for them rather
-than printing a misleading zero. Judging them requires return- and
-drawdown-based measures against a stated benchmark — which this tooling does not
-yet provide, and which is a gap worth closing.
+Two separate reasons, which the closed-trade counter cannot tell apart but the
+benchmark-relative measures below can: `dca_accumulator` never sells by design,
+`adaptive_grid` scales in and out without ever fully flattening (the portfolio
+records a closed trade only on a **full** close), and `dip_recovery` — as it
+turns out — never opened a position at all.
+
+**Update (same-day re-run):** these three are now measured on return and
+drawdown against benchmarks. See the next section; this is no longer an open
+gap.
 
 ### 4. Per-regime behaviour is legible, and mostly as designed
 
@@ -135,6 +141,90 @@ rather than merely decomposing it.
 
 ---
 
+## Benchmark-relative measurement
+
+Measured on the equity curve rather than on closed trades, so it is defined for
+every strategy including the three that close none. `Expo` is realised exposure
+(beta of equity returns to the asset's) — roughly the fraction of the time the
+strategy was effectively deployed. `> B&H` / `> DCA` count the windows in which
+the strategy's return exceeded that benchmark's.
+
+### 4h resolution
+
+| Strategy | Exposure | > buy-and-hold | > periodic DCA |
+|---|---|---|---|
+| dca_accumulator | 0.97 | 6/13 | 8/13 |
+| adaptive_grid | 0.31 | 5/13 | 7/13 |
+| mean_reversion | 0.01 | 4/13 | 6/13 |
+| trend_following | 0.15 | 3/13 | 6/13 |
+| volatility_breakout | 0.01 | 4/13 | 5/13 |
+| dip_recovery | 0.00 | 4/13 | 5/13 |
+
+### 1d resolution
+
+| Strategy | Exposure | > buy-and-hold | > periodic DCA |
+|---|---|---|---|
+| dca_accumulator | 0.87 | 4/13 | 10/13 |
+| adaptive_grid | 0.21 | 4/13 | 6/13 |
+| mean_reversion | 0.01 | 4/13 | 5/13 |
+| trend_following | 0.03 | 4/13 | 5/13 |
+| volatility_breakout | 0.00 | 4/13 | 5/13 |
+| dip_recovery | 0.00 | 4/13 | 5/13 |
+
+### 5. `dip_recovery` never opened a position
+
+Return **+0.00%**, drawdown **0.00%**, exposure **0.00** — in all 13 windows, at
+both resolutions, across six years. It is not that it failed to *close* trades:
+with its shipped defaults it never entered the market at all. The old
+closed-trade instrument could not distinguish this from a strategy that trades
+constantly without flattening; the exposure measure makes it unmistakable.
+
+Its "4 of 13 windows beat buy-and-hold" is **not skill** — it is what holding
+cash does in a falling market. A strategy that never participates wins every
+down window by default.
+
+This warrants investigation as a possible configuration or gating defect. **No
+parameter was changed here**, per the measure-don't-optimise boundary.
+
+### 6. `dca_accumulator` behaves like buy-and-hold, not like an accumulator
+
+Exposure 0.97–1.00 in every 4h window, and per-window returns within a few points
+of buy-and-hold (−12.8% to +6.6%). Over a 180-day window it deploys essentially
+fully and early, so it tracks the asset rather than averaging into it. It beats
+the weekly-DCA benchmark in 8 of 13 windows (10 of 13 at 1d) largely *because* it
+deploys faster than weekly instalments — an exposure difference, not evidence of
+entry timing.
+
+That is worth knowing about a strategy whose stated role is being the project's
+clean, boring accumulation reference: over these window lengths it is closer to a
+lump sum than to dollar-cost averaging.
+
+### 7. `adaptive_grid` trades a large drawdown reduction for return
+
+The one strategy whose profile the old instrument hid completely. Exposure
+averages 0.31 and it draws down **far less than either benchmark in almost every
+window** — −45.1, −35.1, −26.7, −24.8 percentage points of drawdown versus
+buy-and-hold. It beats buy-and-hold on return in only 5 of 13 windows, but it
+beats periodic DCA in 7, while being much less exposed than both.
+
+Its worst window (2021-12 → 2022-06) still lost 56.4% with a 60.7% drawdown, so
+this is risk *reduction*, not risk elimination.
+
+### 8. Most strategies are barely in the market
+
+Exposure is at or below 0.15 for `mean_reversion`, `trend_following`, and
+`volatility_breakout` at both resolutions — `mean_reversion` sits at 0.01 despite
+closing 159 trades. They hold for very short periods and sit in cash the rest of
+the time.
+
+This reframes finding 1. Their per-trade expectancies are not small because each
+decision is poor; they are small in portfolio terms because the strategies are
+almost never deployed. It also explains why all six strategies beat buy-and-hold
+in roughly the same 4 of 13 windows: those are the down windows, where being in
+cash wins regardless of what the strategy did.
+
+---
+
 ## Limitations
 
 These are stated in full in the raw reports; the material ones are:
@@ -154,6 +244,19 @@ These are stated in full in the raw reports; the material ones are:
   entry; a trade held across a regime change is not split.
 - **Small per-regime samples.** Every per-regime bucket above is under the
   30-trade floor except `trend_following`'s "up" (287) and "flat" (52).
+- **Exposure is a proxy, not a measured split.** It is the beta of equity returns
+  to the asset's. The portfolio records only total equity, so the true cash/asset
+  split is not recoverable without changing the engine.
+- **Excess return is not skill when exposure differs.** A strategy at 0.01
+  exposure trailing buy-and-hold has told you almost nothing about its selection
+  quality — mostly that it was not deployed.
+- **The periodic-DCA benchmark has a cadence** (weekly here). A different cadence
+  gives a different benchmark; it is disclosed rather than tuned.
+- **Closed-trade counts understate scale-out strategies.** The backtest portfolio
+  records a closed trade only on a full close
+  (`backend/app/backtesting/portfolio.py:65-73`), a documented simplification.
+  Realised P&L from partial exits appears in the equity curve but not the trade
+  count. Fixing it would change every existing measurement and is its own change.
 
 ---
 

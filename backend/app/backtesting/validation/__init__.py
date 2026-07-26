@@ -29,6 +29,21 @@ from .measurement import (
     measure_fixed_config,
     select_candles,
 )
+from .benchmark_relative import (
+    BenchmarkComparison,
+    BenchmarkRelativeMeasurement,
+    benchmark_limitations,
+    estimate_exposure,
+    format_benchmark_report,
+    measure_against_benchmarks,
+)
+from .benchmarks import (
+    DEFAULT_DCA_CADENCE_MS,
+    BenchmarkCurve,
+    build_benchmarks,
+    buy_and_hold_curve,
+    periodic_dca_curve,
+)
 from .edge_record import (
     MIN_TRADING_WINDOWS_FOR_A_RECORD,
     ValidatedEdgeRecord,
@@ -84,6 +99,18 @@ __all__ = [
     "format_regime_report",
     "regime_label_full",
     "regime_label_trend",
+    # benchmark-relative measurement (works with zero closed round trips)
+    "DEFAULT_DCA_CADENCE_MS",
+    "BenchmarkComparison",
+    "BenchmarkCurve",
+    "BenchmarkRelativeMeasurement",
+    "benchmark_limitations",
+    "build_benchmarks",
+    "buy_and_hold_curve",
+    "estimate_exposure",
+    "format_benchmark_report",
+    "measure_against_benchmarks",
+    "periodic_dca_curve",
     # validated measurement record (reported only, never wired into runtime)
     "MIN_TRADING_WINDOWS_FOR_A_RECORD",
     "ValidatedEdgeRecord",
