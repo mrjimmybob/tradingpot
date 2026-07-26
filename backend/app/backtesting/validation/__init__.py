@@ -44,6 +44,12 @@ from .benchmarks import (
     buy_and_hold_curve,
     periodic_dca_curve,
 )
+from .cadence import (
+    CadenceWarning,
+    check_cadence,
+    format_cadence_warning,
+    infer_candle_interval_ms,
+)
 from .edge_record import (
     MIN_TRADING_WINDOWS_FOR_A_RECORD,
     ValidatedEdgeRecord,
@@ -99,6 +105,11 @@ __all__ = [
     "format_regime_report",
     "regime_label_full",
     "regime_label_trend",
+    # is the measurement's timeframe fine enough for the strategy?
+    "CadenceWarning",
+    "check_cadence",
+    "format_cadence_warning",
+    "infer_candle_interval_ms",
     # benchmark-relative measurement (works with zero closed round trips)
     "DEFAULT_DCA_CADENCE_MS",
     "BenchmarkComparison",

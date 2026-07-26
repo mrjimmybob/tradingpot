@@ -68,6 +68,10 @@ Validated records produced (4h):
 | volatility_breakout | 13 | 6 | 7 | **mixed** | −0.81 |
 | dip_recovery | 13 | 0 | 0 | not assessable | — |
 
+⚠️ `dip_recovery`'s zeros above are a **measurement artefact**, not a property of
+the strategy — 4h and 1d are both too coarse for its 240-minute setup window. See
+finding 5 for what it actually does at 1h (341 trades, −27.40 expectancy).
+
 These tables are in declaration order and are **not** sorted by performance.
 They compare what was measured; they do not rank the strategies, and the sample
 sizes here would not support a ranking.
@@ -171,20 +175,44 @@ the strategy's return exceeded that benchmark's.
 | volatility_breakout | 0.00 | 4/13 | 5/13 |
 | dip_recovery | 0.00 | 4/13 | 5/13 |
 
-### 5. `dip_recovery` never opened a position
+### 5. `dip_recovery`'s zero was a measurement artefact — and it loses money
 
-Return **+0.00%**, drawdown **0.00%**, exposure **0.00** — in all 13 windows, at
-both resolutions, across six years. It is not that it failed to *close* trades:
-with its shipped defaults it never entered the market at all. The old
-closed-trade instrument could not distinguish this from a strategy that trades
-constantly without flattening; the exposure measure makes it unmistakable.
+**Corrected.** An earlier version of this document reported that `dip_recovery`
+"never opened a position" at 4h and 1d and flagged it as a possible defect in the
+strategy. That conclusion was wrong, and the fault was in the measurement.
 
-Its "4 of 13 windows beat buy-and-hold" is **not skill** — it is what holding
-cash does in a falling market. A strategy that never participates wins every
-down window by default.
+`dip_recovery` declares `setup_expiry_minutes: 240`: a decline arms a setup, and
+the setup is abandoned if no reversal is confirmed within 240 minutes. A 4h
+candle **is** 240 minutes, so every setup expired on the very next evaluation —
+463 of 464 setups in a probe of 2022 died with "Setup expired after 240.0 min".
+The strategy's time constants are written for the ~60s cadence the engine runs at
+live; a backtest evaluates once per candle. Measured at 4h or 1d it could not
+possibly trade.
 
-This warrants investigation as a possible configuration or gating defect. **No
-parameter was changed here**, per the measure-don't-optimise boundary.
+Measured at **1h**, where the same setup window gets four evaluations instead of
+one, the same code with the same parameters trades freely — and the real result
+is worse than the artefact suggested:
+
+| | 1h, 2020-2026, 13 × 180d windows |
+|---|---|
+| Closed trades | 341 (every window traded) |
+| Expectancy per trade | **−27.40** |
+| Win rate | 32.6% |
+| Profit factor | **0.61** |
+| Consistency | mixed — only **1 of 13** windows had positive expectancy |
+| Beat buy-and-hold / periodic DCA | 2 of 13 / 4 of 13 |
+
+So `dip_recovery` is not inert. With its shipped defaults it trades often and
+loses persistently: 12 of 13 out-of-sample windows negative, and a profit factor
+below 1 in almost all of them. That is a far more actionable finding than the
+"never trades" artefact it replaced. **No parameter was changed** — acting on
+this is a separate decision.
+
+The tooling now refuses to report this class of zero silently: a **cadence check**
+compares each strategy's declared duration parameters against the measurement's
+inferred candle interval and prints a prominent warning before any results when a
+mechanism cannot function at that resolution. The 4h and 1d figures elsewhere in
+this document carry that warning for `dip_recovery`.
 
 ### 6. `dca_accumulator` behaves like buy-and-hold, not like an accumulator
 
@@ -252,6 +280,11 @@ These are stated in full in the raw reports; the material ones are:
   quality — mostly that it was not deployed.
 - **The periodic-DCA benchmark has a cadence** (weekly here). A different cadence
   gives a different benchmark; it is disclosed rather than tuned.
+- **A candle interval coarser than a strategy's time constants invalidates the
+  measurement.** `dip_recovery` is the worked example (finding 5). The tooling now
+  warns automatically, but the principle applies to any strategy measured at a
+  timeframe near its own durations: these are ~60s-cadence strategies, and a
+  backtest evaluates once per candle.
 - **Closed-trade counts understate scale-out strategies.** The backtest portfolio
   records a closed trade only on a full close
   (`backend/app/backtesting/portfolio.py:65-73`), a documented simplification.

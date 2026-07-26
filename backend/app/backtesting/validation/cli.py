@@ -47,6 +47,7 @@ from app.backtesting.validation.benchmark_relative import (
     measure_windows_against_benchmarks,
 )
 from app.backtesting.validation.benchmarks import DEFAULT_DCA_CADENCE_MS
+from app.backtesting.validation.cadence import check_cadence, format_cadence_warning
 from app.backtesting.validation.edge_record import (
     build_validated_edge_record,
     edge_record_blockers,
@@ -262,6 +263,12 @@ async def _run(args: argparse.Namespace) -> int:
         except ValueError as e:
             print(f"Measurement could not run: {e}", file=sys.stderr)
             return 1
+
+        # Printed BEFORE the results: a reader who is going to be misled by a
+        # zero needs the reason before they see the zero, not in a footnote
+        # after they have already drawn a conclusion from it.
+        cadence_warnings = check_cadence(name, candles, strategy_params)
+        print(format_cadence_warning(name, cadence_warnings, result.total_trades), end="")
 
         print(format_walk_forward_report(result))
 
