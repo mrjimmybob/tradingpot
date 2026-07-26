@@ -1,0 +1,460 @@
+
+===============================================================================
+[1/6] dca_accumulator
+===============================================================================
+
+Walk-forward measurement: dca_accumulator on BTCUSDT
+Range:      2020-01-01 → 2026-01-01
+Windows:    13 x 180d (step 180d)
+Parameters: fixed, fingerprint 44136fa355b3678a
+
+Window                      Candles  Trades    Win%      PF   Expectancy   MaxDD%   Return%      B&H%
+-----------------------------------------------------------------------------------------------------
+2020-01-01 → 2020-06-28       1,080       0     0.0    0.00        +0.00    56.17    +23.84    +26.89
+2020-06-29 → 2020-12-25       1,080       0     0.0    0.00        +0.00    19.95   +169.85   +171.15
+2020-12-26 → 2021-06-23       1,080       0     0.0    0.00        +0.00    51.56    +23.34    +36.28
+2021-06-24 → 2021-12-20       1,080       0     0.0    0.00        +0.00    32.86    +39.84    +39.31
+2021-12-21 → 2022-06-18       1,080       0     0.0    0.00        +0.00    64.53    -61.42    -59.56
+2022-06-19 → 2022-12-15       1,080       0     0.0    0.00        +0.00    36.77    -14.20     -8.51
+2022-12-16 → 2023-06-13       1,080       0     0.0    0.00        +0.00    21.18    +53.81    +49.42
+2023-06-14 → 2023-12-10       1,080       0     0.0    0.00        +0.00    20.82    +66.13    +68.85
+2023-12-11 → 2024-06-07       1,080       0     0.0    0.00        +0.00    22.44    +64.86    +58.38
+2024-06-08 → 2024-12-04       1,079       0     0.0    0.00        +0.00    26.20    +43.91    +42.15
+2024-12-05 → 2025-06-02       1,080       0     0.0    0.00        +0.00    30.62     +5.83     +7.37
+2025-06-03 → 2025-11-29       1,080       0     0.0    0.00        +0.00    34.35    -13.86    -14.22
+2025-11-30 → 2026-01-01         193       0     0.0    0.00        +0.00     9.80     -2.54     -3.47
+-----------------------------------------------------------------------------------------------------
+
+Windows measured: 13   with trades: 0   positive expectancy: 0   non-positive: 0
+Total closed trades: 0
+Consistency: NOT ASSESSABLE - fewer than two windows produced any trades.
+
+Limitations:
+  - Only 0 trade(s) across all windows (< 30). Per-trade expectancy over a sample this small is dominated by noise.
+  - 13 of 13 window(s) produced no trades at all. A window with no trades is neither evidence for nor against an edge; it is excluded from the consistency check.
+  - Some window(s) show a non-zero Return%/MaxDD% with zero trades. Those columns mark an open position to market at the window's end, whereas Trades/Win%/PF/Expectancy count only CLOSED round trips - an accumulating strategy holding through a window shows its unrealised move here, which is not realised profit.
+  - Each window is measured cold: indicator and regime warm-up happens inside the window, so the earliest bars of every window are effectively non-trading. Shorter windows lose proportionally more of their span to it.
+  - Fees and slippage are modelled, not observed. Live fills, funding, and partial fills will differ.
+  - This is a measurement of a fixed configuration, not a profitability claim and not a recommendation to change any parameter.
+
+
+No closed trades to break down by regime.
+
+Validated measurement record
+------------------------------------------------------------
+NOT PRODUCED. This measurement cannot support a validated record:
+  - No window produced any trades, so there is nothing to estimate from.
+  - No closed trades were measured; there is nothing to estimate.
+
+
+===============================================================================
+[2/6] adaptive_grid
+===============================================================================
+
+Walk-forward measurement: adaptive_grid on BTCUSDT
+Range:      2020-01-01 → 2026-01-01
+Windows:    13 x 180d (step 180d)
+Parameters: fixed, fingerprint 44136fa355b3678a
+
+Window                      Candles  Trades    Win%      PF   Expectancy   MaxDD%   Return%      B&H%
+-----------------------------------------------------------------------------------------------------
+2020-01-01 → 2020-06-28       1,080       0     0.0    0.00        +0.00    11.06     -1.64    +26.89
+2020-06-29 → 2020-12-25       1,080       0     0.0    0.00        +0.00     2.88    +13.33   +171.15
+2020-12-26 → 2021-06-23       1,080       0     0.0    0.00        +0.00    16.51     -1.58    +36.28
+2021-06-24 → 2021-12-20       1,080       0     0.0    0.00        +0.00    31.01     +5.55    +39.31
+2021-12-21 → 2022-06-18       1,080       0     0.0    0.00        +0.00    60.74    -56.43    -59.56
+2022-06-19 → 2022-12-15       1,080       0     0.0    0.00        +0.00    10.11     -0.13     -8.51
+2022-12-16 → 2023-06-13       1,080       0     0.0    0.00        +0.00    10.77    +13.89    +49.42
+2023-06-14 → 2023-12-10       1,080       0     0.0    0.00        +0.00     6.27    +38.88    +68.85
+2023-12-11 → 2024-06-07       1,080       0     0.0    0.00        +0.00    22.44    +61.93    +58.38
+2024-06-08 → 2024-12-04       1,079       0     0.0    0.00        +0.00    13.08     +3.64    +42.15
+2024-12-05 → 2025-06-02       1,080       0     0.0    0.00        +0.00     3.96     +3.54     +7.37
+2025-06-03 → 2025-11-29       1,080       0     0.0    0.00        +0.00     9.58     -5.44    -14.22
+2025-11-30 → 2026-01-01         193       0     0.0    0.00        +0.00     2.74     -1.15     -3.47
+-----------------------------------------------------------------------------------------------------
+
+Windows measured: 13   with trades: 0   positive expectancy: 0   non-positive: 0
+Total closed trades: 0
+Consistency: NOT ASSESSABLE - fewer than two windows produced any trades.
+
+Limitations:
+  - Only 0 trade(s) across all windows (< 30). Per-trade expectancy over a sample this small is dominated by noise.
+  - 13 of 13 window(s) produced no trades at all. A window with no trades is neither evidence for nor against an edge; it is excluded from the consistency check.
+  - Some window(s) show a non-zero Return%/MaxDD% with zero trades. Those columns mark an open position to market at the window's end, whereas Trades/Win%/PF/Expectancy count only CLOSED round trips - an accumulating strategy holding through a window shows its unrealised move here, which is not realised profit.
+  - Each window is measured cold: indicator and regime warm-up happens inside the window, so the earliest bars of every window are effectively non-trading. Shorter windows lose proportionally more of their span to it.
+  - Fees and slippage are modelled, not observed. Live fills, funding, and partial fills will differ.
+  - This is a measurement of a fixed configuration, not a profitability claim and not a recommendation to change any parameter.
+
+
+No closed trades to break down by regime.
+
+Validated measurement record
+------------------------------------------------------------
+NOT PRODUCED. This measurement cannot support a validated record:
+  - No window produced any trades, so there is nothing to estimate from.
+  - No closed trades were measured; there is nothing to estimate.
+
+
+===============================================================================
+[3/6] mean_reversion
+===============================================================================
+
+Walk-forward measurement: mean_reversion on BTCUSDT
+Range:      2020-01-01 → 2026-01-01
+Windows:    13 x 180d (step 180d)
+Parameters: fixed, fingerprint 44136fa355b3678a
+
+Window                      Candles  Trades    Win%      PF   Expectancy   MaxDD%   Return%      B&H%
+-----------------------------------------------------------------------------------------------------
+2020-01-01 → 2020-06-28       1,080      10    40.0    2.15       +19.55     1.09     +1.95    +26.89
+2020-06-29 → 2020-12-25       1,080      11    45.5    0.39       -10.63     2.09     -1.17   +171.15
+2020-12-26 → 2021-06-23       1,080       9    55.6    2.57       +48.64     2.60     +4.38    +36.28
+2021-06-24 → 2021-12-20       1,080      10    70.0    7.28       +26.21     0.73     +2.62    +39.31
+2021-12-21 → 2022-06-18       1,080      20    10.0    0.02       -41.65     8.33     -8.33    -59.56
+2022-06-19 → 2022-12-15       1,080      14    57.1    0.49       -14.70     3.02     -2.06     -8.51
+2022-12-16 → 2023-06-13       1,080      20    45.0    1.32        +3.91     1.92     +0.78    +49.42
+2023-06-14 → 2023-12-10       1,080      10    50.0    3.32       +24.74     0.88     +2.47    +68.85
+2023-12-11 → 2024-06-07       1,080      12    58.3    1.49        +5.69     0.90     +0.68    +58.38
+2024-06-08 → 2024-12-04       1,079      14    50.0    1.65       +11.32     1.31     +1.58    +42.15
+2024-12-05 → 2025-06-02       1,080      13    46.2    1.25        +3.00     0.74     +0.39     +7.37
+2025-06-03 → 2025-11-29       1,080      15    46.7    0.56        -5.40     1.66     -0.81    -14.22
+2025-11-30 → 2026-01-01         193       1     0.0    0.00       -22.05     0.23     -0.22     -3.47
+-----------------------------------------------------------------------------------------------------
+
+Windows measured: 13   with trades: 13   positive expectancy: 8   non-positive: 5
+Total closed trades: 159
+Consistency: MIXED - 8 of 13 trading windows had positive expectancy and the rest did not. The strategy's result depends on which period it is measured over, so no single-window number describes it.
+
+Limitations:
+  - Each window is measured cold: indicator and regime warm-up happens inside the window, so the earliest bars of every window are effectively non-trading. Shorter windows lose proportionally more of their span to it.
+  - Fees and slippage are modelled, not observed. Live fills, funding, and partial fills will differ.
+  - This is a measurement of a fixed configuration, not a profitability claim and not a recommendation to change any parameter.
+
+
+Performance by trend regime (rollup)
+Regime                      Candles  Exposure  Trades    Win%      PF   Expectancy     Net P&L   MaxDD%
+-------------------------------------------------------------------------------------------------------
+down                          4,760     36.2%      65    43.1    0.82        -3.82     -248.51     4.19
+flat                          2,497     19.0%      46    43.5    1.44        +5.37     +247.15     1.56
+up                            5,876     44.7%      48    50.0    1.22        +4.78     +229.23     2.41
+unclassified (warm-up)           19      0.1%       0     0.0    0.00        +0.00       +0.00     0.00
+-------------------------------------------------------------------------------------------------------
+Total trades bucketed: 159   (* = fewer than 10 trades)
+
+  - Regimes are classified from the measured candles' own timeframe. The live detector runs on 60-second bars, so labels here describe the same classifier applied at a coarser bar size, not a replay of live regime state.
+  - A trade is attributed entirely to the regime at its ENTRY. A trade held across a regime change is not split between them.
+
+Performance by full regime (trend/volatility/liquidity)
+Regime                      Candles  Exposure  Trades    Win%      PF   Expectancy     Net P&L   MaxDD%
+-------------------------------------------------------------------------------------------------------
+down/high/low                   361      2.7%      22    50.0    1.04        +0.87      +19.12     2.99
+down/high/normal                  4      0.0%       0     0.0    0.00        +0.00       +0.00     0.00
+down/low/low                    159      1.2%       0     0.0    0.00        +0.00       +0.00     0.02
+down/low/normal                  45      0.3%       0     0.0    0.00        +0.00       +0.00     0.00
+down/medium/low               3,736     28.4%      40    42.5    0.74        -5.77     -230.77     4.19
+down/medium/normal              455      3.5%       3     0.0    0.00       -12.29      -36.86     0.54  *
+flat/high/low                    74      0.6%       0     0.0    0.00        +0.00       +0.00     0.00
+flat/high/normal                 15      0.1%       1     0.0    0.00       -10.83      -10.83     0.11  *
+flat/low/low                    134      1.0%       4     0.0    0.00       -18.01      -72.04     0.49  *
+flat/low/normal                 105      0.8%       1   100.0     inf       +11.45      +11.45     0.01  *
+flat/medium/high                  6      0.0%       0     0.0    0.00        +0.00       +0.00     0.00
+flat/medium/low               1,592     12.1%      24    41.7    1.68        +9.83     +235.95     1.56
+flat/medium/normal              571      4.3%      16    56.2    1.60        +5.16      +82.62     0.67
+up/high/low                     449      3.4%       4    50.0    8.24       +65.99     +263.97     0.36  *
+up/high/normal                   24      0.2%       0     0.0    0.00        +0.00       +0.00     0.00
+up/low/low                      114      0.9%       2     0.0    0.00       -29.01      -58.01     0.26  *
+up/low/normal                    74      0.6%       0     0.0    0.00        +0.00       +0.00     0.00
+up/medium/high                    3      0.0%       0     0.0    0.00        +0.00       +0.00     0.00
+up/medium/low                 4,516     34.3%      33    48.5    1.01        +0.28       +9.16     2.41
+up/medium/normal                696      5.3%       9    66.7    1.14        +1.57      +14.12     0.63  *
+unclassified (warm-up)           19      0.1%       0     0.0    0.00        +0.00       +0.00     0.00
+-------------------------------------------------------------------------------------------------------
+Total trades bucketed: 159   (* = fewer than 10 trades)
+
+  - Small samples (down/medium/normal, flat/high/normal, flat/low/low, flat/low/normal, up/high/low, up/low/low, up/medium/normal): fewer than 10 trades each. Per-regime expectancy over so few trades is not a finding.
+  - No trades were entered under: down/high/normal, down/low/low, down/low/normal, flat/high/low, flat/medium/high, up/high/normal, up/low/normal, up/medium/high. That is an absence of evidence about those regimes, not evidence the strategy avoids them.
+  - Regimes are classified from the measured candles' own timeframe. The live detector runs on 60-second bars, so labels here describe the same classifier applied at a coarser bar size, not a replay of live regime state.
+  - A trade is attributed entirely to the regime at its ENTRY. A trade held across a regime change is not split between them.
+
+Validated measurement record
+------------------------------------------------------------
+Strategy                mean_reversion
+Symbol                  BTCUSDT
+Parameters              fixed, fingerprint 44136fa355b3678a
+Range                   2020-01-01 → 2026-01-01
+Out-of-sample windows   13 (13 produced trades)
+Per-window consistency  mixed
+
+Expectancy per trade    +1.43
+Win rate                45.3%
+Profit factor           1.08
+Sample size             159 closed trades
+Source                  add-strategy-validation-tooling
+
+  - Per-window expectancy changes sign across windows. The pooled expectancy below is an average over states the strategy behaves differently in, and describes none of them.
+  - Produced for review only. This record is NOT wired into any live StrategyProposal; expected_edge_estimate remains None at runtime.
+
+
+===============================================================================
+[4/6] trend_following
+===============================================================================
+
+Walk-forward measurement: trend_following on BTCUSDT
+Range:      2020-01-01 → 2026-01-01
+Windows:    13 x 180d (step 180d)
+Parameters: fixed, fingerprint 44136fa355b3678a
+
+Window                      Candles  Trades    Win%      PF   Expectancy   MaxDD%   Return%      B&H%
+-----------------------------------------------------------------------------------------------------
+2020-01-01 → 2020-06-28       1,080      25    28.0    0.94        -5.29     9.98     -1.32    +26.89
+2020-06-29 → 2020-12-25       1,080      41    56.1    2.84      +126.73    10.25    +52.61   +171.15
+2020-12-26 → 2021-06-23       1,080      35    42.9    1.01        +0.59    13.75     +0.21    +36.28
+2021-06-24 → 2021-12-20       1,080      43    32.6    1.25       +22.64    16.62     +9.74    +39.31
+2021-12-21 → 2022-06-18       1,080      19    26.3    0.95        -4.38    11.34     -0.83    -59.56
+2022-06-19 → 2022-12-15       1,080      24    33.3    0.26       -57.43    16.26    -13.78     -8.51
+2022-12-16 → 2023-06-13       1,080      30    36.7    1.71       +54.18     9.25    +16.25    +49.42
+2023-06-14 → 2023-12-10       1,080      24    45.8    2.47       +69.25     5.43    +16.80    +68.85
+2023-12-11 → 2024-06-07       1,080      36    44.4    1.47       +34.60    10.59    +12.48    +58.38
+2024-06-08 → 2024-12-04       1,079      27    25.9    0.64       -33.08    15.81     -8.93    +42.15
+2024-12-05 → 2025-06-02       1,080      28    46.4    1.42       +24.53     6.04     +6.87     +7.37
+2025-06-03 → 2025-11-29       1,080      32    40.6    0.98        -0.95     7.98     -0.31    -14.22
+2025-11-30 → 2026-01-01         193       0     0.0    0.00        +0.00     0.00     +0.00     -3.47
+-----------------------------------------------------------------------------------------------------
+
+Windows measured: 13   with trades: 12   positive expectancy: 7   non-positive: 5
+Total closed trades: 364
+Consistency: MIXED - 7 of 12 trading windows had positive expectancy and the rest did not. The strategy's result depends on which period it is measured over, so no single-window number describes it.
+
+Limitations:
+  - 1 of 13 window(s) produced no trades at all. A window with no trades is neither evidence for nor against an edge; it is excluded from the consistency check.
+  - Each window is measured cold: indicator and regime warm-up happens inside the window, so the earliest bars of every window are effectively non-trading. Shorter windows lose proportionally more of their span to it.
+  - Fees and slippage are modelled, not observed. Live fills, funding, and partial fills will differ.
+  - This is a measurement of a fixed configuration, not a profitability claim and not a recommendation to change any parameter.
+
+
+Performance by trend regime (rollup)
+Regime                      Candles  Exposure  Trades    Win%      PF   Expectancy     Net P&L   MaxDD%
+-------------------------------------------------------------------------------------------------------
+down                          4,760     36.2%      25    32.0    0.92        -6.20     -155.06    13.98
+flat                          2,497     19.0%      52    40.4    1.63       +44.29    +2303.16     5.35
+up                            5,876     44.7%     287    39.7    1.31       +23.50    +6743.87    35.15
+unclassified (warm-up)           19      0.1%       0     0.0    0.00        +0.00       +0.00     0.00
+-------------------------------------------------------------------------------------------------------
+Total trades bucketed: 364   (* = fewer than 10 trades)
+
+  - Regimes are classified from the measured candles' own timeframe. The live detector runs on 60-second bars, so labels here describe the same classifier applied at a coarser bar size, not a replay of live regime state.
+  - A trade is attributed entirely to the regime at its ENTRY. A trade held across a regime change is not split between them.
+
+Performance by full regime (trend/volatility/liquidity)
+Regime                      Candles  Exposure  Trades    Win%      PF   Expectancy     Net P&L   MaxDD%
+-------------------------------------------------------------------------------------------------------
+down/high/low                   361      2.7%       0     0.0    0.00        +0.00       +0.00     0.18
+down/high/normal                  4      0.0%       0     0.0    0.00        +0.00       +0.00     0.00
+down/low/low                    159      1.2%       1     0.0    0.00      -137.24     -137.24     1.95  *
+down/low/normal                  45      0.3%       1     0.0    0.00       -76.37      -76.37     1.18  *
+down/medium/low               3,736     28.4%      19    36.8    1.06        +4.32      +81.99    13.98
+down/medium/normal              455      3.5%       4    25.0    0.91        -5.86      -23.45     6.76  *
+flat/high/low                    74      0.6%       0     0.0    0.00        +0.00       +0.00     1.27
+flat/high/normal                 15      0.1%       0     0.0    0.00        +0.00       +0.00     0.00
+flat/low/low                    134      1.0%       2    50.0    1.00        -0.03       -0.07     1.98  *
+flat/low/normal                 105      0.8%       3    33.3    1.59       +31.39      +94.17     1.19  *
+flat/medium/high                  6      0.0%       0     0.0    0.00        +0.00       +0.00     0.00
+flat/medium/low               1,592     12.1%      29    37.9    1.25       +20.71     +600.64     3.98
+flat/medium/normal              571      4.3%      18    44.4    2.55       +89.36    +1608.41     4.79
+up/high/low                     449      3.4%      23    52.2    3.04       +59.98    +1379.45     2.32
+up/high/normal                   24      0.2%       0     0.0    0.00        +0.00       +0.00     0.46
+up/low/low                      114      0.9%       5    40.0    1.86       +78.70     +393.49     3.55  *
+up/low/normal                    74      0.6%       2    50.0    0.43       -24.60      -49.20     2.09  *
+up/medium/high                    3      0.0%       0     0.0    0.00        +0.00       +0.00     0.00
+up/medium/low                 4,516     34.3%     227    39.2    1.26       +20.55    +4664.37    35.15
+up/medium/normal                696      5.3%      30    33.3    1.16       +11.86     +355.76     4.74
+unclassified (warm-up)           19      0.1%       0     0.0    0.00        +0.00       +0.00     0.00
+-------------------------------------------------------------------------------------------------------
+Total trades bucketed: 364   (* = fewer than 10 trades)
+
+  - Small samples (down/low/low, down/low/normal, down/medium/normal, flat/low/low, flat/low/normal, up/low/low, up/low/normal): fewer than 10 trades each. Per-regime expectancy over so few trades is not a finding.
+  - No trades were entered under: down/high/low, down/high/normal, flat/high/low, flat/high/normal, flat/medium/high, up/high/normal, up/medium/high. That is an absence of evidence about those regimes, not evidence the strategy avoids them.
+  - Regimes are classified from the measured candles' own timeframe. The live detector runs on 60-second bars, so labels here describe the same classifier applied at a coarser bar size, not a replay of live regime state.
+  - A trade is attributed entirely to the regime at its ENTRY. A trade held across a regime change is not split between them.
+
+Validated measurement record
+------------------------------------------------------------
+Strategy                trend_following
+Symbol                  BTCUSDT
+Parameters              fixed, fingerprint 44136fa355b3678a
+Range                   2020-01-01 → 2026-01-01
+Out-of-sample windows   13 (12 produced trades)
+Per-window consistency  mixed
+
+Expectancy per trade    +24.43
+Win rate                39.3%
+Profit factor           1.33
+Sample size             364 closed trades
+Source                  add-strategy-validation-tooling
+
+  - Per-window expectancy changes sign across windows. The pooled expectancy below is an average over states the strategy behaves differently in, and describes none of them.
+  - Produced for review only. This record is NOT wired into any live StrategyProposal; expected_edge_estimate remains None at runtime.
+
+
+===============================================================================
+[5/6] volatility_breakout
+===============================================================================
+
+Walk-forward measurement: volatility_breakout on BTCUSDT
+Range:      2020-01-01 → 2026-01-01
+Windows:    13 x 180d (step 180d)
+Parameters: fixed, fingerprint 44136fa355b3678a
+
+Window                      Candles  Trades    Win%      PF   Expectancy   MaxDD%   Return%      B&H%
+-----------------------------------------------------------------------------------------------------
+2020-01-01 → 2020-06-28       1,080       6    66.7   10.95      +113.21     1.64     +6.79    +26.89
+2020-06-29 → 2020-12-25       1,080       7    14.3    0.10       -43.23     3.98     -3.03   +171.15
+2020-12-26 → 2021-06-23       1,080       3    66.7    1.46        +4.01     1.09     +0.12    +36.28
+2021-06-24 → 2021-12-20       1,080       6    16.7    0.10       -19.88     1.26     -1.19    +39.31
+2021-12-21 → 2022-06-18       1,080       5    60.0    1.38        +5.80     1.15     +0.29    -59.56
+2022-06-19 → 2022-12-15       1,080       7    28.6    0.49       -22.48     3.05     -1.57     -8.51
+2022-12-16 → 2023-06-13       1,080       5    20.0    2.28       +83.97     3.20     +4.20    +49.42
+2023-06-14 → 2023-12-10       1,080       7    28.6    0.57       -23.59     2.35     -1.65    +68.85
+2023-12-11 → 2024-06-07       1,080       6    50.0    2.51       +45.45     2.00     +2.73    +58.38
+2024-06-08 → 2024-12-04       1,079       8    12.5    0.25       -33.39     2.86     -2.67    +42.15
+2024-12-05 → 2025-06-02       1,080       5    40.0    0.91        -3.84     1.82     -0.19     +7.37
+2025-06-03 → 2025-11-29       1,080       5    40.0    1.79       +30.15     1.31     +1.51    -14.22
+2025-11-30 → 2026-01-01         193       1     0.0    0.00       -75.92     0.76     -0.76     -3.47
+-----------------------------------------------------------------------------------------------------
+
+Windows measured: 13   with trades: 13   positive expectancy: 6   non-positive: 7
+Total closed trades: 71
+Consistency: MIXED - 6 of 13 trading windows had positive expectancy and the rest did not. The strategy's result depends on which period it is measured over, so no single-window number describes it.
+
+Limitations:
+  - Each window is measured cold: indicator and regime warm-up happens inside the window, so the earliest bars of every window are effectively non-trading. Shorter windows lose proportionally more of their span to it.
+  - Fees and slippage are modelled, not observed. Live fills, funding, and partial fills will differ.
+  - This is a measurement of a fixed configuration, not a profitability claim and not a recommendation to change any parameter.
+
+
+Performance by trend regime (rollup)
+Regime                      Candles  Exposure  Trades    Win%      PF   Expectancy     Net P&L   MaxDD%
+-------------------------------------------------------------------------------------------------------
+down                          4,760     36.2%      10    30.0    1.78       +35.46     +354.56     6.36
+flat                          2,497     19.0%      22    45.5    1.13        +4.72     +103.75     1.45
+up                            5,876     44.7%      39    28.2    1.00        -0.04       -1.37     2.65
+unclassified (warm-up)           19      0.1%       0     0.0    0.00        +0.00       +0.00     0.00
+-------------------------------------------------------------------------------------------------------
+Total trades bucketed: 71   (* = fewer than 10 trades)
+
+  - Regimes are classified from the measured candles' own timeframe. The live detector runs on 60-second bars, so labels here describe the same classifier applied at a coarser bar size, not a replay of live regime state.
+  - A trade is attributed entirely to the regime at its ENTRY. A trade held across a regime change is not split between them.
+
+Performance by full regime (trend/volatility/liquidity)
+Regime                      Candles  Exposure  Trades    Win%      PF   Expectancy     Net P&L   MaxDD%
+-------------------------------------------------------------------------------------------------------
+down/high/low                   361      2.7%       0     0.0    0.00        +0.00       +0.00     0.00
+down/high/normal                  4      0.0%       0     0.0    0.00        +0.00       +0.00     0.00
+down/low/low                    159      1.2%       1     0.0    0.00      -101.82     -101.82     0.08  *
+down/low/normal                  45      0.3%       0     0.0    0.00        +0.00       +0.00     0.00
+down/medium/low               3,736     28.4%       8    37.5    2.75       +64.53     +516.20     6.36  *
+down/medium/normal              455      3.5%       1     0.0    0.00       -59.83      -59.83     0.51  *
+flat/high/low                    74      0.6%       0     0.0    0.00        +0.00       +0.00     0.00
+flat/high/normal                 15      0.1%       0     0.0    0.00        +0.00       +0.00     0.00
+flat/low/low                    134      1.0%       2    50.0    1.70       +26.48      +52.96     0.76  *
+flat/low/normal                 105      0.8%       4     0.0    0.00      -105.70     -422.80     1.37  *
+flat/medium/high                  6      0.0%       0     0.0    0.00        +0.00       +0.00     0.00
+flat/medium/low               1,592     12.1%      11    45.5    0.44       -14.50     -159.50     1.16
+flat/medium/normal              571      4.3%       5    80.0   20.77      +126.62     +633.09     1.32  *
+up/high/low                     449      3.4%       1     0.0    0.00        -4.15       -4.15     0.83  *
+up/high/normal                   24      0.2%       0     0.0    0.00        +0.00       +0.00     0.00
+up/low/low                      114      0.9%       0     0.0    0.00        +0.00       +0.00     0.00
+up/low/normal                    74      0.6%       1   100.0     inf      +165.89     +165.89     0.10  *
+up/medium/high                    3      0.0%       0     0.0    0.00        +0.00       +0.00     0.00
+up/medium/low                 4,516     34.3%      25    32.0    1.14        +4.24     +105.89     2.65
+up/medium/normal                696      5.3%      12    16.7    0.57       -22.42     -269.01     1.43
+unclassified (warm-up)           19      0.1%       0     0.0    0.00        +0.00       +0.00     0.00
+-------------------------------------------------------------------------------------------------------
+Total trades bucketed: 71   (* = fewer than 10 trades)
+
+  - Small samples (down/low/low, down/medium/low, down/medium/normal, flat/low/low, flat/low/normal, flat/medium/normal, up/high/low, up/low/normal): fewer than 10 trades each. Per-regime expectancy over so few trades is not a finding.
+  - No trades were entered under: down/high/low, down/high/normal, down/low/normal, flat/high/low, flat/high/normal, flat/medium/high, up/high/normal, up/low/low, up/medium/high. That is an absence of evidence about those regimes, not evidence the strategy avoids them.
+  - Regimes are classified from the measured candles' own timeframe. The live detector runs on 60-second bars, so labels here describe the same classifier applied at a coarser bar size, not a replay of live regime state.
+  - A trade is attributed entirely to the regime at its ENTRY. A trade held across a regime change is not split between them.
+
+Validated measurement record
+------------------------------------------------------------
+Strategy                volatility_breakout
+Symbol                  BTCUSDT
+Parameters              fixed, fingerprint 44136fa355b3678a
+Range                   2020-01-01 → 2026-01-01
+Out-of-sample windows   13 (13 produced trades)
+Per-window consistency  mixed
+
+Expectancy per trade    +6.44
+Win rate                33.8%
+Profit factor           1.17
+Sample size             71 closed trades
+Source                  add-strategy-validation-tooling
+
+  - Per-window expectancy changes sign across windows. The pooled expectancy below is an average over states the strategy behaves differently in, and describes none of them.
+  - Produced for review only. This record is NOT wired into any live StrategyProposal; expected_edge_estimate remains None at runtime.
+
+
+===============================================================================
+[6/6] dip_recovery
+===============================================================================
+
+Walk-forward measurement: dip_recovery on BTCUSDT
+Range:      2020-01-01 → 2026-01-01
+Windows:    13 x 180d (step 180d)
+Parameters: fixed, fingerprint 44136fa355b3678a
+
+Window                      Candles  Trades    Win%      PF   Expectancy   MaxDD%   Return%      B&H%
+-----------------------------------------------------------------------------------------------------
+2020-01-01 → 2020-06-28       1,080       0     0.0    0.00        +0.00     0.00     +0.00    +26.89
+2020-06-29 → 2020-12-25       1,080       0     0.0    0.00        +0.00     0.00     +0.00   +171.15
+2020-12-26 → 2021-06-23       1,080       0     0.0    0.00        +0.00     0.00     +0.00    +36.28
+2021-06-24 → 2021-12-20       1,080       0     0.0    0.00        +0.00     0.00     +0.00    +39.31
+2021-12-21 → 2022-06-18       1,080       0     0.0    0.00        +0.00     0.00     +0.00    -59.56
+2022-06-19 → 2022-12-15       1,080       0     0.0    0.00        +0.00     0.00     +0.00     -8.51
+2022-12-16 → 2023-06-13       1,080       0     0.0    0.00        +0.00     0.00     +0.00    +49.42
+2023-06-14 → 2023-12-10       1,080       0     0.0    0.00        +0.00     0.00     +0.00    +68.85
+2023-12-11 → 2024-06-07       1,080       0     0.0    0.00        +0.00     0.00     +0.00    +58.38
+2024-06-08 → 2024-12-04       1,079       0     0.0    0.00        +0.00     0.00     +0.00    +42.15
+2024-12-05 → 2025-06-02       1,080       0     0.0    0.00        +0.00     0.00     +0.00     +7.37
+2025-06-03 → 2025-11-29       1,080       0     0.0    0.00        +0.00     0.00     +0.00    -14.22
+2025-11-30 → 2026-01-01         193       0     0.0    0.00        +0.00     0.00     +0.00     -3.47
+-----------------------------------------------------------------------------------------------------
+
+Windows measured: 13   with trades: 0   positive expectancy: 0   non-positive: 0
+Total closed trades: 0
+Consistency: NOT ASSESSABLE - fewer than two windows produced any trades.
+
+Limitations:
+  - Only 0 trade(s) across all windows (< 30). Per-trade expectancy over a sample this small is dominated by noise.
+  - 13 of 13 window(s) produced no trades at all. A window with no trades is neither evidence for nor against an edge; it is excluded from the consistency check.
+  - Each window is measured cold: indicator and regime warm-up happens inside the window, so the earliest bars of every window are effectively non-trading. Shorter windows lose proportionally more of their span to it.
+  - Fees and slippage are modelled, not observed. Live fills, funding, and partial fills will differ.
+  - This is a measurement of a fixed configuration, not a profitability claim and not a recommendation to change any parameter.
+
+
+No closed trades to break down by regime.
+
+Validated measurement record
+------------------------------------------------------------
+NOT PRODUCED. This measurement cannot support a validated record:
+  - No window produced any trades, so there is nothing to estimate from.
+  - No closed trades were measured; there is nothing to estimate.
+
+
+Cross-strategy summary (comparison, NOT a ranking)
+Strategy                Windows  Traded  Trades             Consistency   Pooled exp.    Record
+-----------------------------------------------------------------------------------------------
+dca_accumulator              13       0       0          not_assessable             -        no
+adaptive_grid                13       0       0          not_assessable             -        no
+mean_reversion               13      13     159                   mixed         +1.43       yes
+trend_following              13      12     364                   mixed        +24.43       yes
+volatility_breakout          13      13      71                   mixed         +6.44       yes
+dip_recovery                 13       0       0          not_assessable             -        no
+-----------------------------------------------------------------------------------------------
+
+Rows are in declaration order and are NOT sorted by performance. This table compares what was measured; it does not recommend a strategy, and the sample sizes here would not support one. 'Record' is whether the measurement met the bar for a validated out-of-sample record - see each strategy's section for why not, where it did not.
+'Pooled exp.' is expectancy per closed trade in quote currency, pooled across out-of-sample windows, and is blank where no record could be produced.
+IMPORTANT: 'Trades' counts CLOSED round trips only. A strategy that scales in and out without ever fully flattening - an accumulator, or a grid - can trade throughout a window and still show 0 here. A zero row therefore does NOT mean the strategy was inactive: read its Return%/MaxDD% columns above, which mark open positions to market. Expectancy per closed trade is simply not a meaningful measure for those strategies, which is why no record is produced for them rather than a misleading one.
+

@@ -75,11 +75,16 @@ def edge_record_blockers(result) -> Tuple[str, ...]:
             "must rest on multiple out-of-sample windows; one window is a backtest, "
             "not corroboration."
         )
-    if len(result.windows_with_trades) < MIN_TRADING_WINDOWS_FOR_A_RECORD:
+    trading_windows = len(result.windows_with_trades)
+    if trading_windows == 0:
         blockers.append(
-            f"Only {len(result.windows_with_trades)} window(s) produced any trades. "
-            "An estimate resting on a single window's trades is in-sample by another "
-            "name, however many windows were planned."
+            "No window produced any trades, so there is nothing to estimate from."
+        )
+    elif trading_windows < MIN_TRADING_WINDOWS_FOR_A_RECORD:
+        blockers.append(
+            f"Only {trading_windows} window(s) produced any trades. An estimate resting "
+            "on a single window's trades is in-sample by another name, however many "
+            "windows were planned."
         )
     if result.windows_overlap:
         blockers.append(

@@ -277,6 +277,34 @@ class TestEndToEnd:
         assert _tree_snapshot(data_root) == before
 
     @pytest.mark.asyncio
+    async def test_strategy_all_measures_every_strategy_in_one_pass(self, data_root, capsys):
+        from app.backtesting.validation.baseline import BASELINE_STRATEGIES
+
+        args = _args(data_root)
+        args.strategy = "all"
+        args.params = "{}"
+        args.skip_regime_report = True  # keep the test's runtime down
+        assert await cli._run(args) == 0
+
+        out = capsys.readouterr().out
+        for position, strategy in enumerate(BASELINE_STRATEGIES, start=1):
+            assert f"[{position}/{len(BASELINE_STRATEGIES)}] {strategy}" in out
+        assert "Cross-strategy summary (comparison, NOT a ranking)" in out
+
+    @pytest.mark.asyncio
+    async def test_strategy_all_refuses_a_single_params_dict(self, data_root, capsys):
+        """One --params dict cannot mean the same thing to six strategies."""
+        args = _args(data_root)
+        args.strategy = "all"
+        assert await cli._run(args) == 1
+        assert "cannot be combined" in capsys.readouterr().err
+
+    @pytest.mark.asyncio
+    async def test_a_single_strategy_prints_no_cross_strategy_summary(self, data_root, capsys):
+        assert await cli._run(_args(data_root)) == 0
+        assert "Cross-strategy summary" not in capsys.readouterr().out
+
+    @pytest.mark.asyncio
     async def test_insufficient_candles_fails_cleanly(self, tmp_path, capsys):
         root = tmp_path / "data" / "backtest"
         _write_hourly_csv(

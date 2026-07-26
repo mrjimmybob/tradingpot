@@ -203,11 +203,51 @@ parameter space, tune parameters, pick a "better" parameter set, or write
       forged source marker — the gate that makes this record legitimate.
 
 ## 5. Baseline Measurement Run
-- [ ] 5.1 Once Sections 1-4 are usable, measure all 6 strategies via
+- [x] 5.1 Once Sections 1-4 are usable, measure all 6 strategies via
       walk-forward + regime-conditioned reporting across the full available
       history (2020-2026) and record the results as the first objective,
       out-of-sample baseline this project has — a report a human reviews, with
       its sample-size limitations stated. No parameters are changed as a result.
+      `app/backtesting/validation/baseline.py` + `--strategy all` on the CLI:
+      loads the candle series once and measures all six concrete strategies
+      over identical windows and execution model, then prints a cross-strategy
+      summary. `auto_mode` is excluded (it selects among the six, so measuring
+      it would double-count whichever it picked). No parameters are supplied,
+      so each strategy falls back to its own internal defaults — which is
+      precisely what "never empirically validated" referred to.
+      The summary is a **comparison, not a ranking**: rows stay in declaration
+      order and are never sorted by result, with a test asserting that even
+      when the last-measured strategy has the best numbers. A sorted table
+      would be a recommendation wearing a table's clothes, and these sample
+      sizes would not support one.
+      **Results recorded in `STRATEGY_BASELINE_2020_2026.md`** (repo root), with
+      full raw reports at `baseline-raw-4h.txt` / `baseline-raw-1d.txt`
+      alongside this change. Run over `binance/BTCUSDT`, 2020-01-01 →
+      2026-01-01, 13 × 180d non-overlapping windows, at both 4h and 1d.
+      Headline findings: (1) **every** strategy that closed trades came back
+      `mixed` — no strategy's edge is stable across the 13 windows at either
+      resolution; (2) the headline number depends heavily on timeframe —
+      `trend_following` measures −26.76/trade at 1d and +24.43 at 4h, changing
+      sign on identical data and parameters; (3) `dca_accumulator`,
+      `adaptive_grid` and `dip_recovery` close zero round trips (they scale in
+      and out without flattening), so expectancy is not a meaningful measure
+      for them and the tooling refuses a record rather than printing a
+      misleading zero; (4) per-regime, `mean_reversion` and `trend_following`
+      both earn in up/flat and lose in down, while `volatility_breakout`
+      inverts that. **No parameter was changed as a result.**
+
+### Design notes for Section 5
+- **Zero closed trades is not inactivity.** The baseline surfaced that the
+  round-trip counter under-reports strategies that scale in and out without
+  fully flattening: `adaptive_grid` returned −1.64% in a window where
+  buy-and-hold returned +26.89%, while showing 0 trades. The summary now says
+  this explicitly and points at the Return%/MaxDD% columns, and the
+  walk-forward limitations flag unrealised mark-to-market wherever it occurs.
+  Measuring these three strategies properly needs return/drawdown-vs-benchmark
+  measures the tooling does not yet provide — recorded as a gap, not silently
+  papered over.
+- **Both 4h and 1d are reported**, because the disagreement between them is one
+  of the findings rather than an inconvenience to be resolved by picking one.
 
 ## Explicitly Out of Scope (deferred to a future, separate change)
 - Parameter optimisation / search / sweep of any kind, and any objective that

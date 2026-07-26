@@ -37,7 +37,16 @@ from datetime import datetime, timezone
 from app.backtesting.data_provider import CsvHistoricalDataProvider, DataIntegrityError
 from app.backtesting.engine import BacktestEngine
 from app.backtesting.execution_model import BacktestExecutionModel
-from app.backtesting.validation.edge_record import format_edge_record_report
+from app.backtesting.validation.baseline import (
+    BASELINE_STRATEGIES,
+    BaselineEntry,
+    format_baseline_summary,
+)
+from app.backtesting.validation.edge_record import (
+    build_validated_edge_record,
+    edge_record_blockers,
+    format_edge_record_report,
+)
 from app.backtesting.validation.measurement import FixedConfig, MeasurementSpan
 from app.backtesting.validation.regime import (
     bucket_trades_by_regime,
@@ -61,6 +70,10 @@ _DEFAULT_DATA_ROOT = _REPO_ROOT / "data" / "backtest"
 # fraction of it. A run-time choice, not a contract; override with --window-days.
 _DEFAULT_WINDOW_DAYS = 180
 
+# --strategy all: measure every concrete strategy over one range in one pass,
+# loading the candle series only once.
+ALL_STRATEGIES = "all"
+
 
 def _parse_date(value: str) -> int:
     """"YYYY-MM-DD" -> unix milliseconds (UTC midnight)."""
@@ -79,7 +92,12 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--exchange", required=True, help="e.g. binance")
     parser.add_argument("--symbol", required=True, help="e.g. BTCUSDT")
     parser.add_argument("--timeframe", required=True, help="e.g. 1m, 5m, 15m, 1h, 4h, 1d")
-    parser.add_argument("--strategy", required=True, help="e.g. dca_accumulator, mean_reversion, ...")
+    parser.add_argument(
+        "--strategy", required=True,
+        help="e.g. dca_accumulator, mean_reversion, ... or 'all' to measure every "
+             "concrete strategy over the same range in one pass (loading candles once) "
+             "and print a cross-strategy comparison",
+    )
     parser.add_argument("--start", default=None, help="YYYY-MM-DD (inclusive)")
     parser.add_argument("--end", default=None, help="YYYY-MM-DD (inclusive)")
     parser.add_argument(
@@ -160,9 +178,22 @@ async def _run(args: argparse.Namespace) -> int:
         print("--step-days must be positive", file=sys.stderr)
         return 1
 
+    strategies = _resolve_strategies(args.strategy)
     from app.services.trading_engine import TradingEngine
-    if TradingEngine()._get_strategy_executor(args.strategy) is None:
-        print(f"Unknown strategy {args.strategy!r}.", file=sys.stderr)
+    trading_engine = TradingEngine()
+    for name in strategies:
+        if trading_engine._get_strategy_executor(name) is None:
+            print(f"Unknown strategy {name!r}.", file=sys.stderr)
+            return 1
+    if args.strategy == ALL_STRATEGIES and strategy_params:
+        # One --params dict cannot mean the same thing to six different
+        # strategies, and silently applying it to all of them would produce a
+        # baseline of something nobody configured.
+        print(
+            f"--params cannot be combined with --strategy {ALL_STRATEGIES}; measure a "
+            "single strategy to supply explicit parameters.",
+            file=sys.stderr,
+        )
         return 1
 
     engine = BacktestEngine(
@@ -184,13 +215,6 @@ async def _run(args: argparse.Namespace) -> int:
         print(f"Loaded {len(candles)} candle(s); need at least 2 to measure.", file=sys.stderr)
         return 1
 
-    config = FixedConfig(
-        strategy=args.strategy,
-        trading_pair=args.symbol,
-        params=strategy_params,
-        starting_balance=args.starting_balance,
-    )
-
     def _report_window(index: int, total: int, measurement) -> None:
         print(
             f"  window {index}/{total}  {measurement.span.label()}  "
@@ -198,28 +222,55 @@ async def _run(args: argparse.Namespace) -> int:
             flush=True,
         )
 
-    try:
-        result = await run_walk_forward(
-            engine,
-            candles,
-            config,
-            window_ms=args.window_days * MS_PER_DAY,
-            step_ms=args.step_days * MS_PER_DAY if args.step_days else None,
-            span=MeasurementSpan(start_ms=start_ms, end_ms=end_ms),
-            quiet=True,  # the engine's own per-candle bar would drown the run
-            on_window=None if args.quiet else _report_window,
+    span = MeasurementSpan(start_ms=start_ms, end_ms=end_ms)
+    entries = []
+    for position, name in enumerate(strategies, start=1):
+        if len(strategies) > 1:
+            print(f"\n{'=' * 79}\n[{position}/{len(strategies)}] {name}\n{'=' * 79}", flush=True)
+
+        config = FixedConfig(
+            strategy=name,
+            trading_pair=args.symbol,
+            params=strategy_params,
+            starting_balance=args.starting_balance,
         )
-    except ValueError as e:
-        print(f"Measurement could not run: {e}", file=sys.stderr)
-        return 1
+        try:
+            result = await run_walk_forward(
+                engine,
+                candles,
+                config,
+                window_ms=args.window_days * MS_PER_DAY,
+                step_ms=args.step_days * MS_PER_DAY if args.step_days else None,
+                span=span,
+                quiet=True,  # the engine's own per-candle bar would drown the run
+                on_window=None if args.quiet else _report_window,
+            )
+        except ValueError as e:
+            print(f"Measurement could not run: {e}", file=sys.stderr)
+            return 1
 
-    print(format_walk_forward_report(result))
+        print(format_walk_forward_report(result))
+        if not args.skip_regime_report:
+            _print_regime_reports(candles, result, quiet=args.quiet)
+        print(format_edge_record_report(result))
 
-    if not args.skip_regime_report:
-        _print_regime_reports(candles, result, quiet=args.quiet)
+        entries.append(BaselineEntry(
+            strategy=name,
+            walk_forward=result,
+            record=build_validated_edge_record(result),
+            blockers=edge_record_blockers(result),
+        ))
 
-    print(format_edge_record_report(result))
+    if len(entries) > 1:
+        print(format_baseline_summary(entries))
     return 0
+
+
+def _resolve_strategies(requested: str) -> list:
+    """``all`` expands to the six concrete strategies; anything else is itself."""
+    if requested == ALL_STRATEGIES:
+        return list(BASELINE_STRATEGIES)
+    return [requested]
 
 
 def _print_regime_reports(candles, result, quiet: bool) -> None:

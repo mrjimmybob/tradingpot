@@ -180,7 +180,12 @@ class TestRecordIsRefusedWhenItWouldMislead:
     @pytest.mark.asyncio
     async def test_no_trades_cannot_produce_a_record(self):
         result = await _walk_forward([[], [], [], []])
-        assert any("nothing to estimate" in b for b in edge_record_blockers(result))
+        blockers = edge_record_blockers(result)
+
+        assert any("nothing to estimate" in b for b in blockers)
+        # With zero trading windows the "resting on a single window" wording
+        # would be plainly wrong, so it must not appear.
+        assert not any("single window" in b for b in blockers)
         assert build_validated_edge_record(result) is None
 
     @pytest.mark.asyncio
