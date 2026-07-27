@@ -231,16 +231,58 @@ fix is not a disguised parameter change — **`dip_recovery` still loses money a
 The all-strategy 4h baseline is **byte-identical** before and after for all six
 strategies: nothing else moved.
 
-### Remaining, NOT fixed here
+---
 
+## Second correction: the setup logic (2026-07-27)
+
+Implemented as `fix-dip-recovery-setup-cadence`. The first fix moved *volatility*
+onto bars; the setup logic was still tick-denominated, which is the same defect.
 `reference_high_lookback_ticks` (60), `ema_slope_period` (5) and
-`min_ticks_without_new_low` (2) are still denominated in evaluation ticks. At the
-live ~1s cadence the "recent high" a decline is measured against therefore spans
-~60 seconds rather than the 60 minutes the defaults imply, so live entries now
-require a *fast* drop (≥1.5% within about a minute) rather than the slower
-setup the defaults describe.
+`min_ticks_without_new_low` (2) counted **evaluations**, and the regime gate read
+the raw tick series.
 
-This is the same class of mismatch, but correcting it changes what the strategy
-means by a "setup" — entry semantics, not the volatility calculation — and so
-falls outside "replace the obsolete volatility calculation". It is recorded here
-as a known, separate question rather than silently changed.
+The setup lifecycle now advances **once per completed bar** and reads bar
+highs/closes; exits still run on every evaluation, ahead of the per-bar gate, so
+a stop reacts when price moves. Again **no parameter value was changed.**
+
+### Measured impact — live cadence
+
+A 2% decline spread over 30 minutes (an ordinary dip), evaluated once a second.
+`bar_interval_seconds=1` reproduces the old 60-evaluation lookback exactly:
+
+| | Lookback spans | Result |
+|---|---|---|
+| Before | 60 seconds | **IDLE** — never detected |
+| After | 60 minutes | **TRACKING_DROP** — armed, reference high 100.0 |
+
+The strategy's entire thesis is "a significant decline, then a confirmed
+reversal". Before this fix, at its real cadence, **any decline slower than about
+a minute was invisible to it** — it could only ever have seen a flash crash.
+
+### Measured impact — backtests (near-nil again)
+
+| Timeframe | | Trades | Expectancy | Profit factor |
+|---|---|---|---|---|
+| 1h | before → after | 342 → 345 | −26.94 → −25.73 | 0.62 → 0.63 |
+| 15m | before → after | 417 → 417 | −20.52 → −20.71 | 0.54 → 0.54 |
+
+Same reason as before: one candle completes one bar, so the setup path still
+advances on every candle. The all-strategy 4h baseline is again identical for all
+six strategies. **`dip_recovery` still loses money at 1h with its shipped
+defaults** — neither correction changed that, and neither was intended to.
+
+### Two safety points worth recording
+
+- **Exits are not deferred to bar close.** The per-bar gate sits behind exit
+  management; deferring a stop to the end of a bar would have been a real risk
+  regression.
+- **The warm-up gate is skipped while a position is open.** A bar-based warm-up
+  would otherwise leave a bot resuming from pre-bar-aggregation state holding an
+  unmanaged position for `atr_period` bars — the hazard
+  `_PERSISTED_PRICE_HISTORY_LEN` already exists to prevent. Caught by a test.
+
+### Still bounded above
+
+`setup_expiry_minutes` (240) is unchanged and still caps the usable evaluation
+interval: at 4h a setup gets exactly one evaluation and can never be confirmed.
+The validation tooling's cadence check warns about this automatically.

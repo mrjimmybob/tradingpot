@@ -1,0 +1,89 @@
+
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+CADENCE WARNING: this timeframe is too coarse for dip_recovery
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+  - cooldown_seconds = 5 min vs a 60 min candle interval: resolves within a SINGLE candle, so it cannot function at all. (Pause before monitoring resumes after any exit)
+  - loss_cooldown_seconds = 30 min vs a 60 min candle interval: resolves within a SINGLE candle, so it cannot function at all. (Extended pause after a losing exit (must be >= cooldown_seconds))
+
+A mechanism above cannot function at this candle interval, so these results do not describe how the strategy would behave live.
+Strategy time constants are written for the ~60s cadence the engine runs at live; a backtest evaluates once per candle.
+
+Walk-forward measurement: dip_recovery on BTCUSDT
+Range:      2020-01-01 → 2026-01-01
+Windows:    13 x 180d (step 180d)
+Parameters: fixed, fingerprint 44136fa355b3678a
+
+Window                      Candles  Trades    Win%      PF   Expectancy   MaxDD%   Return%      B&H%
+-----------------------------------------------------------------------------------------------------
+2020-01-01 → 2020-06-28       4,320      22    40.9    1.11        +6.51     9.09     +1.43    +26.89
+2020-06-29 → 2020-12-25       4,315      20    35.0    0.36       -57.01    12.74    -11.40   +171.15
+2020-12-26 → 2021-06-23       4,313      47    38.3    0.67       -28.32    19.36    -13.31    +36.28
+2021-06-24 → 2021-12-20       4,314      20    30.0    0.71       -23.52    10.46     -4.70    +39.31
+2021-12-21 → 2022-06-18       4,320      20    30.0    0.67       -19.68    11.19     -3.94    -59.56
+2022-06-19 → 2022-12-15       4,320      20    25.0    0.51       -36.74    15.31     -7.35     -8.51
+2022-12-16 → 2023-06-13       4,319      20    20.0    0.37       -43.89    10.09     -8.78    +49.42
+2023-06-14 → 2023-12-10       4,320      24    33.3    0.82        -8.08     5.01     -1.94    +68.85
+2023-12-11 → 2024-06-07       4,320      52    38.5    0.90        -6.95    11.56     -3.61    +58.38
+2024-06-08 → 2024-12-04       4,315      24    29.2    0.70       -19.85     6.57     -4.76    +42.15
+2024-12-05 → 2025-06-02       4,320      20    10.0    0.11       -89.91    18.02    -17.98     +7.37
+2025-06-03 → 2025-11-29       4,320      47    44.7    0.66       -16.66    11.89     -7.83    -14.22
+2025-11-30 → 2026-01-01         769       9    33.3    0.34       -51.12     5.03     -4.60     -3.47
+-----------------------------------------------------------------------------------------------------
+
+Windows measured: 13   with trades: 13   positive expectancy: 1   non-positive: 12
+Total closed trades: 345
+Consistency: MIXED - 1 of 13 trading windows had positive expectancy and the rest did not. The strategy's result depends on which period it is measured over, so no single-window number describes it.
+
+Limitations:
+  - Each window is measured cold: indicator and regime warm-up happens inside the window, so the earliest bars of every window are effectively non-trading. Shorter windows lose proportionally more of their span to it.
+  - Fees and slippage are modelled, not observed. Live fills, funding, and partial fills will differ.
+  - This is a measurement of a fixed configuration, not a profitability claim and not a recommendation to change any parameter.
+
+
+Benchmark-relative measurement by window: dip_recovery
+Window                       Return%   MaxDD%   Ret/DD   Expo       vs buy-and-hold       vs periodic DCA
+---------------------------------------------------------------------------------------------------------
+2020-01-01 → 2020-06-28        +1.43     9.09     0.16   0.01      -25.3% / -52.1dd       -9.2% / -17.6dd
+2020-06-29 → 2020-12-25       -11.40    12.74    -0.89   0.04      -182.3% / -7.3dd      -115.3% / -0.7dd
+2020-12-26 → 2021-06-23       -13.31    19.36    -0.69   0.04      -49.5% / -35.4dd       +8.0% / -29.2dd
+2021-06-24 → 2021-12-20        -4.70    10.46    -0.45   0.02      -43.9% / -23.0dd       -6.6% / -20.6dd
+2021-12-21 → 2022-06-18        -3.94    11.19    -0.35   0.02      +55.7% / -54.5dd      +45.9% / -45.2dd
+2022-06-19 → 2022-12-15        -7.35    15.31    -0.48   0.03       +1.3% / -21.9dd        +5.1% / -8.9dd
+2022-12-16 → 2023-06-13        -8.78    10.09    -0.87   0.02      -58.0% / -11.7dd       -20.0% / -5.0dd
+2023-06-14 → 2023-12-10        -1.94     5.01    -0.39   0.04      -70.6% / -15.8dd       -47.9% / -2.8dd
+2023-12-11 → 2024-06-07        -3.61    11.56    -0.31   0.09      -61.8% / -11.1dd       -32.1% / -6.3dd
+2024-06-08 → 2024-12-04        -4.76     6.57    -0.73   0.05      -46.8% / -22.3dd       -54.5% / -3.8dd
+2024-12-05 → 2025-06-02       -17.98    18.02    -1.00   0.03      -25.2% / -12.9dd       -29.8% / +1.5dd
+2025-06-03 → 2025-11-29        -7.83    11.89    -0.66   0.08       +6.5% / -22.9dd       +9.8% / -19.1dd
+2025-11-30 → 2026-01-01        -4.60     5.03    -0.91   0.06        -1.0% / -5.3dd        -2.7% / -0.5dd
+---------------------------------------------------------------------------------------------------------
+Windows with higher return than buy-and-hold: 3 of 13
+Windows with higher return than periodic DCA (cadence 7d): 4 of 13
+Closed round trips across all windows: 345
+
+Columns after Expo are 'excess return / drawdown difference' versus that benchmark. Negative drawdown difference means the strategy drew down LESS than the benchmark.
+
+  - Closed-trade counts understate strategies that scale out without ever fully flattening: the backtest portfolio records a closed trade only on a FULL close (portfolio.py:65-73). Realised P&L from partial exits is in the equity curve above but not in the trade count.
+  - Exposure (0.04) is the beta of equity returns to the asset's - a proxy for average deployment, not a measured cash/asset split. A strategy below ~1.0 was less exposed than buy-and-hold, so part of any shortfall against it is exposure rather than selection.
+  - Excess return is NOT skill when exposure differs. Compare a gradually deploying strategy against the periodic-DCA benchmark, which deploys on a comparable schedule, rather than against buy-and-hold.
+  - Benchmark costs are modelled with the same fee model the strategy paid, not observed. Benchmarks pay fees; they are not frictionless ideals.
+
+
+Validated measurement record
+------------------------------------------------------------
+Strategy                dip_recovery
+Symbol                  BTCUSDT
+Parameters              fixed, fingerprint 44136fa355b3678a
+Range                   2020-01-01 → 2026-01-01
+Out-of-sample windows   13 (13 produced trades)
+Per-window consistency  mixed
+
+Expectancy per trade    -25.73
+Win rate                33.6%
+Profit factor           0.63
+Sample size             345 closed trades
+Source                  add-strategy-validation-tooling
+
+  - Per-window expectancy changes sign across windows. The pooled expectancy below is an average over states the strategy behaves differently in, and describes none of them.
+  - Produced for review only. This record is NOT wired into any live StrategyProposal; expected_edge_estimate remains None at runtime.
+

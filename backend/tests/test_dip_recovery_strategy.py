@@ -305,6 +305,9 @@ class TestSetupExpiry:
         engine._dip_recovery_states = {
             bot.id: {
                 **engine._dip_recovery_default_state(),
+                # Setup detection is bar-paced, so a warm bot needs bars, not
+                # just ticks (fix-dip-recovery-setup-cadence).
+                "dr_bars": [{"high": 100.0, "low": 100.0, "close": 100.0}] * 20,
                 "state": _DipRecoveryState.TRACKING_DROP,
                 "reference_high": 100.0,
                 "reference_high_time": datetime.utcnow() - timedelta(minutes=500),

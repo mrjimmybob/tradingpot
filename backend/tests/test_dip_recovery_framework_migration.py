@@ -61,12 +61,20 @@ def _capture_proposals(monkeypatch) -> list:
     return captured
 
 
+# Bars, not evaluations, pace the setup logic (fix-dip-recovery-setup-cadence).
+# These tests drive the strategy in a tight loop under the real clock, so no bar
+# would ever close. bar_interval_seconds=0 closes one per call, which reproduces
+# the per-call semantics these tests were written against exactly - the harness
+# convention trend_following already documents.
+_TICK_PARAMS = {"bar_interval_seconds": 0}
+
+
 async def _drive_to_buy(engine, bot, monkeypatch, *, params=None):
     """Feed the decline->recovery series until a BUY fires. Returns
     (buy_signal_or_None, captured_proposals)."""
     engine._get_bot_positions = AsyncMock(return_value=[])
     captured = _capture_proposals(monkeypatch)
-    params = params or {}
+    params = {**_TICK_PARAMS, **(params or {})}
     buy = None
     for p in _ENTRY_PRICES:
         sig = await engine._strategy_dip_recovery(bot, p, params, AsyncMock())
@@ -234,7 +242,7 @@ class TestStrategyEdgeManagement:
         engine._dip_recovery_states = {bot.id: _long_open_state(entry=90.0, atr=1.0)}
         engine._get_bot_positions = AsyncMock(return_value=[SimpleNamespace(amount=1.0)])
         # Price between trailing stop and take-profit -> no exit trigger.
-        sig = await engine._strategy_dip_recovery(bot, 90.2, {}, AsyncMock())
+        sig = await engine._strategy_dip_recovery(bot, 90.2, _TICK_PARAMS, AsyncMock())
         assert sig.action == "hold"  # NOT force-closed despite Category C
 
 
@@ -307,7 +315,7 @@ class TestExitPaths:
         engine._get_bot_positions = AsyncMock(return_value=[SimpleNamespace(amount=1.0)])
         captured = _capture_proposals(monkeypatch)
         # Price at/above take_profit (90 + 3*1 = 93).
-        sig = await engine._strategy_dip_recovery(bot, 93.5, {}, AsyncMock())
+        sig = await engine._strategy_dip_recovery(bot, 93.5, _TICK_PARAMS, AsyncMock())
         assert sig.action == "sell"
         prop = captured[-1]
         assert prop.direction == Direction.SELL
@@ -324,6 +332,6 @@ class TestExitPaths:
         engine._get_bot_positions = AsyncMock(return_value=[SimpleNamespace(amount=1.0)])
         captured = _capture_proposals(monkeypatch)
         # Hold (price between stops) so the HOLD proposal carries the checks.
-        await engine._strategy_dip_recovery(bot, 90.2, {}, AsyncMock())
+        await engine._strategy_dip_recovery(bot, 90.2, _TICK_PARAMS, AsyncMock())
         exp = captured[-1].explanation
         assert any(c["name"] == "Emergency stop hit" for c in exp["checks"])

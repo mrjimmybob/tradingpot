@@ -5755,15 +5755,28 @@ class TradingEngine:
         than suspicious: one candle produces one bar, so a bar's range is the
         candle-to-candle move the old proxy already measured.
 
-        STILL TICK-DENOMINATED, and deliberately left alone (correcting them
-        would change entry semantics, not the volatility calculation):
-        `reference_high_lookback_ticks`, `ema_slope_period`, and
-        `min_ticks_without_new_low` still count EVALUATIONS. At the live ~1s
-        cadence the "recent high" a decline is measured against therefore spans
-        ~60 seconds rather than the 60 minutes the defaults imply, so live
-        entries require a fast drop. Above 1h between evaluations the strategy
-        is also bounded by `setup_expiry_minutes` (at 4h a setup gets exactly
-        one evaluation and can never be confirmed).
+        The SETUP lifecycle is bar-paced for the same reason
+        (fix-dip-recovery-setup-cadence): reference-high tracking, decline
+        detection, low tracking and reversal confirmation advance once per
+        completed bar, and read bar highs/closes rather than the raw tick
+        series. `reference_high_lookback_ticks` (60), `ema_slope_period` (5) and
+        `min_ticks_without_new_low` (2) therefore count BARS - 60 minutes, 5
+        minutes and 2 minutes at the default interval - which is what their
+        defaults describe. Running them per evaluation meant a "60-tick recent
+        high" spanned 60 SECONDS live, so a 2% decline spread over half an hour
+        was invisible to the strategy entirely.
+
+        EXITS are deliberately NOT bar-paced: `_dip_recovery_manage_exit` runs
+        on every evaluation, ahead of the per-bar gate, because a stop has to
+        react when price moves rather than at the end of a bar. The warm-up gate
+        is likewise skipped while a position is open, so a bot resuming from
+        state that predates bar aggregation never sits in "collecting data"
+        holding an unmanaged position.
+
+        Still bounded above by `setup_expiry_minutes`: at 4h between evaluations
+        a setup gets exactly one evaluation and can never be confirmed, so
+        backtests at that resolution report nothing meaningful for this
+        strategy (the validation tooling's cadence check warns about it).
 
         Parameters (sane crypto defaults; also documented in
         validate_dip_recovery_params and app/routers/config.py STRATEGIES):
@@ -5856,6 +5869,7 @@ class TradingEngine:
         _dr_cb["high"] = max(_dr_cb["high"], current_price)
         _dr_cb["low"] = min(_dr_cb["low"], current_price)
         _dr_cb["close"] = current_price
+        bar_completed = False
         if (now - _dr_cb["start_ts"]).total_seconds() >= bar_interval_seconds:
             state["dr_bars"].append(dict(_dr_cb))
             state["dr_bars"] = state["dr_bars"][-100:]
@@ -5863,20 +5877,44 @@ class TradingEngine:
                 "high": current_price, "low": current_price,
                 "close": current_price, "start_ts": now,
             }
+            bar_completed = True
+
+        # Every SETUP input is read from the bar closes, never from the raw tick
+        # series (fix-dip-recovery-setup-cadence). `reference_high_lookback_ticks`,
+        # `ema_slope_period` and `min_ticks_without_new_low` are counts, so they
+        # only describe the span of market time their defaults imply if what they
+        # count is bars. Reading raw evaluations instead made the "recent high"
+        # span ~60 seconds live rather than 60 minutes.
+        bar_closes = [b["close"] for b in state["dr_bars"]]
+        previous_bar_close = bar_closes[-2] if len(bar_closes) >= 2 else (
+            bar_closes[-1] if bar_closes else current_price
+        )
 
         exp = self._explain(bot.id)
 
-        # Warm-up gate: need enough ticks for a meaningful ATR proxy.
-        if len(price_history) < atr_period + 1:
+        # Warm-up gate: need enough BARS for a meaningful ATR and lookback.
+        #
+        # Skipped entirely while a position is open. A bot resuming from state
+        # saved before bar aggregation existed has no bars yet, and refusing to
+        # act until it collects `atr_period` of them would leave a real open
+        # position unmanaged for that long - the same hazard
+        # _PERSISTED_PRICE_HISTORY_LEN exists to prevent ("a resumed bot does
+        # not sit in a 'collecting data' warmup while holding an unmanaged open
+        # position"). Exit levels were locked at entry and the ATR below is
+        # floored, so exits are safe to manage without a warm ATR window;
+        # only ENTRY needs one.
+        positions = await self._get_bot_positions(bot.id, session)
+        _warming_up = len(bar_closes) < atr_period + 1
+        if _warming_up and not positions:
             self._dip_recovery_states[bot.id] = state
             exp.state(state["state"]).metric("current_price", current_price).check(
-                "History collected", len(price_history), f">= {atr_period + 1}", False,
+                "Bars collected", len(bar_closes), f">= {atr_period + 1}", False,
                 detail="warming up ATR window",
             )
             return TradeSignal(
                 action="hold",
                 amount=0,
-                reason=f"Dip Recovery: Collecting data ({len(price_history)}/{atr_period + 1})"
+                reason=f"Dip Recovery: Collecting data ({len(bar_closes)}/{atr_period + 1})"
             )
 
         # ATR from completed bar high-low ranges, so `atr_period` denotes
@@ -5902,9 +5940,9 @@ class TradingEngine:
         atr = max(bar_atr, current_price * _dr_min_atr_pct)
 
         atr_percent = (atr / current_price * 100.0) if current_price > 0 else 0.0
-        is_spike = atr > 0 and abs(current_price - previous_price) > (atr * spike_guard_mult)
+        is_spike = atr > 0 and abs(current_price - previous_bar_close) > (atr * spike_guard_mult)
 
-        positions = await self._get_bot_positions(bot.id, session)
+        # positions fetched above, before the warm-up gate
         has_position = len(positions) > 0
 
         # === STRATEGY DECISION FRAMEWORK (Phase 3 migration) ===
@@ -5928,7 +5966,7 @@ class TradingEngine:
         # bar_interval_seconds is read at the top of this method (the ATR bars
         # need it before the warm-up early-return).
         _validity_interval_seconds = max(bar_interval_seconds, 1)
-        current_regime = self._detect_market_regime(price_history, None)
+        current_regime = self._detect_market_regime(bar_closes, None)
         suitability = MarketSuitabilityGate().evaluate(current_regime, allowed_regimes)
         # Category B ("parameter mismatch") is never cited for this strategy:
         # its entry thresholds are ALREADY ATR-adaptive (Pillar 4, "best of the
@@ -5990,12 +6028,44 @@ class TradingEngine:
             state = self._dip_recovery_reset_state(state)
             self._dip_recovery_states[bot.id] = state
 
+        # Exits are evaluated on EVERY call, deliberately ahead of the per-bar
+        # gate below: a stop has to react when price moves, not at the end of a
+        # bar. Only the setup lifecycle is bar-paced.
         if has_position:
             return self._dip_recovery_manage_exit(
                 bot, state, positions, current_price, atr, now,
                 take_profit_atr_mult, trailing_atr_mult, emergency_atr_mult,
                 max_duration_min, cooldown_seconds, loss_cooldown_seconds, exp,
                 mk_proposal, edge_manager,
+            )
+
+        # === PER-BAR SETUP GATE (fix-dip-recovery-setup-cadence) ===
+        # Everything below advances the setup lifecycle, and its counters
+        # (`min_ticks_without_new_low`) and windows are denominated in bars. If
+        # this ran on every evaluation, the live ~1s loop would advance a
+        # "2-tick" confirmation in 2 seconds rather than the 2 minutes the
+        # default describes. Running it once per completed bar is what makes
+        # those counts mean the span of market time they claim to.
+        #
+        # In a backtest one candle completes one bar, so this gate does not fire
+        # and the setup path still advances on every candle - which is why
+        # backtest results are essentially unchanged by this.
+        if not bar_completed:
+            self._dip_recovery_states[bot.id] = state
+            exp.state(state["state"]).update({
+                "current_price": current_price, "atr": atr, "atr_percent": atr_percent,
+                "bars_collected": len(bar_closes),
+            })
+            return hold_via(
+                mk_proposal(
+                    direction=Direction.NO_TRADE, execution_intent=ExecutionIntent.NO_ACTION,
+                    evidence_name="Bar in progress", evidence_value=0.0,
+                    evidence_reason=(
+                        "setup detection advances once per "
+                        f"{bar_interval_seconds}s bar; this bar is still forming"
+                    ),
+                ),
+                f"Dip Recovery: Bar in progress ({bar_interval_seconds}s) - setup unchanged",
             )
 
         # === COOLDOWN ===
@@ -6032,8 +6102,12 @@ class TradingEngine:
 
         # === IDLE: watch for a significant decline ===
         if state["state"] == _DipRecoveryState.IDLE:
-            window = price_history[-ref_high_lookback:]
-            # A single-tick spike must not anchor the reference high.
+            # Bar HIGHS, not closes: "the recent high" means the highest price
+            # actually traded in the window, which is what the tick series used
+            # to give. Using closes would silently discard every intra-bar peak
+            # and understate the decline the strategy is trying to detect.
+            window = [b["high"] for b in state["dr_bars"][-ref_high_lookback:]]
+            # A single-bar spike must not anchor the reference high.
             if is_spike and len(window) > 1:
                 window = window[:-1]
             reference_high = max(window) if window else current_price
@@ -6110,7 +6184,7 @@ class TradingEngine:
 
         # === TRACKING_DROP / WAITING_REVERSAL ===
         return self._dip_recovery_manage_setup(
-            bot, state, price_history, current_price, atr, atr_percent, is_spike, now,
+            bot, state, bar_closes, current_price, atr, atr_percent, is_spike, now,
             recovery_threshold, require_ema_slope, ema_slope_period,
             require_no_new_low, min_ticks_no_new_low, setup_expiry_min,
             risk_percent, take_profit_atr_mult, trailing_atr_mult, emergency_atr_mult,
@@ -6122,7 +6196,7 @@ class TradingEngine:
         self,
         bot: Bot,
         state: dict,
-        price_history: list,
+        bar_closes: list,
         current_price: float,
         atr: float,
         atr_percent: float,
@@ -6241,7 +6315,7 @@ class TradingEngine:
             )
 
         # Price has bounced off the low - evaluate reversal confirmation.
-        ema_series = self._calculate_ema(price_history, ema_slope_period)
+        ema_series = self._calculate_ema(bar_closes, ema_slope_period)
         ema_slope_positive = len(ema_series) >= 2 and ema_series[-1] > ema_series[-2]
         ema_ok = (not require_ema_slope) or ema_slope_positive
 

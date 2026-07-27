@@ -43,11 +43,13 @@ def _engine_at(start_ms: int = START_MS) -> tuple:
 
 
 async def _drive(engine, clock, bot, samples, params=None):
-    """Feed (seconds_from_start, price) samples through the strategy."""
+    """Feed (seconds_from_start, price) samples; return the last signal."""
     session = AsyncMock()
+    signal = None
     for offset_s, price in samples:
         clock.set(START_MS + int(offset_s * 1000))
-        await engine._strategy_dip_recovery(bot, price, params or {}, session)
+        signal = await engine._strategy_dip_recovery(bot, price, params or {}, session)
+    return signal
 
 
 def _atr_of(engine, bot_id: int) -> float:
@@ -117,16 +119,30 @@ class TestAtrIsIndependentOfEvaluationCadence:
 
 class TestFeeCoverageFloor:
     @pytest.mark.asyncio
-    async def test_warm_up_never_produces_a_stop_inside_the_fee_hurdle(self):
-        """Before `atr_period` bars exist there is no measured volatility, and a
-        near-zero ATR would place every exit inside the cost of trading."""
+    async def test_a_dead_calm_market_never_produces_a_stop_inside_the_fee_hurdle(self):
+        """Measured volatility can be far smaller than the cost of trading. A
+        near-zero ATR would place every exit inside the round-trip fee."""
         engine, clock = _engine_at()
         bot = _bot()
-        # 20 evaluations one second apart: plenty of ticks, but under one bar.
-        await _drive(engine, clock, bot, [(i, 100.0 + i * 0.001) for i in range(20)])
+        # 20 bars whose ranges are negligible next to the ~0.25% fee hurdle.
+        await _drive(engine, clock, bot, [(i * 60, 100.0 + i * 0.0001) for i in range(20)])
+
+        bars = engine._dip_recovery_states[bot.id]["dr_bars"]
+        assert len(bars) >= 14
+        assert max(b["high"] - b["low"] for b in bars) < 0.01, "fixture must be near-flat"
+        assert _atr_of(engine, bot.id) == pytest.approx(100.0 * _floor_pct(), rel=1e-3)
+
+    @pytest.mark.asyncio
+    async def test_warm_up_holds_until_enough_bars_exist(self):
+        """With no position open, the strategy waits for a real ATR window
+        rather than acting on one bar."""
+        engine, clock = _engine_at()
+        bot = _bot()
+        signal = await _drive(engine, clock, bot, [(i, 100.0 + i * 0.001) for i in range(20)])
 
         assert engine._dip_recovery_states[bot.id]["dr_bars"] == []
-        assert _atr_of(engine, bot.id) == pytest.approx(100.019 * _floor_pct(), rel=1e-3)
+        assert signal.action == "hold"
+        assert "Collecting data" in signal.reason
 
     @pytest.mark.asyncio
     async def test_a_larger_measured_volatility_takes_over_from_the_floor(self):
@@ -147,7 +163,7 @@ class TestFeeCoverageFloor:
         engine, clock = _engine_at()
         bot = _bot()
         bot.exchange_fee = 0.5  # a pricier venue needs a wider minimum
-        await _drive(engine, clock, bot, [(i, 100.0) for i in range(20)])
+        await _drive(engine, clock, bot, [(i * 60, 100.0) for i in range(20)])
 
         expected_pct = 2.0 * 0.005 + _VIABILITY_SAFETY_MARGIN_PCT
         assert _atr_of(engine, bot.id) == pytest.approx(100.0 * expected_pct, rel=1e-6)
@@ -178,6 +194,117 @@ class TestLiveCadenceRegression:
             f"take-profit {take_profit_pct * 100:.4f}% must clear the "
             f"{hurdle * 100:.3f}% fee hurdle at the live cadence"
         )
+
+
+class TestSetupAdvancesInMarketTime:
+    """fix-dip-recovery-setup-cadence: the setup lifecycle and its confirmation
+    counters are paced by bars, so they denote market time rather than however
+    often the engine happened to call the strategy."""
+
+    def _bars(self, n=20, price=100.0):
+        return [{"high": price, "low": price, "close": price}] * n
+
+    @pytest.mark.asyncio
+    async def test_the_no_new_low_counter_advances_at_most_once_per_bar(self):
+        """It is `min_ticks_without_new_low`, and at the live ~1s cadence it used
+        to be satisfied in 2 seconds rather than the 2 minutes it describes."""
+        engine, clock = _engine_at()
+        bot = _bot()
+        engine._dip_recovery_states = {
+            bot.id: {
+                **engine._dip_recovery_default_state(),
+                "dr_bars": self._bars(),
+                "state": "TRACKING_DROP",
+                "reference_high": 100.0,
+                "reference_high_time": engine.clock.now(),
+                "lowest_price": 95.0,
+                "lowest_price_time": engine.clock.now(),
+                "tracking_started_at": engine.clock.now(),
+                "ticks_since_new_low": 0,
+            }
+        }
+        # 30 evaluations inside a single 60-second bar.
+        await _drive(engine, clock, bot, [(i, 96.0) for i in range(30)])
+
+        counter = engine._dip_recovery_states[bot.id]["ticks_since_new_low"]
+        assert counter <= 1, (
+            f"30 evaluations inside one bar advanced the counter to {counter}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_setup_state_does_not_change_mid_bar(self):
+        engine, clock = _engine_at()
+        bot = _bot()
+        await _drive(engine, clock, bot, [(i * 60, 100.0) for i in range(20)])
+        before = dict(engine._dip_recovery_states[bot.id])
+
+        # A sharp drop, but delivered entirely inside one unfinished bar.
+        await _drive(engine, clock, bot, [(19 * 60 + i, 90.0) for i in range(1, 30)])
+        after = engine._dip_recovery_states[bot.id]
+
+        assert after["state"] == before["state"]
+        assert after["reference_high"] == before["reference_high"]
+
+    @pytest.mark.asyncio
+    async def test_a_mid_bar_evaluation_reports_why_it_did_nothing(self):
+        engine, clock = _engine_at()
+        bot = _bot()
+        await _drive(engine, clock, bot, [(i * 60, 100.0) for i in range(20)])
+        signal = await _drive(engine, clock, bot, [(19 * 60 + 1, 100.0)])
+
+        assert signal.action == "hold"
+        assert "Bar in progress" in signal.reason
+
+    @pytest.mark.asyncio
+    async def test_the_reference_high_spans_bars_not_evaluations(self):
+        """A high set 60 bars ago must still be the reference, however many
+        evaluations happened in between."""
+        engine, clock = _engine_at()
+        bot = _bot()
+        samples = [(0, 130.0), (60, 130.0)]  # the peak, held for a full bar
+        samples += [(i * 60, 100.0) for i in range(2, 40)]
+        # Many intra-bar evaluations that must not age the window.
+        samples += [(39 * 60 + i, 100.0) for i in range(1, 50)]
+        await _drive(engine, clock, bot, samples)
+
+        bars = engine._dip_recovery_states[bot.id]["dr_bars"]
+        assert len(bars) <= 60, "fixture must fit inside the lookback window"
+        assert max(b["high"] for b in bars[-60:]) == pytest.approx(130.0), (
+            "the 60-BAR window must still contain the peak"
+        )
+
+
+class TestExitsAreNotDeferredToBarClose:
+    @pytest.mark.asyncio
+    async def test_a_stop_fires_mid_bar(self):
+        """The per-bar gate must sit behind exit management: a stop has to react
+        when price moves, not at the end of a bar."""
+        from types import SimpleNamespace
+
+        engine, clock = _engine_at()
+        bot = _bot()
+        engine._get_bot_positions = AsyncMock(
+            return_value=[SimpleNamespace(amount=1.0)]
+        )
+        entry = 100.0
+        engine._dip_recovery_states = {
+            bot.id: {
+                **engine._dip_recovery_default_state(),
+                "dr_bars": [{"high": 101.0, "low": 99.0, "close": 100.0}] * 20,
+                "state": "LONG_OPEN",
+                "entry_price": entry,
+                "entry_time": engine.clock.now(),
+                "entry_atr": 1.0,
+                "highest_price_since_entry": entry,
+                "trailing_stop": entry - 1.5,
+                "take_profit": entry + 3.0,
+                "emergency_stop": entry - 5.0,
+            }
+        }
+        # One evaluation, one second into a fresh bar, at the take-profit level.
+        signal = await _drive(engine, clock, bot, [(1, 104.0)])
+
+        assert signal.action == "sell", "an exit must not wait for the bar to close"
 
 
 class TestPersistedStateCompatibility:
