@@ -50,6 +50,17 @@ def _no_positions(engine: TradingEngine) -> None:
     engine._get_bot_positions = AsyncMock(return_value=[])
 
 
+# ATR is measured over `bar_interval_seconds` bars (fix-dip-recovery-bar-atr), so
+# a test that drives the strategy in a tight loop under the real clock would
+# never close a bar and would sit on the fee-coverage floor forever. Closing a
+# bar on every call makes each bar's range the price change since the previous
+# call - i.e. exactly the tick-to-tick semantics these tests were written
+# against - so every existing assertion keeps its original meaning. This is the
+# harness convention trend_following already documents ("some test harnesses set
+# bar_interval_seconds=0").
+_TICK_PARAMS = {"bar_interval_seconds": 0}
+
+
 def _with_position(engine: TradingEngine, pos: MagicMock) -> None:
     engine._get_bot_positions = AsyncMock(return_value=[pos])
 
@@ -57,7 +68,7 @@ def _with_position(engine: TradingEngine, pos: MagicMock) -> None:
 async def _feed(engine, bot, prices, params=None, session=None):
     """Drive the strategy across a sequence of prices, returning all signals."""
     session = session or AsyncMock()
-    params = params or {}
+    params = {**_TICK_PARAMS, **(params or {})}
     signals = []
     for p in prices:
         sig = await engine._strategy_dip_recovery(bot, p, params, session)
@@ -111,7 +122,7 @@ class TestDeclineThenRecoveryBuys:
         # to IDLE if it ever sees LONG_OPEN with no matching position).
         signals = []
         for p in warmup + decline + bounce:
-            sig = await engine._strategy_dip_recovery(bot, p, {}, AsyncMock())
+            sig = await engine._strategy_dip_recovery(bot, p, _TICK_PARAMS, AsyncMock())
             signals.append(sig)
             if sig.action == "buy":
                 break
@@ -201,7 +212,7 @@ class TestAdaptiveThresholds:
         atr = engine._calc_price_atr_proxy(engine._get_price_history(bot.id), 14)
         assert atr / 100.0 * 100.0 > 2.0, "test setup must produce ATR% well above 2%"
 
-        decline_tick = await engine._strategy_dip_recovery(bot, 98.0, {}, AsyncMock())
+        decline_tick = await engine._strategy_dip_recovery(bot, 98.0, _TICK_PARAMS, AsyncMock())
         state = engine._dip_recovery_states[bot.id]
         assert state["state"] == _DipRecoveryState.IDLE, (
             "A 2% move must NOT arm tracking when volatility-scaled threshold is much larger"
@@ -224,7 +235,7 @@ class TestAdaptiveThresholds:
         atr = engine._calc_price_atr_proxy(engine._get_price_history(bot.id), 14)
         assert (atr / 100.0 * 100.0) * 2.5 < 1.5, "test setup must keep the ATR term below the floor"
 
-        decline_tick = await engine._strategy_dip_recovery(bot, 98.0, {}, AsyncMock())
+        decline_tick = await engine._strategy_dip_recovery(bot, 98.0, _TICK_PARAMS, AsyncMock())
         state = engine._dip_recovery_states[bot.id]
         assert state["state"] == _DipRecoveryState.TRACKING_DROP, (
             "A 2% decline must arm tracking once the floor (not an inflated ATR term) governs"
@@ -262,7 +273,7 @@ class TestTrailingExit:
 
         seen_stops = []
         for p in [101.0, 102.0, 103.0]:
-            sig = await engine._strategy_dip_recovery(bot, p, {}, AsyncMock())
+            sig = await engine._strategy_dip_recovery(bot, p, _TICK_PARAMS, AsyncMock())
             assert sig.action == "hold"
             seen_stops.append(engine._dip_recovery_states[bot.id]["trailing_stop"])
 
@@ -271,7 +282,7 @@ class TestTrailingExit:
         assert seen_stops[-1] == pytest.approx(103.0 - atr * 1.5)
 
         # A pullback through the ratcheted stop (not the original one) exits.
-        sig = await engine._strategy_dip_recovery(bot, 101.4, {}, AsyncMock())
+        sig = await engine._strategy_dip_recovery(bot, 101.4, _TICK_PARAMS, AsyncMock())
         assert sig.action == "sell"
         assert "trailing stop" in sig.reason.lower()
         state = engine._dip_recovery_states[bot.id]
@@ -305,7 +316,7 @@ class TestSetupExpiry:
         }
 
         # setup_expiry_minutes default is 240; 500 minutes elapsed must expire it.
-        sig = await engine._strategy_dip_recovery(bot, 96.0, {}, AsyncMock())
+        sig = await engine._strategy_dip_recovery(bot, 96.0, _TICK_PARAMS, AsyncMock())
         assert sig.action == "hold"
         assert "expired" in sig.reason.lower()
         state = engine._dip_recovery_states[bot.id]
@@ -406,7 +417,7 @@ class TestRestartRestoresState:
         engine2._price_histories = {bot_id: [92.0] * 20}  # normally rebuilt by ticks after resume
         pos = MagicMock(amount=1.0, entry_price=90.4)
         _with_position(engine2, pos)
-        sig = await engine2._strategy_dip_recovery(bot, 92.5, {}, AsyncMock())
+        sig = await engine2._strategy_dip_recovery(bot, 92.5, _TICK_PARAMS, AsyncMock())
         assert sig.action == "hold"
         assert engine2._dip_recovery_states[bot_id]["highest_price_since_entry"] == 92.5
 
@@ -518,7 +529,7 @@ class TestExplanationExactValues:
 
         # Flat warmup so ATR% is ~0 and the threshold floors at min_drop_percent.
         await _feed(engine, bot, [100.0] * 15)
-        await engine._strategy_dip_recovery(bot, 99.0, {}, AsyncMock())
+        await engine._strategy_dip_recovery(bot, 99.0, _TICK_PARAMS, AsyncMock())
 
         exp = engine._explanations[bot.id].to_dict()
         assert exp["state"] == _DipRecoveryState.IDLE
@@ -554,7 +565,7 @@ class TestExplanationExactValues:
         pos = MagicMock(amount=1.0, entry_price=entry_price)
         _with_position(engine, pos)
 
-        await engine._strategy_dip_recovery(bot, 103.0, {}, AsyncMock())
+        await engine._strategy_dip_recovery(bot, 103.0, _TICK_PARAMS, AsyncMock())
         exp = engine._explanations[bot.id].to_dict()
         metrics = exp["metrics"]
         assert exp["state"] == _DipRecoveryState.LONG_OPEN

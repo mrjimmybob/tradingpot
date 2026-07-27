@@ -5680,6 +5680,28 @@ class TradingEngine:
             "emergency_stop": None,
             "cooldown_until": None,
             "last_exit_was_loss": None,
+            # Time-based bar aggregation for the ATR source (fix-dip-recovery-bar-atr).
+            # Mirrors trend_following's tf_bars/tf_current_bar: volatility must be
+            # measured over a fixed span of market time, never over however many
+            # times this strategy happened to be evaluated.
+            "dr_bars": [],
+            "dr_current_bar": None,
+        }
+
+    def _dip_recovery_reset_state(self, state: dict) -> dict:
+        """A fresh lifecycle state that KEEPS the accumulated ATR bars.
+
+        The bar history is observed market data, not lifecycle state: a setup
+        expiring or a position closing says nothing about how volatile the
+        market has been. Rebuilding it on every reset would drop the strategy
+        back onto the fee-coverage floor for `atr_period` bars each time -
+        which, given how often a setup expires, would leave it running on the
+        floor almost permanently and silently undo the bar-ATR fix.
+        """
+        return {
+            **self._dip_recovery_default_state(),
+            "dr_bars": state.get("dr_bars", []),
+            "dr_current_bar": state.get("dr_current_bar"),
         }
 
     async def _strategy_dip_recovery(
@@ -5704,40 +5726,44 @@ class TradingEngine:
         ENTRY_ARMED is reported only in the explanation on the single tick a
         BUY fires - see _DipRecoveryState for why it is never itself persisted.
 
-        All thresholds adapt to current volatility via an ATR-percent proxy
-        (_calc_price_atr_proxy) computed from the bot's own tick price history:
-        True Range is approximated as the absolute tick-to-tick price change.
-        This makes every threshold pair-and-volatility agnostic (no BTC-
-        specific assumptions): a 2% move only matters relative to what THIS
-        pair's recent ATR% says is normal for it.
+        All thresholds adapt to current volatility via ATR, computed from the
+        high-low ranges of `bar_interval_seconds` bars this method aggregates
+        itself (see "BAR ATR ACCUMULATION" below). This makes every threshold
+        pair-and-volatility agnostic (no BTC-specific assumptions): a 2% move
+        only matters relative to what THIS pair's recent ATR% says is normal
+        for it.
 
-        !! CADENCE SENSITIVITY - READ BEFORE CHANGING ANY DEFAULT HERE !!
-        This ATR proxy is denominated in EVALUATION TICKS, not wall-clock time,
-        so its value changes with the cadence the strategy is called at, while
-        the fee hurdle it must clear does not. This method is now the ONLY
-        caller of _calc_price_atr_proxy: trend_following used to compute ATR the
-        same way and was deliberately changed to 60-second bar ranges (see the
-        "BAR ATR ACCUMULATION" comment in _strategy_trend_following) because at
-        the live ~1 Hz loop cadence tick-to-tick deltas give ATR ~= $1-3 on BTC,
-        placing every ATR-derived distance inside the round-trip fee hurdle.
-        An earlier version of this docstring claimed the approximation matched
-        trend_following "exactly"; that has not been true since that fix.
+        Volatility is denominated in MARKET TIME, not in evaluation ticks
+        (fix-dip-recovery-bar-atr). `atr_period` therefore means `atr_period`
+        BARS - 14 bars = 14 minutes at the default 60-second interval - which
+        is what this strategy's defaults, its wall-clock time constants, and
+        its fee-viability gate have always assumed.
 
-        Consequence, measured on real BTCUSDT data (see
-        DIP_RECOVERY_CADENCE_INVESTIGATION.md at the repo root): at the ~1s
-        cadence the live loop actually runs at, the take-profit target
-        (3 x ATR) is ~0.02% against a 0.25% fee hurdle, so the fee-viability
-        gate below refuses EVERY entry - even through Feb 2022. The parameter
-        defaults are calibrated for one tick per MINUTE (14-tick ATR = 14 min,
-        60-tick lookback = 60 min, setup_expiry 240 min = 4x that lookback).
-        Unlike every other strategy, this one does not aggregate ticks into
-        bars, so it never reaches that cadence on its own.
+        This matters because the live loop calls strategies about once a
+        SECOND (trading_engine.py, "1 second between iterations"). ATR used to
+        be the mean absolute change between consecutive evaluations, so it
+        measured ~1 second of movement - about $1.62 on BTC in measurement -
+        while every threshold derived from it must clear an absolute round-trip
+        fee hurdle. The take-profit target came to ~0.011% against a 0.25%
+        hurdle, so the fee-viability gate below refused EVERY entry: the
+        strategy could not open a position live in any market condition.
+        trend_following had the identical bug and was moved to 60-second bar
+        ranges; this is the same mechanism. Measured impact and full evidence:
+        DIP_RECOVERY_CADENCE_INVESTIGATION.md at the repo root.
 
-        Usable range as it stands: roughly 5m-1h between evaluations - bounded
-        below by fee viability and above by setup_expiry_minutes (at 4h a setup
-        gets exactly one evaluation and can never be confirmed). Correcting
-        this properly means bar-aggregating like every other strategy, which is
-        a behaviour change and is not done here.
+        Backtests are barely affected by that fix, and that is expected rather
+        than suspicious: one candle produces one bar, so a bar's range is the
+        candle-to-candle move the old proxy already measured.
+
+        STILL TICK-DENOMINATED, and deliberately left alone (correcting them
+        would change entry semantics, not the volatility calculation):
+        `reference_high_lookback_ticks`, `ema_slope_period`, and
+        `min_ticks_without_new_low` still count EVALUATIONS. At the live ~1s
+        cadence the "recent high" a decline is measured against therefore spans
+        ~60 seconds rather than the 60 minutes the defaults imply, so live
+        entries require a fast drop. Above 1h between evaluations the strategy
+        is also bounded by `setup_expiry_minutes` (at 4h a setup gets exactly
+        one evaluation and can never be confirmed).
 
         Parameters (sane crypto defaults; also documented in
         validate_dip_recovery_params and app/routers/config.py STRATEGIES):
@@ -5789,6 +5815,9 @@ class TradingEngine:
         loss_cooldown_seconds = params.get("loss_cooldown_seconds", 1800)
         risk_percent = params.get("risk_percent", 1.0) / 100
         spike_guard_mult = params.get("spike_guard_atr_multiplier", 6.0)
+        # Read up here (not beside the Decision-Framework block below) because the
+        # ATR bars are accumulated before this method's warm-up early-return.
+        bar_interval_seconds = params.get("bar_interval_seconds", 60)
 
         now = self.clock.now()
 
@@ -5801,6 +5830,39 @@ class TradingEngine:
         if not hasattr(self, "_dip_recovery_states"):
             self._dip_recovery_states = {}
         state = self._dip_recovery_states.get(bot.id) or self._dip_recovery_default_state()
+        # Backfill keys added after a state dict may have been persisted, before
+        # any early return - so a bot resumed from pre-bar-ATR state does not
+        # KeyError on the accumulation below (same pattern as trend_following).
+        state.setdefault("dr_bars", [])
+        state.setdefault("dr_current_bar", None)
+
+        # === BAR ATR ACCUMULATION (fix-dip-recovery-bar-atr) ===
+        # Volatility must be denominated in market TIME, not in evaluation
+        # ticks. The live loop calls this strategy about once a second, so the
+        # previous tick-to-tick proxy measured ~1 second of movement (ATR ~= $1-3
+        # on BTC) while every threshold derived from it has to clear an absolute
+        # round-trip fee hurdle - which made the fee-viability gate below reject
+        # every entry, permanently. trend_following hit exactly this and moved to
+        # 60-second bar ranges; this is the same mechanism, applied here.
+        #
+        # Accumulated BEFORE the warm-up early-return so bars keep building
+        # during warm-up ticks instead of restarting once it clears.
+        if state.get("dr_current_bar") is None:
+            state["dr_current_bar"] = {
+                "high": current_price, "low": current_price,
+                "close": current_price, "start_ts": now,
+            }
+        _dr_cb = state["dr_current_bar"]
+        _dr_cb["high"] = max(_dr_cb["high"], current_price)
+        _dr_cb["low"] = min(_dr_cb["low"], current_price)
+        _dr_cb["close"] = current_price
+        if (now - _dr_cb["start_ts"]).total_seconds() >= bar_interval_seconds:
+            state["dr_bars"].append(dict(_dr_cb))
+            state["dr_bars"] = state["dr_bars"][-100:]
+            state["dr_current_bar"] = {
+                "high": current_price, "low": current_price,
+                "close": current_price, "start_ts": now,
+            }
 
         exp = self._explain(bot.id)
 
@@ -5817,7 +5879,28 @@ class TradingEngine:
                 reason=f"Dip Recovery: Collecting data ({len(price_history)}/{atr_period + 1})"
             )
 
-        atr = self._calc_price_atr_proxy(price_history, atr_period)
+        # ATR from completed bar high-low ranges, so `atr_period` denotes
+        # `atr_period` BARS of market time (14 bars = 14 minutes at the default
+        # 60-second interval) rather than however many evaluations happened to
+        # occur - which is what the defaults, the time constants, and the fee
+        # viability gate below have always assumed.
+        _dr_bars = state.get("dr_bars", [])
+        bar_atr = (
+            sum(b["high"] - b["low"] for b in _dr_bars[-atr_period:]) / atr_period
+            if len(_dr_bars) >= atr_period else 0.0
+        )
+
+        # Fee-coverage floor, identical in purpose to trend_following's: until
+        # enough bars exist, and whenever measured volatility is smaller than the
+        # cost of trading it, ATR must not place an exit inside the round-trip
+        # fee hurdle. Once real bars are collected the larger bar ATR takes over.
+        _fee_raw_dr_atr = getattr(bot, "exchange_fee", 0.1)
+        _fee_pct_dr_atr = (
+            float(_fee_raw_dr_atr) if isinstance(_fee_raw_dr_atr, (int, float)) else 0.1
+        ) / 100.0
+        _dr_min_atr_pct = 2.0 * _fee_pct_dr_atr + _VIABILITY_SAFETY_MARGIN_PCT
+        atr = max(bar_atr, current_price * _dr_min_atr_pct)
+
         atr_percent = (atr / current_price * 100.0) if current_price > 0 else 0.0
         is_spike = atr > 0 and abs(current_price - previous_price) > (atr * spike_guard_mult)
 
@@ -5842,7 +5925,8 @@ class TradingEngine:
             "allowed_regimes", ["trend_down", "volatility_high", "volatility_expanding"]
         )
         decision_score_threshold = params.get("decision_score_threshold", 40.0)
-        bar_interval_seconds = params.get("bar_interval_seconds", 60)
+        # bar_interval_seconds is read at the top of this method (the ATR bars
+        # need it before the warm-up early-return).
         _validity_interval_seconds = max(bar_interval_seconds, 1)
         current_regime = self._detect_market_regime(price_history, None)
         suitability = MarketSuitabilityGate().evaluate(current_regime, allowed_regimes)
@@ -5903,7 +5987,7 @@ class TradingEngine:
             # (those fields were cleared on entry) - reset cleanly to IDLE
             # rather than falling into the setup-tracking branch below with
             # stale/absent low/high fields.
-            state = self._dip_recovery_default_state()
+            state = self._dip_recovery_reset_state(state)
             self._dip_recovery_states[bot.id] = state
 
         if has_position:
@@ -6080,7 +6164,7 @@ class TradingEngine:
             (now - tracking_started_at).total_seconds() / 60.0 if tracking_started_at else 0.0
         )
         if elapsed_minutes >= setup_expiry_min:
-            self._dip_recovery_states[bot.id] = self._dip_recovery_default_state()
+            self._dip_recovery_states[bot.id] = self._dip_recovery_reset_state(state)
             exp.state(_DipRecoveryState.IDLE).check(
                 "Setup expiry", f"{elapsed_minutes:.1f} min", f"< {setup_expiry_min} min", False,
             )
@@ -6102,7 +6186,7 @@ class TradingEngine:
         # Invalidation: price fully round-tripped past the original high
         # without ever confirming entry - no longer "the dip"; reset and re-watch.
         if reference_high and current_price >= reference_high:
-            self._dip_recovery_states[bot.id] = self._dip_recovery_default_state()
+            self._dip_recovery_states[bot.id] = self._dip_recovery_reset_state(state)
             exp.state(_DipRecoveryState.IDLE)
             return hold_via(
                 mk_proposal(
@@ -6406,7 +6490,7 @@ class TradingEngine:
 
         entry_price = current_price
         self._dip_recovery_states[bot.id] = {
-            **self._dip_recovery_default_state(),
+            **self._dip_recovery_reset_state(state),
             "state": _DipRecoveryState.LONG_OPEN,
             "entry_price": entry_price,
             "entry_time": now,
@@ -6478,8 +6562,11 @@ class TradingEngine:
         is routed through the Standalone Adapter, never returned directly.
         """
         is_loss = current_price < entry_price
+        # Read the live state from the store: this helper is called from the
+        # exit paths, which do not carry the state dict, and the reset must
+        # still preserve the accumulated ATR bars.
         self._dip_recovery_states[bot.id] = {
-            **self._dip_recovery_default_state(),
+            **self._dip_recovery_reset_state(self._dip_recovery_states.get(bot.id, {})),
             "state": _DipRecoveryState.COOLDOWN,
             "cooldown_until": now + timedelta(seconds=cooldown_secs),
             "last_exit_was_loss": is_loss,

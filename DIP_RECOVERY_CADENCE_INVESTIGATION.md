@@ -5,6 +5,10 @@
 `dip_recovery` were invalid. That does not answer whether the strategy itself is
 correctly configured. This report answers that.
 
+> **Status: corrected.** The defect described below was fixed on 2026-07-27 by
+> `fix-dip-recovery-bar-atr`. See *Correction applied* at the end for the
+> measured before/after impact and what deliberately remains.
+
 **Verdict: genuine strategy design defect.** `dip_recovery` denominates its
 volatility estimate in *evaluation ticks* while the thresholds that consume it
 must clear an *absolute* fee hurdle. The live engine evaluates roughly once per
@@ -182,7 +186,61 @@ Two smaller alternatives were considered and rejected:
 - *Rescale the wall-clock parameters to the cadence.* This treats the symptom,
   changes what a "setup" means at every timeframe, and is parameter tuning.
 
-**This is a live-trading behaviour change and has not been made.** It needs a
-decision, and — per this repo's conventions — an OpenSpec change with its own
-before/after measurement, since altering the ATR source changes every entry and
-exit distance the strategy produces.
+---
+
+## Correction applied (2026-07-27)
+
+Implemented as `fix-dip-recovery-bar-atr`. `dip_recovery` now aggregates ticks
+into `bar_interval_seconds` bars in its own persisted state and computes ATR
+from bar high-low ranges, with the same fee-coverage floor `trend_following`
+applies. **No parameter value, threshold, or multiplier was changed.**
+
+### Measured impact — live cadence (the defect)
+
+Driven at ~1 evaluation/second over 35,940 ticks of a BTCUSDT-derived price path:
+
+| | ATR | ATR% | Take-profit (3×ATR) | vs 0.25% hurdle |
+|---|---|---|---|---|
+| Before | $1.62 | 0.0038% | 0.0114% | **BLOCKED** |
+| After | $106.62 | 0.2500% | 0.7500% | **PASSES** |
+
+A **66× increase**. The $1.62 measured "before" independently corroborates the
+"$1-3 on BTC" figure recorded in `trend_following`'s comment. On this particular
+path the fee-coverage floor sets the result (raw 60-second bar range averaged
+$15.64 against a $106.62 floor at that price); on a live feed with genuine
+intra-minute noise the bar range contributes more — `trend_following` documents
+60-second ranges of $50-200 on BTC. Either component clears the hurdle; the old
+tick ATR could not.
+
+### Measured impact — backtests (near-nil, as predicted)
+
+| Timeframe | | Trades | Expectancy | Win rate | Profit factor |
+|---|---|---|---|---|---|
+| 1h | before | 341 | −27.40 | 32.6% | 0.61 |
+| 1h | after | 342 | −26.94 | 33.0% | 0.62 |
+| 15m | before | 416 | −20.36 | 29.1% | 0.53 |
+| 15m | after | 417 | −20.52 | 27.8% | 0.54 |
+
+This near-identity is the expected result and is itself evidence the change is
+what it claims to be: in a backtest one candle produces one bar, so a bar's range
+is the candle-to-candle move the tick proxy already measured. The change bites
+live, where 60 one-second ticks now collapse into one bar. It also confirms the
+fix is not a disguised parameter change — **`dip_recovery` still loses money at
+1h with its shipped defaults**, and that finding stands unaltered.
+
+The all-strategy 4h baseline is **byte-identical** before and after for all six
+strategies: nothing else moved.
+
+### Remaining, NOT fixed here
+
+`reference_high_lookback_ticks` (60), `ema_slope_period` (5) and
+`min_ticks_without_new_low` (2) are still denominated in evaluation ticks. At the
+live ~1s cadence the "recent high" a decline is measured against therefore spans
+~60 seconds rather than the 60 minutes the defaults imply, so live entries now
+require a *fast* drop (≥1.5% within about a minute) rather than the slower
+setup the defaults describe.
+
+This is the same class of mismatch, but correcting it changes what the strategy
+means by a "setup" — entry semantics, not the volatility calculation — and so
+falls outside "replace the obsolete volatility calculation". It is recorded here
+as a known, separate question rather than silently changed.
